@@ -285,9 +285,15 @@ var aemcp = (function () {
 
     function keyAt(p, time, value, kind, influence) {
         // set a keyframe and its interpolation; returns its index
-        var idx, dims, eases = [], low = [], j;
+        var idx;
         p.setValueAtTime(time, value);
         idx = p.nearestKeyIndex(time);
+        easeKey(p, idx, kind, influence);
+        return idx;
+    }
+
+    function easeKey(p, idx, kind, influence) {
+        var dims, eases = [], low = [], j;
         if (kind === "hold") {
             p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
         } else if (kind === "linear") {
@@ -303,7 +309,14 @@ var aemcp = (function () {
             // ease_in slows into the key (incoming side), ease_out slows out of it (outgoing side)
             p.setTemporalEaseAtKey(idx, kind === "ease_out" ? low : eases, kind === "ease_in" ? low : eases);
         }
-        return idx;
+    }
+
+    function findItemOfType(ref, type, what) {
+        var it = findItem(ref);
+        if (!(it instanceof type)) {
+            fail(it.name + " is not " + what);
+        }
+        return it;
     }
 
     function transform(l, match) {
@@ -1267,12 +1280,200 @@ var aemcp = (function () {
             return {comp: c.name, template: c.motionGraphicsTemplateName, path: a.path};
         },
 
+        bake_expression: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), p = findProperty(l, a.property), times = [],
+                values = [], t, dt = c.frameDuration * a.step, t0 = a.start !== undefined ? a.start : l.inPoint,
+                t1 = a.end !== undefined ? a.end : l.outPoint;
+            if (!p.expressionEnabled || !p.expression) {
+                fail(p.name + " has no expression to bake");
+            }
+            if (t1 <= t0) {
+                fail("end must be after start");
+            }
+            for (t = t0; t < t1 - 1e-9; t += dt) {
+                times.push(t);
+                values.push(p.valueAtTime(t, false));  // false: with the expression applied
+            }
+            p.expressionEnabled = false;
+            while (p.numKeys > 0) {
+                p.removeKey(p.numKeys);
+            }
+            p.setValuesAtTimes(times, values);
+            return {property: p.name, keys: p.numKeys, from: round(t0), to: round(times[times.length - 1]),
+                expression: "disabled (kept, not deleted)"};
+        },
+
+        ease_keyframes: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p = findProperty(l, a.property), i;
+            if (!p.numKeys) {
+                fail(p.name + " has no keyframes");
+            }
+            for (i = 1; i <= p.numKeys; i++) {
+                easeKey(p, i, a.ease, a.influence);
+            }
+            return {property: p.name, keys: p.numKeys, ease: a.ease};
+        },
+
+        copy_keyframes: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), src = findProperty(l, a.property), keys = [], i, j,
+                k, target, dst, idx, done = [];
+            if (!src.numKeys) {
+                fail(src.name + " on " + l.name + " has no keyframes to copy");
+            }
+            for (i = 1; i <= src.numKeys; i++) {
+                keys.push({time: src.keyTime(i), value: src.keyValue(i), inType: src.keyInInterpolationType(i),
+                    outType: src.keyOutInterpolationType(i), inEase: src.keyInTemporalEase(i),
+                    outEase: src.keyOutTemporalEase(i)});
+            }
+            for (j = 0; j < a.targets.length; j++) {
+                target = findLayer(c, a.targets[j]);
+                if (target === l) {
+                    fail("a layer cannot be its own target");
+                }
+                dst = findProperty(target, a.property);
+                while (dst.numKeys > 0) {
+                    dst.removeKey(dst.numKeys);
+                }
+                for (i = 0; i < keys.length; i++) {
+                    k = keys[i];
+                    dst.setValueAtTime(k.time + a.offset * (j + 1), k.value);
+                    idx = dst.nearestKeyIndex(k.time + a.offset * (j + 1));
+                    dst.setInterpolationTypeAtKey(idx, k.inType, k.outType);
+                    if (k.outType === KeyframeInterpolationType.BEZIER || k.inType === KeyframeInterpolationType.BEZIER) {
+                        dst.setTemporalEaseAtKey(idx, k.inEase, k.outEase);
+                    }
+                }
+                done.push(target.name);
+            }
+            return {property: src.name, from: l.name, to: done, keys: keys.length};
+        },
+
+        stagger_layers: function (a) {
+            var c = findComp(a.comp), layers = [], i, base, out = [];
+            for (i = 0; i < a.layers.length; i++) {
+                layers.push(findLayer(c, a.layers[i]));
+            }
+            base = a.start !== undefined ? a.start : layers[0].inPoint;
+            for (i = 0; i < layers.length; i++) {
+                layers[i].startTime += base + i * a.offset - layers[i].inPoint;
+                out.push({layer: layers[i].name, inPoint: round(layers[i].inPoint)});
+            }
+            return {layers: out};
+        },
+
+        split_layer: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), d;
+            if (a.time <= l.inPoint || a.time >= l.outPoint) {
+                fail("split time must be inside the layer (" + round(l.inPoint) + "-" + round(l.outPoint) + " s)");
+            }
+            d = l.duplicate();  // the copy sits right above the original
+            l.outPoint = a.time;
+            d.inPoint = a.time;
+            if (a.name) {
+                d.name = a.name;
+            }
+            return {first: {index: l.index, name: l.name, outPoint: round(l.outPoint)},
+                second: {index: d.index, name: d.name, inPoint: round(d.inPoint)}};
+        },
+
+        trim_comp: function (a) {
+            var c = findComp(a.comp), i, lo = null, hi = null, l, shift, dur;
+            if (a.to === "work_area") {
+                shift = c.workAreaStart;
+                dur = c.workAreaDuration;
+            } else {
+                for (i = 1; i <= c.numLayers; i++) {
+                    l = c.layer(i);
+                    lo = lo === null ? l.inPoint : Math.min(lo, l.inPoint);
+                    hi = hi === null ? l.outPoint : Math.max(hi, l.outPoint);
+                }
+                if (lo === null) {
+                    fail(c.name + " has no layers to trim to");
+                }
+                shift = Math.max(0, lo);
+                dur = Math.min(hi, c.duration) - shift;
+            }
+            for (i = 1; i <= c.numLayers; i++) {
+                c.layer(i).startTime -= shift;
+            }
+            c.workAreaStart = 0;
+            c.duration = dur;
+            c.workAreaDuration = dur;
+            return {comp: c.name, duration: round(dur), shiftedBy: round(shift)};
+        },
+
+        make_variants: function (a) {
+            var c = findComp(a.comp), made = [], i, row, dup, k, l, prop, doc, rq;
+            for (i = 0; i < a.rows.length; i++) {
+                row = a.rows[i];
+                dup = c.duplicate();
+                dup.name = row.name;
+                for (k in row.texts) {
+                    if (row.texts.hasOwnProperty(k)) {
+                        l = findLayer(dup, k);
+                        prop = l.property("ADBE Text Properties");
+                        if (!prop) {
+                            fail(l.name + " in " + c.name + " is not a text layer");
+                        }
+                        prop = prop.property("ADBE Text Document");
+                        doc = prop.value;
+                        doc.text = row.texts[k];
+                        prop.setValue(doc);
+                    }
+                }
+                if (a.outputDir) {
+                    rq = app.project.renderQueue.items.add(dup);
+                    if (a.template) {
+                        rq.outputModule(1).applyTemplate(a.template);
+                    }
+                    rq.outputModule(1).file = new File(a.outputDir + "/" + row.name);
+                }
+                made.push({comp: dup.name, id: dup.id, queued: !!a.outputDir});
+            }
+            return {from: c.name, variants: made};
+        },
+
+        import_layered: function (a) {
+            var f = new File(a.path), opts = new ImportOptions(f), it;
+            if (!f.exists) {
+                fail("file not found: " + a.path);
+            }
+            opts.importAs = a.mode === "footage" ? ImportAsType.FOOTAGE :
+                (a.mode === "comp" ? ImportAsType.COMP : ImportAsType.COMP_CROPPED_LAYERS);
+            if (!opts.canImportAs(opts.importAs)) {
+                fail("After Effects cannot import " + f.name + " as " + a.mode + " (layered PSD / AI files can)");
+            }
+            it = app.project.importFile(opts);
+            return {id: it.id, name: it.name, type: itemType(it), layers: it instanceof CompItem ? it.numLayers : null};
+        },
+
+        missing_footage: function () {
+            var items = allItems(), out = [], i;
+            for (i = 0; i < items.length; i++) {
+                if (items[i] instanceof FootageItem && items[i].footageMissing) {
+                    out.push({id: items[i].id, name: items[i].name, file: items[i].file ? items[i].file.fsName : null});
+                }
+            }
+            return out;
+        },
+
+        relink_footage: function (a) {
+            var done = [], i, it;
+            for (i = 0; i < a.links.length; i++) {
+                it = findItemOfType(a.links[i].id, FootageItem, "footage");
+                it.replace(new File(a.links[i].path));
+                done.push({id: it.id, name: it.name, missing: it.footageMissing});
+            }
+            return done;
+        },
+
         run_jsx: function (a) {
             return plain(eval(a.code));
         }
     };
 
-    var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1};
+    var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1,
+        missing_footage: 1};
 
     function run(name, args) {
         var result, cmd = commands[name];

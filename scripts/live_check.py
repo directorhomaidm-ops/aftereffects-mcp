@@ -235,6 +235,24 @@ def main():
          needs=have)
     step("mogrt_add_property + export_mogrt", lambda: _mogrt(work), needs=have,
          note="addToMotionGraphicsTemplateAs and exportAsMotionGraphicsTemplate")
+
+    print("\nKeyframe work, editing, variants, footage")
+    step("bake_expression: the null's wiggle into keyframes (every 2 frames)", lambda: d.bake_expression(
+        "Null", "position", step=2, start=0, end=1, comp="aemcp check"), needs=have,
+         note="valueAtTime(t, false) and setValuesAtTimes")
+    step("ease_keyframes: the solid's scale, strong ease", lambda: d.ease_keyframes(
+        "Solid", "scale", "ease", influence=80, comp="aemcp check"), needs=have)
+    step("copy_keyframes: the solid's opacity onto two captions, cascading", lambda: d.copy_keyframes(
+        "Solid", "opacity", ["Caption 1", "Caption 2"], offset=0.2, comp="aemcp check"), needs=have,
+         note="keyIn/OutInterpolationType and keyIn/OutTemporalEase")
+    step("stagger_layers the captions by 0.1 s", lambda: d.stagger_layers(
+        ["Caption 1", "Caption 2"], offset=0.1, comp="aemcp check"), needs=have)
+    step("split_layer the Pulse circle at 1.5 s", lambda: d.split_layer("Pulse", 1.5, name="Pulse B",
+                                                                         comp="aemcp check"), needs=have)
+    step("make_variants: two versions of a card comp, queued", lambda: _variants(work), needs=have,
+         note="CompItem.duplicate and text replacement")
+    step("trim_comp to its layers", lambda: d.trim_comp(comp="variants source"), needs=have)
+    step("find_missing_footage after deleting a file, then relink", lambda: _missing(work), needs=have)
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -336,6 +354,26 @@ def _background(work):
     files = [p.name for p in work.iterdir() if p.name.startswith("background_check")]
     expect(files, f"no output from aerender in {work}")
     return {"state": st["state"], "files": files, "log_tail": st["log_tail"][-3:]}
+
+
+def _variants(work):
+    d.create_comp("variants source", 1080, 1080, 3, 30)
+    d.add_layer("text", text="NAME", name="Name", comp="variants source")
+    return d.make_variants([{"name": "Variant One", "texts": {"Name": "واحد"}},
+                            {"name": "Variant Two", "texts": {"Name": "Two"}}], comp="variants source",
+                           output_dir=str(work / "variants"))
+
+
+def _missing(work):
+    gone = work / "to_move.png"
+    write_png(gone, 16, 16, (10, 200, 10))
+    d.import_file(str(gone))
+    moved = work / "moved"
+    moved.mkdir()
+    gone.rename(moved / "to_move.png")
+    out = d.find_missing_footage(search=str(moved))
+    expect(out["relinked"] and not out["still_missing"], f"relink failed: {out}")
+    return out
 
 
 def _types():
