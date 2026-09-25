@@ -13,7 +13,8 @@ const KeyframeInterpolationType = {LINEAR: 6612, BEZIER: 6613, HOLD: 6614};
 const RQItemStatus = {WILL_CONTINUE: 3012, NEEDS_OUTPUT: 3013, UNQUEUED: 3014, QUEUED: 3015, RENDERING: 3016,
     USER_STOPPED: 3017, ERR_STOPPED: 3018, DONE: 3019};
 const ParagraphJustification = {LEFT_JUSTIFY: 7413, RIGHT_JUSTIFY: 7414, CENTER_JUSTIFY: 7415};
-const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// PNG signature + an empty IEND chunk: export_frame waits for IEND.
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
 
 const EFFECTS = [
     {displayName: "Gaussian Blur", matchName: "ADBE Gaussian Blur 2", category: "Blur & Sharpen",

@@ -12,7 +12,7 @@ Register with Claude Code:
     claude mcp add aftereffects -- uv run /path/to/aftereffects_mcp.py
 
 Each tool runs one command of jsx/aemcp.jsx inside After Effects: the script goes through AppleScript's DoScript
-(`osascript`) and its JSON result comes back on stdout, or from a result file when DoScript returns nothing (that
+(`osascript`) and its JSON result comes back through a result file, or on stdout when the file is missing (that
 needs Settings > Scripting & Expressions > "Allow Scripts to Write Files and Access Network").
 Set AE_APP if your After Effects is not "Adobe After Effects 2026". Logs one JSON object per line to stderr; set
 AE_MCP_LOG_LEVEL (default INFO) to change verbosity.
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from time import monotonic, sleep  # export_frame has a parameter named time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -133,11 +134,11 @@ def _osascript(script, timeout):
             if "-1712" in err:
                 raise ToolError(f"After Effects did not answer within {timeout}s (a dialog open, or a long render?)")
             raise ToolError(f"osascript failed: {err or r.returncode}")
-        result = r.stdout.strip()
-        if not result and os.path.exists(out):
+        # The result file wins: AE 2026's DoScript prints "0" on stdout whatever the script returns.
+        if os.path.exists(out):
             with open(out, encoding="utf-8") as f:
-                result = f.read().strip()
-        return result
+                return f.read().strip()
+        return r.stdout.strip()
     except subprocess.TimeoutExpired as e:
         raise ToolError(f"After Effects did not answer within {timeout}s") from e
     finally:
@@ -357,7 +358,17 @@ def render(timeout: int = 1800) -> dict:
 @_tool
 def export_frame(path: str, time: float = 0.0, comp: int | str | None = None) -> dict:
     """Save one frame of a comp as a PNG file (time in seconds)."""
-    return _call("export_frame", comp=comp, path=_path(path), time=time)
+    out = _call("export_frame", comp=comp, path=_path(path), time=time)
+    # saveFrameToPng returns at once and fills the file later: wait for the PNG's IEND chunk.
+    deadline = monotonic() + DEFAULT_TIMEOUT
+    while monotonic() < deadline:
+        try:
+            if Path(out["path"]).read_bytes()[-8:-4] == b"IEND":
+                return out
+        except OSError:
+            pass
+        sleep(0.1)
+    raise ToolError(f"After Effects did not finish writing {out['path']} within {DEFAULT_TIMEOUT}s")
 
 
 @_tool
