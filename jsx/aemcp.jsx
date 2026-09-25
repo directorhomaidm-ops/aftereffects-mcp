@@ -364,6 +364,15 @@ var aemcp = (function () {
         return l.property("ADBE Transform Group").property(match);
     }
 
+    function newCamera(c, name) {
+        // After Effects 26 puts a new camera at [0, 0, -zoom] whatever center is given, looking at the center from
+        // the top left corner: move it in front of the center, facing the comp straight on
+        var cam = c.layers.addCamera(name || "Camera", [c.width / 2, c.height / 2]),
+            zoom = cam.property("ADBE Camera Options Group").property("ADBE Camera Zoom").value;
+        transform(cam, "ADBE Position").setValue([c.width / 2, c.height / 2, -zoom]);
+        return cam;
+    }
+
     function enumValue(table, name, what) {
         var key = String(name).toUpperCase(), v = table[key];
         if (v === undefined) {
@@ -497,7 +506,7 @@ var aemcp = (function () {
             } else if (kind === "null") {
                 l = c.layers.addNull(c.duration);
             } else if (kind === "camera") {
-                l = c.layers.addCamera(a.name || "Camera", [c.width / 2, c.height / 2]);
+                l = newCamera(c, a.name);
             } else if (kind === "light") {
                 l = c.layers.addLight(a.name || "Light", [c.width / 2, c.height / 2]);
             } else if (kind === "item") {
@@ -921,6 +930,13 @@ var aemcp = (function () {
             if (a.bgColor !== undefined) {
                 c.bgColor = a.bgColor;
             }
+            if (a.motionBlur !== undefined) {
+                c.motionBlur = a.motionBlur;
+            }
+            if (a.shutterAngle !== undefined) {
+                c.shutterAngle = a.shutterAngle;
+                c.shutterPhase = -a.shutterAngle / 2;  // centered on the frame, After Effects' default
+            }
             if (a.workArea !== undefined) {
                 if (a.workArea[0] < 0 || a.workArea[1] <= a.workArea[0] || a.workArea[1] > c.duration) {
                     fail("work_area must be [start, end] inside the comp (0-" + round(c.duration) + " s)");
@@ -931,7 +947,7 @@ var aemcp = (function () {
             }
             return {id: c.id, name: c.name, width: c.width, height: c.height, duration: round(c.duration),
                 frameRate: round(c.frameRate), workArea: [round(c.workAreaStart),
-                    round(c.workAreaStart + c.workAreaDuration)]};
+                    round(c.workAreaStart + c.workAreaDuration)], motionBlur: c.motionBlur, shutterAngle: c.shutterAngle};
         },
 
         render_templates: function () {
@@ -1132,7 +1148,7 @@ var aemcp = (function () {
                     fail(cam.name + " is not a camera");
                 }
             } else {
-                cam = c.layers.addCamera("Camera", [c.width / 2, c.height / 2]);
+                cam = newCamera(c);
             }
             pos = transform(cam, "ADBE Position");
             poi = transform(cam, "ADBE Anchor Point");  // a camera's anchor point is its point of interest
@@ -1643,6 +1659,313 @@ var aemcp = (function () {
                 }
             }
             return {removed: removed.length, left: rq.numItems};
+        },
+
+        motion_path: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p = transform(l, "ADBE Position"), i, idx, n = a.points.length,
+                pt, z, flat, end;
+            while (p.numKeys > 0) {
+                p.removeKey(p.numKeys);
+            }
+            z = p.value[2];
+            flat = [0, 0, 0];
+            for (i = 0; i < n; i++) {
+                pt = a.points[i];
+                end = i === 0 || i === n - 1;
+                idx = keyAt(p, a.times[i], pt.length === 2 ? [pt[0], pt[1], z] : pt,
+                    end && a.ease && !a.constantSpeed ? "ease" : "linear");
+                if (a.smooth) {
+                    p.setSpatialAutoBezierAtKey(idx, true);  // curved through the points
+                } else {
+                    p.setSpatialAutoBezierAtKey(idx, false);
+                    p.setSpatialTangentsAtKey(idx, flat, flat);  // straight lines between them
+                }
+                if (!end) {
+                    // no stop at the inner points: speed flows through them
+                    p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER);
+                    p.setTemporalContinuousAtKey(idx, true);
+                    p.setTemporalAutoBezierAtKey(idx, true);
+                }
+            }
+            for (i = 2; a.constantSpeed && i < n; i++) {
+                p.setRovingAtKey(i, true);  // inner keys rove in time to even the speed out (once all keys exist)
+            }
+            if (a.autoOrient) {
+                l.autoOrient = AutoOrientType.ALONG_PATH;
+            }
+            return {layer: l.name, keys: p.numKeys, from: round(p.keyTime(1)), to: round(p.keyTime(n)),
+                smooth: !!a.smooth, constantSpeed: !!a.constantSpeed, autoOrient: !!a.autoOrient};
+        },
+
+        bezier_ease: function (a) {
+            // A CSS cubic-bezier(x1, y1, x2, y2) per segment as After Effects temporal ease: the outgoing handle of a
+            // key gets influence x1 and speed (y1 / x1) x the segment's average speed, the incoming handle of the
+            // next key influence 1 - x2 and speed (1 - y2) / (1 - x2) x average. Signed per dimension; spatial
+            // properties take one ease with the speed along the path.
+            var l = findLayer(findComp(a.comp), a.layer), p = findProperty(l, a.property), c = a.curve, n = p.numKeys,
+                first = a.keys ? a.keys[0] : 1, last = a.keys ? a.keys[1] : n, k, dt, v0, v1, deltas, j, d, outs, ins;
+            if (n < 2) {
+                fail(p.name + " needs at least 2 keyframes (has " + n + ")");
+            }
+            if (first < 1 || last > n || last <= first) {
+                fail("keys must be [first, last] within 1-" + n);
+            }
+            if (typeof p.keyValue(1) !== "number" && !(p.keyValue(1) instanceof Array)) {
+                fail(p.name + " has no numeric value to ease");
+            }
+            if (p.isSpatial && (c[1] < 0 || c[1] > 1 || c[3] < 0 || c[3] > 1)) {
+                fail("overshoot (y outside 0-1) is not possible on " + p.name + ": After Effects keeps spatial " +
+                    "motion on its path. Use expression_preset bounce instead");
+            }
+            for (k = first; k < last; k++) {
+                dt = p.keyTime(k + 1) - p.keyTime(k);
+                v0 = p.keyValue(k);
+                v1 = p.keyValue(k + 1);
+                if (p.isSpatial) {
+                    d = 0;
+                    for (j = 0; j < v0.length; j++) {
+                        d += (v1[j] - v0[j]) * (v1[j] - v0[j]);
+                    }
+                    deltas = [Math.sqrt(d)];
+                } else if (v0 instanceof Array) {
+                    deltas = [];
+                    for (j = 0; j < v0.length; j++) {
+                        deltas.push(v1[j] - v0[j]);
+                    }
+                } else {
+                    deltas = [v1 - v0];
+                }
+                outs = [];
+                ins = [];
+                for (j = 0; j < deltas.length; j++) {
+                    outs.push(new KeyframeEase(c[1] / c[0] * deltas[j] / dt, c[0] * 100));
+                    ins.push(new KeyframeEase((1 - c[3]) / (1 - c[2]) * deltas[j] / dt, (1 - c[2]) * 100));
+                }
+                p.setInterpolationTypeAtKey(k, p.keyInInterpolationType(k), KeyframeInterpolationType.BEZIER);
+                p.setInterpolationTypeAtKey(k + 1, KeyframeInterpolationType.BEZIER, p.keyOutInterpolationType(k + 1));
+                p.setTemporalEaseAtKey(k, p.keyInTemporalEase(k), outs);
+                p.setTemporalEaseAtKey(k + 1, ins, p.keyOutTemporalEase(k + 1));
+            }
+            return {property: p.name, segments: last - first, keys: [first, last]};
+        },
+
+        track_window: function (a) {
+            // A small comp showing one window of a layer's source, rendered frame by frame for the Python side to
+            // follow a feature in: made once (create), moved and saved per frame, removed at the end.
+            var c, l, src, win = null, i, tl;
+            if (a.create) {
+                c = findComp(a.comp);
+                l = findLayer(c, a.layer);
+                src = l.source;
+                if (!src || !src.width || (src.mainSource && src.mainSource instanceof SolidSource)) {
+                    fail(l.name + " has no footage to track (it needs video, an image sequence or a precomp)");
+                }
+                win = app.project.items.addComp("aemcp track window", a.size, a.size, 1, c.duration, c.frameRate);
+                tl = win.layers.add(src);
+                tl.startTime = l.startTime;  // window time = comp time
+                tl.stretch = l.stretch;
+                transform(tl, "ADBE Anchor Point").setValue([0, 0]);
+                return {window: win.id, size: [src.width, src.height], frame: c.frameDuration, inPoint: l.inPoint,
+                    outPoint: l.outPoint, timeRemap: l.timeRemapEnabled};
+            }
+            for (i = 1; i <= app.project.numItems; i++) {
+                if (app.project.item(i).id === a.window) {
+                    win = app.project.item(i);
+                }
+            }
+            if (!win) {
+                fail("the tracking window comp is gone");
+            }
+            if (a.remove) {
+                win.remove();
+                return {removed: true};
+            }
+            transform(win.layer(1), "ADBE Position").setValue([-a.origin[0], -a.origin[1]]);
+            win.saveFrameToPng(a.time, new File(a.path));
+            return {path: a.path};
+        },
+
+        write_track: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), trackers = l.property("ADBE MTrackers"), trk, pt;
+            function named(group, name, match) {
+                var i, made;
+                for (i = 1; i <= group.numProperties; i++) {
+                    if (group.property(i).name === name) {
+                        return group.property(i);
+                    }
+                }
+                made = group.addProperty(match);
+                made.name = name;
+                return made;
+            }
+            function put(match, values) {
+                var p = pt.property(match);
+                while (p.numKeys > 0) {
+                    p.removeKey(p.numKeys);
+                }
+                p.setValuesAtTimes(a.times, values);
+            }
+            trk = named(trackers, a.tracker, "ADBE MTracker");
+            pt = named(trk, a.point, "ADBE MTracker Pt");
+            pt.property("ADBE MTracker Pt Feature Size").setValue([a.feature, a.feature]);
+            pt.property("ADBE MTracker Pt Search Size").setValue([a.search, a.search]);
+            put("ADBE MTracker Pt Feature Center", a.points);
+            put("ADBE MTracker Pt Attach Pt", a.points);
+            put("ADBE MTracker Pt Confidence", a.confidence);
+            return {layer: l.name, tracker: trk.name, point: pt.name, keys: a.times.length};
+        },
+
+        attach_to_track: function (a) {
+            var c = findComp(a.comp), target = findLayer(c, a.layer), tracked = findLayer(c, a.tracked),
+                trackers = tracked.property("ADBE MTrackers"), trk, pt, p = transform(target, "ADBE Position"), attach, ap,
+                t0;
+            if (target === tracked) {
+                fail("a layer cannot follow its own track");
+            }
+            if (!trackers || !trackers.numProperties) {
+                fail(tracked.name + " has no tracks (see track_point, or track it in the Tracker panel)");
+            }
+            trk = trackers.property(a.tracker !== undefined ? a.tracker : trackers.numProperties);  // default: newest
+            if (!trk) {
+                fail(tracked.name + " has no tracker " + a.tracker + " (has: " + childNames(trackers) + ")");
+            }
+            pt = trk.property(a.point !== undefined ? a.point : 1);
+            if (!pt) {
+                fail(trk.name + " has no track point " + a.point + " (has: " + childNames(trk) + ")");
+            }
+            if (p.numKeys) {
+                fail(target.name + "'s position is animated: clear its keyframes first");
+            }
+            ap = pt.property("ADBE MTracker Pt Attach Pt");
+            t0 = ap.numKeys ? ap.keyTime(1) : 0;
+            // the attach point is in the tracked layer's pixels: to comp space, then into the target's parent if any
+            attach = "L.motionTracker(" + quote(trk.name) + ")(" + quote(pt.name) + ").attachPoint";
+            p.expression = "var L = thisComp.layer(" + quote(tracked.name) + ");\n" +
+                "var p = L.toComp(" + attach + ");\n" +
+                (!a.keepOffset ? "" :
+                    // stay where the layer is at the track's first key, and move with the track from there
+                    "var here = hasParent ? parent.toComp(value) : value;\n" +
+                    "var q = L.toComp(" + attach + ".valueAtTime(" + t0 + "));\n" +
+                    "p = [p[0] + here[0] - q[0], p[1] + here[1] - q[1], p[2]];\n") +
+                "if (hasParent) p = parent.fromComp(p);\n" +
+                (target.threeDLayer ? "[p[0], p[1], value[2]]" : "[p[0], p[1]]");
+            p.expressionEnabled = true;
+            return {layer: target.name, follows: [tracked.name, trk.name, pt.name], expression: p.expression,
+                error: p.expressionError || null};
+        },
+
+        set_camera: function (a) {
+            var c = findComp(a.comp), cam = findLayer(c, a.layer), opts, set = {}, focus, target, err = null;
+            if (!(cam instanceof CameraLayer)) {
+                fail(cam.name + " is not a camera");
+            }
+            opts = cam.property("ADBE Camera Options Group");
+            function put(match, v, key) {
+                var p = opts.property(match);
+                p.setValue(v);
+                set[key] = plain(p.value);
+            }
+            if (a.focalLength !== undefined) {
+                // zoom in pixels for a lens on a 36 mm wide film back, measured across the comp width
+                put("ADBE Camera Zoom", c.width * a.focalLength / 36, "zoom");
+            }
+            if (a.depthOfField !== undefined) {
+                put("ADBE Camera Depth of Field", a.depthOfField ? 1 : 0, "depthOfField");
+            }
+            if (a.fStop !== undefined) {
+                // f-stop = zoom / aperture
+                put("ADBE Camera Aperture", opts.property("ADBE Camera Zoom").value / a.fStop, "aperture");
+            }
+            if (a.blurLevel !== undefined) {
+                put("ADBE Camera Blur Level", a.blurLevel, "blurLevel");
+            }
+            focus = opts.property("ADBE Camera Focus Distance");
+            if (a.focusDistance !== undefined) {
+                focus.expression = "";
+                put("ADBE Camera Focus Distance", a.focusDistance, "focusDistance");
+            }
+            if (a.focusOn !== undefined) {
+                target = findLayer(c, a.focusOn);
+                // autofocus: the target's distance along the camera's line of sight
+                focus.expression = "var L = thisComp.layer(" + quote(target.name) + ");\n" +
+                    "dot(L.toWorld(L.anchorPoint) - toWorld([0, 0, 0]), toWorldVec([0, 0, 1]))";
+                focus.expressionEnabled = true;
+                err = focus.expressionError || null;
+                set.focusOn = target.name;
+            }
+            return {camera: cam.name, set: set, error: err};
+        },
+
+        set_3d_layer: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), geo, mat, set = {}, k, MATERIAL = {
+                castsShadows: "ADBE Casts Shadows", acceptsShadows: "ADBE Accepts Shadows",
+                acceptsLights: "ADBE Accepts Lights", specular: "ADBE Specular Coefficient",
+                shininess: "ADBE Shininess Coefficient", metal: "ADBE Metal Coefficient",
+                reflection: "ADBE Reflection Coefficient"};
+            if (l instanceof CameraLayer || l instanceof LightLayer) {
+                fail(l.name + " is a " + layerType(l) + ": it has no geometry or material");
+            }
+            l.threeDLayer = true;
+            geo = l.property("ADBE Extrsn Options Group");
+            mat = l.property("ADBE Material Options Group");
+            if ((a.extrusion !== undefined || a.bevel !== undefined) && c.renderer !== "ADBE Calder" &&
+                    c.renderer !== "ADBE Ernst") {
+                c.renderer = "ADBE Calder";  // Classic 3D cannot extrude: switch to the Advanced 3D renderer
+            }
+            if (a.extrusion !== undefined) {
+                geo.property("ADBE Extrsn Depth").setValue(a.extrusion);
+                set.extrusion = plain(geo.property("ADBE Extrsn Depth").value);
+            }
+            if (a.bevel !== undefined) {
+                geo.property("ADBE Bevel Styles").setValue(a.bevelStyle);
+                geo.property("ADBE Bevel Depth").setValue(a.bevel);
+                set.bevel = plain(geo.property("ADBE Bevel Depth").value);
+            }
+            for (k in MATERIAL) {
+                if (MATERIAL.hasOwnProperty(k) && a[k] !== undefined) {
+                    mat.property(MATERIAL[k]).setValue(typeof a[k] === "boolean" ? (a[k] ? 1 : 0) : a[k]);
+                    set[k] = plain(mat.property(MATERIAL[k]).value);
+                }
+            }
+            return {layer: l.name, threeD: l.threeDLayer, renderer: c.renderer, set: set};
+        },
+
+        depth_stack: function (a) {
+            // 2.5D parallax: spread layers back in depth, scaled up so each still fills the same part of the frame from
+            // the camera; a camera move (camera_move) then shows the depth.
+            var c = findComp(a.comp), cam = null, i, l, z, f, d0, pos, sc, out = [];
+            for (i = 1; i <= c.numLayers && !cam; i++) {
+                if (c.layer(i) instanceof CameraLayer && (a.camera === undefined || c.layer(i).name === a.camera ||
+                        i === a.camera)) {
+                    cam = c.layer(i);
+                }
+            }
+            if (!cam) {
+                if (a.camera !== undefined) {
+                    fail("no camera " + a.camera + " in " + c.name);
+                }
+                cam = newCamera(c);
+            }
+            d0 = -transform(cam, "ADBE Position").value[2];  // the camera's distance to the z = 0 plane
+            if (d0 <= 0) {
+                fail(cam.name + " is not in front of the comp (its z must be negative)");
+            }
+            for (i = 0; i < a.layers.length; i++) {
+                l = findLayer(c, a.layers[i]);
+                if (l instanceof CameraLayer || l instanceof LightLayer) {
+                    fail(l.name + " is a " + layerType(l) + ": only visible layers can be stacked");
+                }
+                z = i * a.spacing;
+                l.threeDLayer = true;
+                pos = transform(l, "ADBE Position");
+                pos.setValue([pos.value[0], pos.value[1], z]);
+                sc = transform(l, "ADBE Scale");
+                // at distance d0 + z a layer looks d0 / (d0 + z) as big: scale it back up
+                f = a.compensate ? (d0 + z) / d0 : 1;
+                sc.setValue([sc.value[0] * f, sc.value[1] * f, sc.value[2]]);
+                out.push({layer: l.name, z: z, scale: round(sc.value[0], 2)});
+            }
+            return {camera: cam.name, layers: out};
         },
 
         run_jsx: function (a) {

@@ -4,6 +4,7 @@
 "use strict";
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
 
 const PropertyType = {PROPERTY: 6812, INDEXED_GROUP: 6813, NAMED_GROUP: 6814};
 const PropertyValueType = {NO_VALUE: 6412, ThreeD_SPATIAL: 6413, ThreeD: 6414, TwoD_SPATIAL: 6415, TwoD: 6416,
@@ -20,6 +21,53 @@ const BlendingMode = {NORMAL: 5212, DISSOLVE: 5213, DARKEN: 5214, MULTIPLY: 5215
 const ImportAsType = {COMP_CROPPED_LAYERS: 3812, FOOTAGE: 3813, COMP: 3814, PROJECT: 3815};
 const LightType = {PARALLEL: 4412, SPOT: 4413, POINT: 4414, AMBIENT: 4415};
 const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
+const AutoOrientType = {NO_AUTO_ORIENT: 4212, ALONG_PATH: 4213, CAMERA_OR_POINT_OF_INTEREST: 4214,
+    CHARACTERS_TOWARD_CAMERA: 4215};
+const RENDERERS = ["ADBE Advanced 3d", "ADBE Calder", "ADBE Ernst"];
+
+// Footage whose file name starts with "moving" shows a checkered 30 px square on gray, its center at
+// (100 + 60 t, 150 + 20 t) source pixels at t seconds into the layer: what track_point follows in the tests.
+function movingSquare(x, y, t) {
+    const cx = 100 + 60 * t, cy = 150 + 20 * t;
+    if (Math.abs(x - cx) > 15 || Math.abs(y - cy) > 15) {
+        return 40;
+    }
+    return (Math.floor((x - cx + 15) / 6) + Math.floor((y - cy + 15) / 6)) % 2 ? 230 : 90;
+}
+
+// An 8-bit RGB PNG, each row with the next of the five PNG filters so the decoder meets all of them.
+function encodePng(w, h, gray) {
+    const rows = [];
+    let prev = Buffer.alloc(w * 3);
+    for (let y = 0; y < h; y++) {
+        const line = Buffer.alloc(w * 3);
+        for (let x = 0; x < w; x++) {
+            line.fill(gray(x, y), x * 3, x * 3 + 3);
+        }
+        const f = y % 5, out = Buffer.alloc(w * 3 + 1);
+        out[0] = f;
+        for (let i = 0; i < w * 3; i++) {
+            const a = i >= 3 ? line[i - 3] : 0, b = prev[i], c = i >= 3 ? prev[i - 3] : 0;
+            const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+            const pred = [0, a, b, (a + b) >> 1, pa <= pb && pa <= pc ? a : pb <= pc ? b : c][f];
+            out[i + 1] = (line[i] - pred) & 255;
+        }
+        rows.push(out);
+        prev = line;
+    }
+    const chunk = (kind, data) => {
+        const len = Buffer.alloc(4), crc = Buffer.alloc(4);
+        len.writeUInt32BE(data.length);
+        crc.writeUInt32BE(zlib.crc32(Buffer.concat([Buffer.from(kind), data])));
+        return Buffer.concat([len, Buffer.from(kind), data, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(w, 0);
+    ihdr.writeUInt32BE(h, 4);
+    ihdr.set([8, 2, 0, 0, 0], 8);
+    return Buffer.concat([PNG.subarray(0, 8), chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(Buffer.concat(rows))),
+        chunk("IEND", Buffer.alloc(0))]);
+}
 // PNG signature + an empty IEND chunk: export_frame waits for IEND.
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
 
@@ -245,6 +293,36 @@ function makeAE(CtxArray) {
             this._check();
             Object.assign(this.keys[i - 1], {inType, outType});
         }
+        _spatial(i) {
+            this._check();
+            if (!this.isSpatial) {
+                throw new Error("After Effects error: " + this.name + " is not a spatial property");
+            }
+            return this.keys[i - 1];
+        }
+        setSpatialAutoBezierAtKey(i, on) { this._spatial(i).spatialAuto = on; }
+        setSpatialContinuousAtKey(i, on) { this._spatial(i).spatialContinuous = on; }
+        setSpatialTangentsAtKey(i, inT, outT) {
+            if (inT.length !== this._value.length || outT.length !== this._value.length) {
+                throw new Error("After Effects error: tangents need " + this._value.length + " values");
+            }
+            this._spatial(i).tangents = [Array.from(inT), Array.from(outT)];
+        }
+        setRovingAtKey(i, on) {
+            // only inner keys of a spatial property can rove
+            if (i === 1 || i === this.keys.length) {
+                throw new Error("After Effects error: the first and last keyframes cannot rove");
+            }
+            this._spatial(i).roving = on;
+        }
+        setTemporalContinuousAtKey(i, on) { this._check(); this.keys[i - 1].temporalContinuous = on; }
+        setTemporalAutoBezierAtKey(i, on) {
+            this._check();
+            if (this.keys[i - 1].inType !== KeyframeInterpolationType.BEZIER) {
+                throw new Error("After Effects error: temporal auto Bezier needs Bezier keyframes");
+            }
+            this.keys[i - 1].temporalAuto = on;
+        }
         setTemporalEaseAtKey(i, inEase, outEase) {
             this._check();
             const dims = (Array.isArray(this._value) && !this.isSpatial) ? this._value.length : 1;
@@ -308,10 +386,12 @@ function makeAE(CtxArray) {
             }
             const [display, build, extra] = this.factories[n];
             const made = build();
+            const count = this.children.filter((c) => c.matchName === n).length + 1;
             let prop = made;
             if (Array.isArray(made)) {
-                const count = this.children.filter((c) => c.matchName === n).length + 1;
                 prop = Object.assign(new PropertyGroup(display + " " + count, n, made), extra ? extra() : {});
+            } else if (made instanceof AddGroup) {
+                made.name = display + " " + count;
             }
             this.children.push(prop);
             return prop;
@@ -394,6 +474,29 @@ function makeAE(CtxArray) {
                 "ADBE Text Blur": ["Blur", P("Blur", "ADBE Text Blur", [0, 0], PropertyValueType.TwoD)],
             })]],
     });
+
+    const trackers = () => new AddGroup("Motion Trackers", "ADBE MTrackers", {
+        "ADBE MTracker": ["Tracker", () => new AddGroup(null, "ADBE MTracker", {
+            "ADBE MTracker Pt": ["Track Point", () => [
+                new Property("Feature Center", "ADBE MTracker Pt Feature Center", [0, 0], PropertyValueType.TwoD_SPATIAL,
+                    true),
+                new Property("Feature Size", "ADBE MTracker Pt Feature Size", [20, 20], PropertyValueType.TwoD),
+                new Property("Search Size", "ADBE MTracker Pt Search Size", [40, 40], PropertyValueType.TwoD),
+                new Property("Confidence", "ADBE MTracker Pt Confidence", 0, PropertyValueType.OneD),
+                new Property("Attach Point", "ADBE MTracker Pt Attach Pt", [0, 0], PropertyValueType.TwoD_SPATIAL,
+                    true)]],
+        })],
+    });
+    const geometry = () => new PropertyGroup("Geometry Options", "ADBE Extrsn Options Group", [
+        new Property("Bevel Style", "ADBE Bevel Styles", 1, PropertyValueType.OneD),
+        new Property("Bevel Depth", "ADBE Bevel Depth", 2, PropertyValueType.OneD),
+        new Property("Extrusion Depth", "ADBE Extrsn Depth", 0, PropertyValueType.OneD)]);
+    const material = () => new PropertyGroup("Material Options", "ADBE Material Options Group", [
+        ["Casts Shadows", "ADBE Casts Shadows", 0], ["Accepts Shadows", "ADBE Accepts Shadows", 1],
+        ["Accepts Lights", "ADBE Accepts Lights", 1], ["Specular Intensity", "ADBE Specular Coefficient", 50],
+        ["Specular Shininess", "ADBE Shininess Coefficient", 5], ["Metal", "ADBE Metal Coefficient", 100],
+        ["Reflection Intensity", "ADBE Reflection Coefficient", 0],
+    ].map(([n, m, v]) => new Property(n, m, v, PropertyValueType.OneD)));
 
     class EffectParade extends PropertyGroup {
         constructor() {
@@ -481,12 +584,17 @@ function makeAE(CtxArray) {
                 new EffectParade(),
                 masks(),
                 new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER),
+                trackers(),
+                geometry(),
+                material(),
             ];
             if (source && source.hasAudio) {
                 this.groups.push(new PropertyGroup("Audio", "ADBE Audio Group", [
                     new Property("Audio Levels", "ADBE Audio Levels", [0, 0], PropertyValueType.TwoD)]));
             }
             this.selected = false;
+            this.autoOrient = AutoOrientType.NO_AUTO_ORIENT;
+            this.stretch = 100;
             Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
                 solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
         }
@@ -630,15 +738,23 @@ function makeAE(CtxArray) {
             return {left: -100, top: -100, width: 200, height: 200};
         }
     }
-    const NOT_ON_3D = ["ADBE Effect Parade", "ADBE Mask Parade"];
+    const NOT_ON_3D = ["ADBE Effect Parade", "ADBE Mask Parade", "ADBE MTrackers", "ADBE Extrsn Options Group",
+        "ADBE Material Options Group"];
     class CameraLayer extends AVLayer {
-        constructor(comp, name) {
+        constructor(comp, name, center) {
             super(comp, name);
             this.groups = this.groups.filter((g) => !NOT_ON_3D.includes(g.matchName));
-            // a camera's anchor point is its point of interest; it starts 1777.8 px in front of the comp
+            // a camera's anchor point is its point of interest, at the given center; like After Effects 26 the
+            // camera itself starts at [0, 0, -zoom] whatever the center
             const t = this.groups[0].children;
-            t[0]._value = [comp.width / 2, comp.height / 2, 0];
-            t[1]._value = [comp.width / 2, comp.height / 2, -1777.8];
+            t[0]._value = [center[0], center[1], 0];
+            t[1]._value = [0, 0, -1777.8];
+            this.groups.push(new PropertyGroup("Camera Options", "ADBE Camera Options Group", [
+                new Property("Zoom", "ADBE Camera Zoom", 1777.8, PropertyValueType.OneD),
+                new Property("Depth of Field", "ADBE Camera Depth of Field", 0, PropertyValueType.OneD),
+                new Property("Focus Distance", "ADBE Camera Focus Distance", 1777.8, PropertyValueType.OneD),
+                new Property("Aperture", "ADBE Camera Aperture", 25.3, PropertyValueType.OneD),
+                new Property("Blur Level", "ADBE Camera Blur Level", 100, PropertyValueType.OneD)]));
         }
     }
     class LightLayer extends AVLayer {
@@ -708,8 +824,8 @@ function makeAE(CtxArray) {
             l.nullLayer = true;
             return this._top(l);
         }
-        addCamera(name) {
-            return this._top(new CameraLayer(this.comp, name));
+        addCamera(name, center) {
+            return this._top(new CameraLayer(this.comp, name, center));
         }
         addLight(name) {
             return this._top(new LightLayer(this.comp, name));
@@ -752,6 +868,24 @@ function makeAE(CtxArray) {
             Object.assign(this, {motionBlur: false, shutterAngle: 180, shutterPhase: -90});
             this.motionGraphicsTemplateName = name;
             this._wa = [0, dur];
+            this._renderer = RENDERERS[0];
+            Object.assign(this, {motionBlur: false, shutterAngle: 180, shutterPhase: -90});
+        }
+        get renderers() { return arr(RENDERERS); }
+        get renderer() { return this._renderer; }
+        set renderer(r) {
+            needUndo();
+            if (!RENDERERS.includes(r)) {
+                throw new Error("After Effects error: unknown renderer " + r);
+            }
+            this._renderer = r;
+        }
+        get frameDuration() {
+            return 1 / this.frameRate;
+        }
+        remove() {
+            needUndo();
+            project._items.splice(project._items.indexOf(this), 1);
         }
         get workAreaStart() { return this._wa[0]; }
         set workAreaStart(v) {
@@ -803,7 +937,22 @@ function makeAE(CtxArray) {
             if (t < 0 || t > this.duration) {
                 throw new Error("time " + t + " is outside the comp");
             }
-            fs.writeFileSync(file.fsName, PNG);
+            const l = this._layers.find((x) => x.source && x.source.file && /^moving/.test(x.source.file.name));
+            if (!l) {
+                fs.writeFileSync(file.fsName, PNG);
+                return;
+            }
+            // the layer at position p with anchor a shows source pixel (x - p + a); 4 x 4 samples per pixel
+            const tg = l.property("ADBE Transform Group"), p = tg.property("ADBE Position").value,
+                a = tg.property("ADBE Anchor Point").value, st = t - l.startTime;
+            fs.writeFileSync(file.fsName, encodePng(this.width, this.height, (x, y) => {
+                let sum = 0;
+                for (let i = 0; i < 16; i++) {
+                    sum += movingSquare(x + (i % 4 + 0.5) / 4 - p[0] + a[0], y + (Math.floor(i / 4) + 0.5) / 4 - p[1] + a[1],
+                        st);
+                }
+                return Math.round(sum / 16);
+            }));
         }
     }
 
@@ -1017,7 +1166,7 @@ function makeAE(CtxArray) {
         globals: {app, CompItem, FolderItem, FootageItem, SolidSource, TextLayer, ShapeLayer, CameraLayer, LightLayer,
             PropertyType, PropertyValueType, KeyframeInterpolationType, KeyframeEase, RQItemStatus,
             ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue,
-            LightType, ImportAsType},
+            LightType, ImportAsType, AutoOrientType},
     };
 }
 

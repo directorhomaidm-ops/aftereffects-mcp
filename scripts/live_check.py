@@ -86,6 +86,28 @@ def write_png(path, w, h, rgb):
                            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
+def write_moving_square(folder, frames=31, w=640, h=360):
+    """A PNG sequence: a checkered 24 px square on gray, centered at (100 + 12 f, 150 + 4 f) on frame f."""
+    for f in range(frames):
+        cx, cy = 100 + 12 * f, 150 + 4 * f
+        rows = []
+        for y in range(h):
+            row = bytearray(b"\x28" * (w * 3))
+            if abs(y - cy) < 12:
+                for x in range(cx - 12, cx + 12):
+                    v = 230 if ((x - cx + 12) // 6 + (y - cy + 12) // 6) % 2 else 90
+                    row[x * 3:x * 3 + 3] = bytes((v, v, v))
+            rows.append(bytes(row))
+        raw = b"".join(b"\x00" + r for r in rows)
+
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+        (folder / f"square_{f:04d}.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
 def main():
     work = Path(tempfile.mkdtemp(prefix="aemcp_live_"))
     print(f"Work folder (kept): {work}\n")
@@ -269,6 +291,24 @@ def main():
         ["Caption 1", "Caption 2"], comp="aemcp check"), needs=have)
     step("render_queue_list + clear finished items", lambda: (d.render_queue_list(), d.clear_render_queue())[1],
          needs=have, note="RQItemStatus names and RenderQueueItem.remove")
+    print("\nMotion, tracking, 3D")
+    step("motion_path: curved, even speed, auto-orient", lambda: _path(), needs=have,
+         note="spatial auto Bezier, roving inner keys, AutoOrientType.ALONG_PATH")
+    step("bezier_ease ease_in_out_cubic matches the curve", lambda: _ease(), needs=have,
+         note="rotation sampled against cubic-bezier(0.65, 0, 0.35, 1)")
+    step("set_comp motion blur 180", lambda: d.set_comp("aemcp check", motion_blur=True, shutter_angle=180),
+         needs=have)
+    seq = work / "track"
+    seq.mkdir()
+    write_moving_square(seq)
+    track = step("track_point a moving square (1 s)", lambda: _track(seq), needs=have,
+                 note="the square's center moves 12 px right and 4 px down per frame: max error in pixels")
+    step("attach_to_track: a text follows the track", lambda: _attach(), needs=True if track else "no track")
+    step("set_camera 50 mm, depth of field, autofocus", lambda: _lens(), needs=have)
+    step("set_3d_layer: extruded, beveled text", lambda: _extrude(work), needs=have,
+         note="the comp switches to the Advanced 3D renderer (ADBE Calder); a frame renders")
+    step("depth_stack three layers + camera push", lambda: _stack(work), needs=have)
+
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -465,6 +505,96 @@ def write_report(info, work):
     (work / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Report: {work / 'report.md'}  (send this file back)")
     return 1 if counts["FAIL"] else 0
+
+
+def _path():
+    d.add_shape("star", size=[120, 120], layer_name="Flyer", comp="aemcp check")
+    out = d.motion_path("Flyer", [[100, 300], [900, 700], [200, 1200], [900, 1700]], duration=3, constant_speed=True,
+                        auto_orient=True, comp="aemcp check")
+    keys = d.get_property("Flyer", "position", comp="aemcp check")["keys"]
+    expect(len(keys) == 4, f"{len(keys)} keys")
+    return {**out, "times": [k["time"] for k in keys]}
+
+
+def _css(x1, y1, x2, y2, x):
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        t = (lo + hi) / 2
+        bx = 3 * (1 - t) ** 2 * t * x1 + 3 * (1 - t) * t * t * x2 + t ** 3
+        lo, hi = (t, hi) if bx < x else (lo, t)
+    t = (lo + hi) / 2
+    return 3 * (1 - t) ** 2 * t * y1 + 3 * (1 - t) * t * t * y2 + t ** 3
+
+
+def _ease():
+    d.set_keyframes("Flyer", "rotation", [{"time": 0, "value": 0}, {"time": 2, "value": 360}], comp="aemcp check")
+    d.bezier_ease("Flyer", "rotation", "ease_in_out_cubic", comp="aemcp check")
+    got = d.run_jsx('var c = null, i; for (i = 1; i <= app.project.numItems; i++) '
+                    'if (app.project.item(i).name === "aemcp check") c = app.project.item(i); '
+                    'var p = c.layer("Flyer").property("ADBE Transform Group").property("ADBE Rotate Z"), r = []; '
+                    'for (i = 0; i <= 8; i++) r.push(p.valueAtTime(i / 4, true)); r')
+    err = max(abs(v / 360 - _css(0.65, 0, 0.35, 1, i / 8)) for i, v in enumerate(got))
+    expect(err < 0.002, f"off the curve by {err:.4f}")
+    return {"samples": got, "max_error": round(err, 5)}
+
+
+def _track(seq):
+    it = d.import_file(str(seq / "square_0000.png"), sequence=True)
+    d.run_jsx(f"app.project.itemByID({it['id']}).mainSource.conformFrameRate = 30; 1")
+    d.create_comp("track check", 640, 360, 1, 30)
+    d.add_layer("item", item=it["id"], name="Plate", comp="track check")
+    out = d.track_point("Plate", [100, 150], start=0, end=1, comp="track check")
+    keys = d.get_property("Plate", ["Motion Trackers", "aemcp track", "Track Point 1", "Attach Point"],
+                          comp="track check")["keys"]
+    err = max(max(abs(k["value"][0] - (100 + 360 * k["time"])), abs(k["value"][1] - (150 + 120 * k["time"])))
+              for k in keys)
+    expect(err < 0.75, f"the track is off by {err:.2f} px")
+    return {**out, "max_error_px": round(err, 3)}
+
+
+def _attach():
+    d.add_layer("text", text="TRACKED", name="Tag", comp="track check")
+    out = d.attach_to_track("Tag", "Plate", comp="track check")
+    expect(out["error"] is None, f"expression error: {out['error']}")
+    at = d.run_jsx('var c = null, i; for (i = 1; i <= app.project.numItems; i++) '
+                   'if (app.project.item(i).name === "track check") c = app.project.item(i); '
+                   'c.layer("Tag").property("ADBE Transform Group").property("ADBE Position").valueAtTime(0.5, false)')
+    expect(abs(at[0] - 280) < 1 and abs(at[1] - 210) < 1, f"at 0.5 s the text is at {at}, the square at [280, 210]")
+    return {"expression_error": out["error"], "position_at_0.5s": at}
+
+
+def _lens():
+    d.add_layer("text", text="FOCUS", name="Focus target", comp="aemcp check")
+    out = d.set_camera("Camera", focal_length=50, depth_of_field=True, f_stop=2.8, focus_on="Focus target",
+                       comp="aemcp check")
+    expect(out["error"] is None, f"autofocus expression error: {out['error']}")
+    return out
+
+
+def _extrude(work):
+    d.create_comp("extrude check", 1080, 1080, 1, 30)
+    d.add_layer("text", text="3D", name="Logo", comp="extrude check")
+    d.set_text("Logo", size=400, comp="extrude check")
+    d.add_layer("light", name="Key", comp="extrude check")
+    out = d.set_3d_layer("Logo", extrusion=80, bevel=6, bevel_style="convex", metal=60, comp="extrude check")
+    d.set_property("Logo", ["ADBE Transform Group", "ADBE Rotate Y"], 35, comp="extrude check")
+    d.add_layer("camera", name="Cam", comp="extrude check")
+    path = work / "extrude.png"
+    d.export_frame(str(path), time=0, comp="extrude check")
+    return {**out, "frame": str(path)}
+
+
+def _stack(work):
+    d.create_comp("stack check", 1920, 1080, 4, 30)
+    for name, color in (("Sky", [0.2, 0.4, 0.8]), ("Hills", [0.2, 0.6, 0.3]), ("Tree", [0.4, 0.25, 0.1])):
+        d.add_layer("solid", name=name, color=color, comp="stack check")
+    d.set_property("Hills", "scale", [60, 40], comp="stack check")
+    d.set_property("Tree", "scale", [15, 50], comp="stack check")
+    out = d.depth_stack(["Tree", "Hills", "Sky"], spacing=800, comp="stack check")
+    d.camera_move("pan_right", amount=500, duration=4, camera="Camera", comp="stack check")
+    path = work / "stack.png"
+    d.export_frame(str(path), time=2, comp="stack check")
+    return {**out, "frame": str(path)}
 
 
 if __name__ == "__main__":
