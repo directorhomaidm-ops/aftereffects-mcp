@@ -24,6 +24,7 @@ def test_all_tools_registered():
         "captions_from_srt", "render_background", "render_background_status", "mogrt_add_property", "export_mogrt",
         "bake_expression", "ease_keyframes", "copy_keyframes", "stagger_layers", "split_layer", "trim_comp",
         "make_variants", "import_layered", "find_missing_footage",
+        "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
 
 
@@ -535,14 +536,17 @@ def test_set_comp(ae):
     d.create_comp("Main", duration=10, frame_rate=25)
     out = d.set_comp(name="Final", width=1080, height=1350, frame_rate=30, bg_color=[1, 1, 1], work_area=[2, 6])
     assert out == {"id": 1, "name": "Final", "width": 1080, "height": 1350, "duration": 10, "frameRate": 30,
-                   "workArea": [2, 6]}
+                   "workArea": [2, 6], "motionBlur": False, "shutterAngle": 180}
+    blur = d.set_comp("Final", motion_blur=True, shutter_angle=270)
+    assert (blur["motionBlur"], blur["shutterAngle"]) == (True, 270)
+    assert ae.inspect("ae.app.project.item(1).shutterPhase") == -135  # centered on the frame
     assert d.set_comp("Final", work_area=[8, 9.5])["workArea"] == [8, 9.5]  # moving later than the old end
     assert d.set_comp("Final", work_area=[0, 10])["workArea"] == [0, 10]  # longer than 10 - 8: start moves first
     assert d.set_comp("Final", work_area=[0, 1])["workArea"] == [0, 1]
     with pytest.raises(ToolError, match="inside the comp"):
         d.set_comp("Final", work_area=[5, 12])
     for kwargs, msg in [({"width": 2}, "width"), ({"duration": 0}, "duration"), ({"frame_rate": 0}, "frame_rate"),
-                        ({"work_area": [1]}, r"\[start, end\]")]:
+                        ({"work_area": [1]}, r"\[start, end\]"), ({"shutter_angle": 800}, "shutter_angle")]:
         with pytest.raises(ToolError, match=msg):
             d.set_comp("Final", **kwargs)
 
@@ -1154,3 +1158,271 @@ def test_find_missing_footage(ae, tmp_path):
     assert (out["still_missing"], out["files_searched"]) == (["b.mov"], 1)
     with pytest.raises(ToolError, match="folder not found"):
         d.find_missing_footage(search=str(tmp_path / "nowhere"))
+
+
+# --- motion ---
+
+POS = "ae.app.project.item(1).layer(1).groups[0].children[1]"  # a layer's Position
+
+
+def test_motion_path(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="Plane")
+    out = d.motion_path("Plane", [[0, 500], [600, 200], [1200, 500], [1800, 200]], duration=3, start=1,
+                        auto_orient=True)
+    assert out == {"layer": "Plane", "keys": 4, "from": 1, "to": 4, "smooth": True, "constantSpeed": False,
+                   "autoOrient": True}
+    keys = ae.inspect(f"{POS}.keys")
+    assert [k["time"] for k in keys] == [1, 2, 3, 4]
+    assert keys[1]["value"] == [600, 200, 0]  # 2D points keep the layer's z
+    assert [k["spatialAuto"] for k in keys] == [True] * 4  # curved through the points
+    assert [k["outType"] for k in keys] == [6613, 6613, 6613, 6613]  # ends eased, inner keys Bezier
+    assert [k.get("temporalContinuous", False) for k in keys] == [False, True, True, False]  # no stop inside
+    assert ae.inspect("ae.app.project.item(1).layer(1).autoOrient") == 4213
+    # straight lines at an even speed: flat tangents, inner keys rove, linear ends; old keys replaced
+    d.motion_path("Plane", [[0, 0, 0], [100, 0, 50], [100, 100, 50]], times=[0, 1, 5], smooth=False,
+                  constant_speed=True)
+    keys = ae.inspect(f"{POS}.keys")
+    assert [k["time"] for k in keys] == [0, 1, 5]
+    assert keys[0]["tangents"] == [[0, 0, 0], [0, 0, 0]]
+    assert [k.get("roving", False) for k in keys] == [False, True, False]
+    assert (keys[0]["outType"], keys[2]["inType"]) == (6612, 6612)
+    for kwargs, msg in [({"points": [[0, 0]]}, "at least 2 points"), ({"points": [[0], [1]]}, "at least 2 points"),
+                        ({"times": [1, 1]}, "increasing"), ({"times": [0]}, "one increasing time"),
+                        ({"duration": 0}, "duration")]:
+        with pytest.raises(ToolError, match=msg):
+            d.motion_path("Plane", **{"points": [[0, 0], [9, 9]], **kwargs})
+
+
+def test_bezier_ease(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="S")
+    d.set_keyframes("S", "rotation", [{"time": 0, "value": 0}, {"time": 2, "value": 100}, {"time": 4, "value": 0}])
+    out = d.bezier_ease("S", "rotation", "ease")  # CSS ease: cubic-bezier(0.25, 0.1, 0.25, 1)
+    assert out == {"property": "Rotation", "segments": 2, "keys": [1, 3], "curve": "ease"}
+    keys = ae.inspect("ae.app.project.item(1).layer(1).groups[0].children[5].keys"
+                      ".map(k => [k.inEase && Array.from(k.inEase, e => [e.speed, e.influence]),"
+                      " Array.from(k.outEase, e => [e.speed, e.influence])])")
+    # out of key 1: influence 25 %, speed 0.1 / 0.25 x 50 per second; into key 2: 75 %, speed 0
+    assert keys[0][1] == [[20, 25]]
+    assert keys[1] == [[[0, 75]], [[-20, 25]]]  # falling segment: signed speed
+    assert keys[2][0] == [[0, 75]]
+    # multi-dimensional: one ease per dimension, each with its own signed speed
+    d.set_keyframes("S", "scale", [{"time": 0, "value": [100, 100]}, {"time": 1, "value": [200, 50]}])
+    d.bezier_ease("S", "scale", [0.5, 0.5, 0.5, 0.5])
+    scale = ae.inspect("Array.from(ae.app.project.item(1).layer(1).groups[0].children[2].keys[0].outEase,"
+                       " e => [e.speed, e.influence])")
+    assert scale == [[100, 50], [-50, 50], [0, 50]]
+    # spatial: one ease, the speed along the path; overshoot refused there
+    d.set_keyframes("S", "position", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [300, 400]}])
+    d.bezier_ease("S", "position", [0.5, 1, 0.5, 1])
+    assert ae.inspect(f"Array.from({POS}.keys[0].outEase, e => [e.speed, e.influence])") == [[1000, 50]]
+    with pytest.raises(ToolError, match="overshoot"):
+        d.bezier_ease("S", "position", "ease_out_back")
+    d.bezier_ease("S", "rotation", "ease_out_back", keys=[1, 2])  # fine on a 1D property, one segment
+    # x of 0 or 1 would make an influence of 0: kept at the 0.1 % minimum
+    d.bezier_ease("S", "rotation", "ease_out", keys=[2, 3])
+    assert ae.inspect("ae.app.project.item(1).layer(1).groups[0].children[5].keys[1].outEase[0].influence") == 0.1
+    for kwargs, msg in [({"curve": "springy"}, "curve must be"), ({"curve": [0.5, 0, 1.5, 1]}, "x1 and x2 0-1"),
+                        ({"curve": [1, 2]}, r"\[x1, y1, x2, y2\]"), ({"keys": [1]}, r"\[first, last\]")]:
+        with pytest.raises(ToolError, match=msg):
+            d.bezier_ease("S", "rotation", **kwargs)
+    with pytest.raises(ToolError, match="within 1-3"):
+        d.bezier_ease("S", "rotation", keys=[2, 5])
+    with pytest.raises(ToolError, match="at least 2 keyframes"):
+        d.bezier_ease("S", "opacity")
+
+
+# --- tracking ---
+
+
+def _png(w, h, gray, filters=(0, 1, 2, 3, 4)):
+    """An 8-bit RGBA PNG, row y filtered with filters[y % len(filters)]."""
+    import struct
+    import zlib
+    rows, prev = [], bytes(w * 4)
+    for y in range(h):
+        line = bytes(v for x in range(w) for v in (gray(x, y),) * 3 + (255,))
+        f, out = filters[y % len(filters)], bytearray([filters[y % len(filters)]])
+        for i in range(w * 4):
+            a, b, c = (line[i - 4] if i >= 4 else 0), prev[i], (prev[i - 4] if i >= 4 else 0)
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            pred = [0, a, b, (a + b) // 2, a if pa <= pb and pa <= pc else b if pb <= pc else c][f]
+            out.append((line[i] - pred) & 255)
+        rows.append(bytes(out))
+        prev = line
+    chunk = lambda k, data: struct.pack(">I", len(data)) + k + data + struct.pack(">I", zlib.crc32(k + data))  # noqa
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b""))
+
+
+def test_png_gray_decodes_every_filter():
+    gray = lambda x, y: (x * 37 + y * 11) % 256  # noqa: E731
+    w, rows = d._png_gray(_png(23, 11, gray))
+    assert w == 23 and len(rows) == 11
+    assert all(rows[y][x] == pytest.approx(gray(x, y), abs=1e-6) for y in range(11) for x in range(23))
+    with pytest.raises(ToolError, match="8-bit RGB or RGBA"):
+        d._png_gray(_png(4, 4, gray)[:24] + bytes([16]) + _png(4, 4, gray)[25:])  # a 16-bit header
+
+
+def test_match_finds_a_shifted_feature():
+    # a 9 x 9 pattern hidden in a 29 x 29 window, 3 px right and 2 px up of center
+    pat = lambda x, y: (x * 53 + y * 97 + x * y * 7) % 200 + 20  # noqa: E731
+    feature, radius = 9, 10
+    tmpl = [pat(x, y) for y in range(feature) for x in range(feature)]
+    img = [[5.0] * 29 for _ in range(29)]
+    for y in range(feature):
+        for x in range(feature):
+            img[radius - 2 + y][radius + 3 + x] = pat(x, y)
+    dx, dy, score = d._match(img, tmpl, feature, radius)
+    assert (round(dx), round(dy)) == (3, -2) and score > 0.99
+
+
+def test_track_point_and_attach(ae, tmp_path):
+    clip = tmp_path / "moving.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))  # the fake shows a square moving from (100, 150) at 60, 20 px per second
+    d.create_comp("Main", 1920, 1080, duration=5, frame_rate=25)
+    d.add_layer("item", item="moving.mov")
+    out = d.track_point("moving.mov", [100, 150], start=0, end=1, feature=25, search=12)
+    assert (out["tracker"], out["point"], out["keys"], out["from"], out["to"]) == \
+        ("aemcp track", "Track Point 1", 26, 0, 1)
+    # sharp edges between whole pixels match a little less well: 0.9 there, 1 where the square lands on the grid
+    assert out["min_confidence"] > 0.85 and out["lost_frames"] == 0
+    assert out["end"] == [pytest.approx(160, abs=0.25), pytest.approx(170, abs=0.25)]
+    pt = ("ae.app.project.item(2).layer(1).property('ADBE MTrackers').property(1).property(1)")
+    attach = ae.inspect(f"{pt}.property('ADBE MTracker Pt Attach Pt').keys.map(k => [k.time, k.value])")
+    for t, (x, y) in attach:
+        assert (x, y) == (pytest.approx(100 + 60 * t, abs=0.25), pytest.approx(150 + 20 * t, abs=0.25))
+    assert ae.inspect(f"{pt}.property('ADBE MTracker Pt Feature Size')._value") == [25, 25]
+    assert "aemcp track window" not in [i["name"] for i in d.list_items()]  # the window comp is removed
+    # tracking again replaces the point's keys
+    assert d.track_point("moving.mov", [100, 150], start=0, end=0.2, feature=25, search=12)["keys"] == 6
+    assert ae.inspect(f"{pt}.property('ADBE MTracker Pt Attach Pt').keys.length") == 6
+
+    d.add_layer("text", text="Label")
+    follow = d.attach_to_track("Label", "moving.mov")
+    assert follow["follows"] == ["moving.mov", "aemcp track", "Track Point 1"]
+    expr = follow["expression"]
+    assert 'L.motionTracker("aemcp track")("Track Point 1").attachPoint' in expr
+    assert "if (hasParent) p = parent.fromComp(p);" in expr and expr.endswith("[p[0], p[1]]")
+    assert follow["error"] is None
+    offset = d.attach_to_track("Label", "moving.mov", tracker=1, point="Track Point 1", keep_offset=True)
+    assert ".attachPoint.valueAtTime(0)" in offset["expression"]  # aligned at the track's first key
+    d.set_switches("Label", three_d=True)
+    assert d.attach_to_track("Label", "moving.mov")["expression"].endswith("[p[0], p[1], value[2]]")
+
+
+def test_track_errors(ae, tmp_path):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Plate")
+    with pytest.raises(ToolError, match="no footage to track"):
+        d.track_point("Plate", [10, 10])
+    for kwargs, msg in [({"point": [1]}, r"\[x, y\]"), ({"feature": 30}, "odd"), ({"search": 2}, "search")]:
+        with pytest.raises(ToolError, match=msg):
+            d.track_point("Plate", **{"point": [10, 10], **kwargs})
+    clip = tmp_path / "moving.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))
+    d.add_layer("item", item="moving.mov")
+    with pytest.raises(ToolError, match="end must come after start"):
+        d.track_point("moving.mov", [100, 150], start=2, end=1)
+    d.time_remap("moving.mov", [{"time": 0, "source": 0}, {"time": 1, "source": 2}])
+    with pytest.raises(ToolError, match="precompose"):
+        d.track_point("moving.mov", [100, 150])
+    assert "aemcp track window" not in [i["name"] for i in d.list_items()]
+    d.add_layer("text", text="Label")
+    with pytest.raises(ToolError, match="has no tracks"):
+        d.attach_to_track("Label", "Plate")
+    with pytest.raises(ToolError, match="its own track"):
+        d.attach_to_track("Plate", "Plate")
+
+
+def test_attach_errors(ae, tmp_path):
+    clip = tmp_path / "moving.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))
+    d.create_comp("Main", duration=5, frame_rate=25)
+    d.add_layer("item", item="moving.mov")
+    d.track_point("moving.mov", [100, 150], start=0, end=0.1, feature=25, search=12)
+    d.add_layer("text", text="Label")
+    with pytest.raises(ToolError, match="no tracker Nope"):
+        d.attach_to_track("Label", "moving.mov", tracker="Nope")
+    with pytest.raises(ToolError, match="no track point 3"):
+        d.attach_to_track("Label", "moving.mov", point=3)
+    d.set_keyframes("Label", "position", [{"time": 0, "value": [0, 0]}])
+    with pytest.raises(ToolError, match="position is animated"):
+        d.attach_to_track("Label", "moving.mov")
+
+
+# --- 3D ---
+
+
+def test_set_camera(ae):
+    d.create_comp("Main", 1920, 1080)
+    d.add_layer("camera", name="Cam")
+    # in front of the center, facing it straight on (After Effects 26 alone would put it at x = y = 0)
+    assert ae.inspect("ae.app.project.item(1).layer(1).groups[0].children[1]._value") == [960, 540, -1777.8]
+    d.add_layer("text", text="Hero")
+    out = d.set_camera("Cam", focal_length=50, depth_of_field=True, f_stop=2.8, blur_level=150, focus_on="Hero")
+    assert out["set"] == {"zoom": pytest.approx(2666.6667), "depthOfField": 1,
+                          "aperture": pytest.approx(952.381, abs=1e-3), "blurLevel": 150, "focusOn": "Hero"}
+    focus = ae.inspect("ae.app.project.item(1).layer(2).property('ADBE Camera Options Group')"
+                       ".property('ADBE Camera Focus Distance')")
+    assert focus["expressionEnabled"] and 'thisComp.layer("Hero")' in focus["expression"]
+    assert "toWorldVec([0, 0, 1])" in focus["expression"]
+    fixed = d.set_camera("Cam", focus_distance=900)  # a fixed distance replaces the autofocus
+    assert fixed["set"] == {"focusDistance": 900}
+    assert ae.inspect("ae.app.project.item(1).layer(2).property('ADBE Camera Options Group')"
+                      ".property('ADBE Camera Focus Distance').expression") == ""
+    with pytest.raises(ToolError, match="Hero is not a camera"):
+        d.set_camera("Hero", focal_length=35)
+    for kwargs, msg in [({"focal_length": 0}, "focal_length"), ({"focus_distance": 5, "focus_on": "Hero"}, "not both"),
+                        ({"focus_distance": 0}, "focus_distance"), ({"f_stop": 100}, "f_stop"),
+                        ({"blur_level": -1}, "blur_level")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_camera("Cam", **kwargs)
+
+
+def test_set_3d_layer(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="LOGO")
+    out = d.set_3d_layer("LOGO", extrusion=40, bevel=4, bevel_style="convex", casts_shadows=True, metal=80,
+                         specular=70)
+    assert out == {"layer": "LOGO", "threeD": True, "renderer": "ADBE Calder",
+                   "set": {"extrusion": 40, "bevel": 4, "castsShadows": 1, "specular": 70, "metal": 80}}
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Extrsn Options Group')"
+                      ".property('ADBE Bevel Styles')._value") == 4
+    # material only: no renderer change
+    d.create_comp("Flat")
+    d.add_layer("solid", name="Card", comp="Flat")
+    assert d.set_3d_layer("Card", accepts_lights=False, comp="Flat")["renderer"] == "ADBE Advanced 3d"
+    d.add_layer("light", name="Key", comp="Flat")
+    with pytest.raises(ToolError, match="Key is a light"):
+        d.set_3d_layer("Key", extrusion=5, comp="Flat")
+    for kwargs, msg in [({"bevel_style": "round"}, "bevel_style"), ({"extrusion": -1}, "0 or more"),
+                        ({"metal": 101}, "metal must be")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_3d_layer("Card", comp="Flat", **kwargs)
+
+
+def test_depth_stack(ae):
+    d.create_comp("Main")
+    for name in ("Sky", "Hills", "Tree"):
+        d.add_layer("solid", name=name)
+    out = d.depth_stack(["Tree", "Hills", "Sky"], spacing=500)
+    # a new camera 1777.8 px in front: 500 px further back looks 1777.8 / 2277.8 as big, scaled up to match
+    assert out == {"camera": "Camera", "layers": [
+        {"layer": "Tree", "z": 0, "scale": 100}, {"layer": "Hills", "z": 500, "scale": 128.12},
+        {"layer": "Sky", "z": 1000, "scale": 156.25}]}
+    assert ae.inspect("ae.app.project.item(1)._layers.filter(l => l.name === 'Sky')[0].threeDLayer") is True
+    flat = d.depth_stack(["Tree", "Hills"], spacing=100, compensate=False, camera="Camera")
+    assert [l["scale"] for l in flat["layers"]] == [100, 128.12]  # left as they were
+    with pytest.raises(ToolError, match="no camera Nope"):
+        d.depth_stack(["Tree", "Hills"], camera="Nope")
+    with pytest.raises(ToolError, match="only visible layers"):
+        d.depth_stack(["Tree", "Camera"])
+    for kwargs, msg in [({"layers": ["Tree"]}, "at least 2"), ({"spacing": 0}, "spacing")]:
+        with pytest.raises(ToolError, match=msg):
+            d.depth_stack(**{"layers": ["Tree", "Hills"], **kwargs})

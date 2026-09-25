@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from time import monotonic, sleep  # export_frame has a parameter named time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,8 +45,9 @@ mcp = MCPServer(
     "aftereffects",
     instructions="Controls the running Adobe After Effects: project items, compositions, layers (text, solid, shape, "
     "null, adjustment, camera, light, footage), properties, keyframes with easing, expressions, effects, masks, "
-    "vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, import, "
-    "the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, motion "
+    "paths and easing curves, point tracking, cameras, extruded 3D and parallax, import, the render queue and frame "
+    "export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -361,16 +363,22 @@ def render(timeout: int = 1800) -> dict:
 def export_frame(path: str, time: float = 0.0, comp: int | str | None = None) -> dict:
     """Save one frame of a comp as a PNG file (time in seconds)."""
     out = _call("export_frame", comp=comp, path=_path(path), time=time)
-    # saveFrameToPng returns at once and fills the file later: wait for the PNG's IEND chunk.
+    _wait_png(out["path"])
+    return out
+
+
+def _wait_png(path):
+    """saveFrameToPng returns at once and fills the file later: wait for the PNG's IEND chunk, return its bytes."""
     deadline = monotonic() + DEFAULT_TIMEOUT
     while monotonic() < deadline:
         try:
-            if Path(out["path"]).read_bytes()[-8:-4] == b"IEND":
-                return out
+            data = Path(path).read_bytes()
+            if data[-8:-4] == b"IEND":
+                return data
         except OSError:
             pass
-        sleep(0.1)
-    raise ToolError(f"After Effects did not finish writing {out['path']} within {DEFAULT_TIMEOUT}s")
+        sleep(0.02)
+    raise ToolError(f"After Effects did not finish writing {path} within {DEFAULT_TIMEOUT}s")
 
 
 @_tool
@@ -527,9 +535,12 @@ def add_marker(time: float, comment: str = "", duration: float = 0.0, layer: int
 @_tool
 def set_comp(comp: int | str | None = None, name: str | None = None, width: int | None = None,
              height: int | None = None, duration: float | None = None, frame_rate: float | None = None,
-             bg_color: list[float] | None = None, work_area: list[float] | None = None) -> dict:
-    """Change a comp's name, size, duration, frame rate, background color, or work area [start, end] in seconds
-    (what renders when the render settings use the work area)."""
+             bg_color: list[float] | None = None, work_area: list[float] | None = None,
+             motion_blur: bool | None = None, shutter_angle: float | None = None) -> dict:
+    """Change a comp's name, size, duration, frame rate, background color, work area [start, end] in seconds
+    (what renders when the render settings use the work area), or motion blur: motion_blur switches it on for the
+    comp (layers also need theirs, set_switches), shutter_angle 0-720 degrees sets how long the blur streaks
+    (180 = film look, 360 = one whole frame)."""
     if width is not None and not 4 <= width <= 30000 or height is not None and not 4 <= height <= 30000:
         raise ToolError("width and height must be 4-30000 pixels")
     if duration is not None and not 0 < duration <= 10800:
@@ -538,8 +549,11 @@ def set_comp(comp: int | str | None = None, name: str | None = None, width: int 
         raise ToolError("frame_rate must be 1-999")
     if work_area is not None and len(work_area) != 2:
         raise ToolError("work_area needs [start, end]")
+    if shutter_angle is not None and not 0 <= shutter_angle <= 720:
+        raise ToolError("shutter_angle must be 0-720 degrees")
     return _call("set_comp", comp=comp, name=name, width=width, height=height, duration=duration,
-                 frameRate=frame_rate, bgColor=_color("bg_color", bg_color), workArea=work_area)
+                 frameRate=frame_rate, bgColor=_color("bg_color", bg_color), workArea=work_area,
+                 motionBlur=motion_blur, shutterAngle=shutter_angle)
 
 
 @_tool
@@ -862,6 +876,305 @@ def render_background_status(job: int) -> dict:
     if code == 0 and any("error" in ln.lower() for ln in lines):
         state = "failed"  # aerender can exit 0 after a failed render; its log says so
     return {"job": job, "state": state, "exit_code": code, "log_tail": lines[-15:]}
+
+
+# --- motion ---
+
+
+@_tool
+def motion_path(layer: int | str, points: list[list[float]], duration: float = 2.0, start: float = 0.0,
+                times: list[float] | None = None, smooth: bool = True, ease: bool = True, constant_speed: bool = False,
+                auto_orient: bool = False, comp: int | str | None = None) -> dict:
+    """Move a layer along a path through points [[x, y] or [x, y, z], ...] (comp pixels), replacing its position
+    keyframes: spread over `duration` seconds from `start`, or at the given `times`. smooth curves the path through the
+    points (False: straight lines); the layer keeps moving through inner points, easing only at the ends (ease=False:
+    none). constant_speed evens the speed over the whole path (roving keyframes); auto_orient turns the layer to
+    face along the path, e.g. a car or a paper plane."""
+    if len(points) < 2 or any(len(pt) not in (2, 3) for pt in points):
+        raise ToolError("points needs at least 2 points [x, y] or [x, y, z]")
+    if times is None:
+        if duration <= 0 or start < 0:
+            raise ToolError("duration must be above 0 and start 0 or more")
+        times = [start + duration * i / (len(points) - 1) for i in range(len(points))]
+    elif len(times) != len(points) or any(b <= a for a, b in zip(times, times[1:])) or times[0] < 0:
+        raise ToolError("times needs one increasing time (0 or more) per point")
+    return _call("motion_path", comp=comp, layer=layer, points=points, times=times, smooth=smooth, ease=ease,
+                 constantSpeed=constant_speed, autoOrient=auto_orient)
+
+
+# CSS cubic-bezier control points; the named ones follow easings.net
+CURVES = {
+    "ease": (0.25, 0.1, 0.25, 1), "ease_in": (0.42, 0, 1, 1), "ease_out": (0, 0, 0.58, 1),
+    "ease_in_out": (0.42, 0, 0.58, 1),
+    "ease_in_sine": (0.12, 0, 0.39, 0), "ease_out_sine": (0.61, 1, 0.88, 1), "ease_in_out_sine": (0.37, 0, 0.63, 1),
+    "ease_in_quad": (0.11, 0, 0.5, 0), "ease_out_quad": (0.5, 1, 0.89, 1), "ease_in_out_quad": (0.45, 0, 0.55, 1),
+    "ease_in_cubic": (0.32, 0, 0.67, 0), "ease_out_cubic": (0.33, 1, 0.68, 1),
+    "ease_in_out_cubic": (0.65, 0, 0.35, 1),
+    "ease_in_quart": (0.5, 0, 0.75, 0), "ease_out_quart": (0.25, 1, 0.5, 1), "ease_in_out_quart": (0.76, 0, 0.24, 1),
+    "ease_in_quint": (0.64, 0, 0.78, 0), "ease_out_quint": (0.22, 1, 0.36, 1),
+    "ease_in_out_quint": (0.83, 0, 0.17, 1),
+    "ease_in_expo": (0.7, 0, 0.84, 0), "ease_out_expo": (0.16, 1, 0.3, 1), "ease_in_out_expo": (0.87, 0, 0.13, 1),
+    "ease_in_circ": (0.55, 0, 1, 0.45), "ease_out_circ": (0, 0.55, 0.45, 1), "ease_in_out_circ": (0.85, 0, 0.15, 1),
+    "ease_in_back": (0.36, 0, 0.66, -0.56), "ease_out_back": (0.34, 1.56, 0.64, 1),
+    "ease_in_out_back": (0.68, -0.6, 0.32, 1.6),
+}
+
+
+@_tool
+def bezier_ease(layer: int | str, property: str | list[str], curve: str | list[float] = "ease_in_out_cubic",
+                keys: list[int] | None = None, comp: int | str | None = None) -> dict:
+    """Shape the speed between existing keyframes with a named easing curve (ease, ease_in, ease_out, ease_in_out,
+    and ease_in / ease_out / ease_in_out _sine, _quad, _cubic, _quart, _quint, _expo, _circ, _back) or a CSS
+    cubic-bezier [x1, y1, x2, y2], as in a motion designer's graph editor. Every segment gets the curve, or only
+    those between keys [first, last] (1-based). _back curves overshoot: not possible on position (use
+    expression_preset bounce)."""
+    if isinstance(curve, str):
+        if curve not in CURVES:
+            raise ToolError(f"curve must be a cubic-bezier [x1, y1, x2, y2] or one of: {', '.join(CURVES)}")
+        pts = CURVES[curve]
+    else:
+        if len(curve) != 4 or not (0 <= curve[0] <= 1 and 0 <= curve[2] <= 1):
+            raise ToolError("a cubic-bezier needs [x1, y1, x2, y2] with x1 and x2 0-1")
+        pts = tuple(float(v) for v in curve)
+    if keys is not None and len(keys) != 2:
+        raise ToolError("keys needs [first, last]")
+    # After Effects' influence is 0.1-100 %: x1 and 1 - x2 can not be 0
+    x1, y1, x2, y2 = pts
+    pts = [max(x1, 0.001), y1, min(x2, 0.999), y2]
+    out = _call("bezier_ease", comp=comp, layer=layer, property=property, curve=pts, keys=keys)
+    return {**out, "curve": curve}
+
+
+# --- tracking ---
+
+
+def _png_gray(data):
+    """Decode an 8-bit RGB or RGBA PNG (what saveFrameToPng writes) to (width, rows of gray 0-255)."""
+    pos, idat, w = 8, [], None
+    while pos < len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            w, h, depth, ctype = body[0:4], body[4:8], body[8], body[9]
+            w, h = int.from_bytes(w, "big"), int.from_bytes(h, "big")
+            if depth != 8 or ctype not in (2, 6) or body[12]:
+                raise ToolError("unexpected PNG from After Effects (want 8-bit RGB or RGBA, not interlaced)")
+            bpp = 3 if ctype == 2 else 4
+        elif kind == b"IDAT":
+            idat.append(body)
+        pos += 12 + n
+    raw, stride, prev, rows = zlib.decompress(b"".join(idat)), w * bpp, bytearray(w * bpp), []
+    for y in range(h):
+        f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        if f == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 255
+        elif f == 2:
+            line = bytearray((a + b) & 255 for a, b in zip(line, prev))
+        elif f == 3:
+            for i in range(stride):
+                line[i] = (line[i] + ((line[i - bpp] if i >= bpp else 0) + prev[i]) // 2) & 255
+        elif f == 4:
+            for i in range(stride):
+                a, b, c = (line[i - bpp] if i >= bpp else 0), prev[i], (prev[i - bpp] if i >= bpp else 0)
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        prev = line
+        rows.append([0.299 * line[i] + 0.587 * line[i + 1] + 0.114 * line[i + 2] for i in range(0, stride, bpp)])
+    return w, rows
+
+
+def _patch(img, x, y, size, step=1):
+    """size x size pixels from (x, y), every `step`-th pixel averaged over step x step blocks, flattened."""
+    if step == 1:
+        return [v for row in img[y:y + size] for v in row[x:x + size]]
+    out = []
+    for by in range(y, y + size - step + 1, step):
+        for bx in range(x, x + size - step + 1, step):
+            out.append(sum(v for row in img[by:by + step] for v in row[bx:bx + step]) / (step * step))
+    return out
+
+
+def _ncc(a, b):
+    """Normalized cross-correlation of two equal-length patches: 1 identical, 0 unrelated (brightness-proof)."""
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    num = va = vb = 0.0
+    for x, y in zip(a, b):
+        x, y = x - ma, y - mb
+        num += x * y
+        va += x * x
+        vb += y * y
+    return num / (va * vb) ** 0.5 if va and vb else 0.0
+
+
+def _match(img, tmpl, feature, radius):
+    """Find the template (feature x feature, flattened) in a window image of side feature + 2 radius: coarse search
+    at quarter resolution, then full resolution around the best, then a parabola fit for sub-pixel. Returns the
+    offset (dx, dy) of the template's top left from the window's centered position, and the correlation."""
+    step = 4
+    small = _patch([tmpl[i * feature:(i + 1) * feature] for i in range(feature)], 0, 0, feature, step)
+    best, bx, by = -2.0, 0, 0
+    for dy in range(-radius, radius + 1, step):
+        for dx in range(-radius, radius + 1, step):
+            s = _ncc(small, _patch(img, radius + dx, radius + dy, feature, step))
+            if s > best:
+                best, bx, by = s, dx, dy
+    scores = {}
+    for dy in range(max(-radius, by - step), min(radius, by + step) + 1):
+        for dx in range(max(-radius, bx - step), min(radius, bx + step) + 1):
+            scores[dx, dy] = _ncc(tmpl, _patch(img, radius + dx, radius + dy, feature))
+    (bx, by), best = max(scores.items(), key=lambda kv: kv[1])
+
+    def vertex(a, b, c):  # peak of the parabola through three scores at -1, 0, 1
+        d = a - 2 * b + c
+        return max(-0.5, min(0.5, (a - c) / (2 * d))) if d < 0 else 0.0
+
+    sx = vertex(scores[bx - 1, by], best, scores[bx + 1, by]) if (bx - 1, by) in scores and (bx + 1, by) in scores \
+        else 0.0
+    sy = vertex(scores[bx, by - 1], best, scores[bx, by + 1]) if (bx, by - 1) in scores and (bx, by + 1) in scores \
+        else 0.0
+    return bx + sx, by + sy, best
+
+
+@_tool
+def track_point(layer: int | str, point: list[float], start: float | None = None, end: float | None = None,
+                feature: int = 31, search: int = 40, tracker: str = "aemcp track", name: str = "Track Point 1",
+                comp: int | str | None = None) -> dict:
+    """Track a feature through footage: `point` [x, y] in the layer's own pixels (on an untransformed full-frame
+    layer, comp pixels) marks a high-contrast spot (a corner, a mark, an eye), followed frame by frame from `start`
+    to `end` (seconds, default the layer's in and out points). `feature` is the square it matches (pixels, odd),
+    `search` how far it may move between frames. The track is written as an After Effects tracker (`tracker` /
+    `name`) on the layer, visible and editable in the Tracker panel; attach_to_track makes other layers follow it.
+    Returns per-frame confidence (1 = exact match): below about 0.6 the feature was lost or hidden. It renders
+    each frame, about 0.2 s a frame."""
+    if len(point) != 2:
+        raise ToolError("point needs [x, y]")
+    if not (9 <= feature <= 101 and feature % 2 == 1):
+        raise ToolError("feature must be an odd number 9-101")
+    if not 4 <= search <= 200:
+        raise ToolError("search must be 4-200 pixels")
+    size = feature + 2 * search
+    win = _call("track_window", comp=comp, layer=layer, create=True, size=size)
+    if win["timeRemap"]:
+        _call("track_window", window=win["window"], remove=True)
+        raise ToolError("time remapped layers cannot be tracked here: precompose the layer first")
+    frame = win["frame"]
+    t = win["inPoint"] if start is None else start
+    t_end = win["outPoint"] - frame if end is None else end
+    if t_end <= t:
+        _call("track_window", window=win["window"], remove=True)
+        raise ToolError("end must come after start")
+    tmp = tempfile.mkdtemp(prefix="aemcp_track_")
+    times, points, confidence = [], [], []
+    x, y, vx, vy, tmpl = float(point[0]), float(point[1]), 0.0, 0.0, None
+    fx, fy = x - round(x), y - round(y)  # the sub-pixel part of the start point, kept on every frame
+    try:
+        while t <= t_end + frame / 2:
+            # the window is centered where the feature should be: last position plus last motion
+            ox, oy = round(x + vx) - size // 2, round(y + vy) - size // 2
+            path = os.path.join(tmp, f"{len(times)}.png")
+            _call("track_window", window=win["window"], origin=[ox, oy], time=t, path=path)
+            _, img = _png_gray(_wait_png(path))
+            if tmpl is None:
+                # ponytail: fixed first-frame template, drift-free but blind to big scale or rotation changes
+                tmpl = _patch(img, search, search, feature)
+                nx, ny, score = float(point[0]), float(point[1]), 1.0
+            else:
+                dx, dy, score = _match(img, tmpl, feature, search)
+                nx, ny = ox + search + dx + feature // 2 + fx, oy + search + dy + feature // 2 + fy
+                vx, vy = nx - x, ny - y
+            x, y = nx, ny
+            times.append(round(t, 6))
+            points.append([round(x, 3), round(y, 3)])
+            confidence.append(round(max(score, 0.0), 4))
+            os.remove(path)
+            t += frame
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        _call("track_window", window=win["window"], remove=True)
+    out = _call("write_track", comp=comp, layer=layer, tracker=tracker, point=name, times=times, points=points,
+                confidence=confidence, feature=feature, search=size)
+    lost = [times[i] for i, c in enumerate(confidence) if c < 0.6]
+    return {**out, "from": times[0], "to": times[-1], "start": points[0], "end": points[-1],
+            "min_confidence": min(confidence), "lost_frames": len(lost), "first_lost": lost[0] if lost else None}
+
+
+@_tool
+def attach_to_track(layer: int | str, tracked: int | str, tracker: int | str | None = None,
+                    point: int | str | None = None, keep_offset: bool = False, comp: int | str | None = None) -> dict:
+    """Make a layer follow a track point of another layer (from track_point, or tracked in After Effects' Tracker
+    panel): a live expression on its position, so the text, graphic or null sticks to the tracked feature. tracker
+    and point by name or index (default the newest tracker, its first point). keep_offset keeps the layer where it
+    is and moves it with the track, instead of snapping it onto the point. The position must not be keyframed."""
+    return _call("attach_to_track", comp=comp, layer=layer, tracked=tracked, tracker=tracker, point=point,
+                 keepOffset=keep_offset or None)
+
+
+# --- 3D ---
+
+
+@_tool
+def set_camera(layer: int | str, focal_length: float | None = None, depth_of_field: bool | None = None,
+               focus_distance: float | None = None, focus_on: int | str | None = None, f_stop: float | None = None,
+               blur_level: float | None = None, comp: int | str | None = None) -> dict:
+    """Set up a camera's lens: focal_length in mm (a 36 mm film back: 15 wide, 50 normal, 200 telephoto),
+    depth_of_field on or off, focus by focus_distance (pixels from the camera) or focus_on a layer (autofocus: an
+    expression keeps that layer sharp as things move), f_stop for how shallow the focus is (1.4 very blurry, 16 all
+    sharp), blur_level in %."""
+    if focal_length is not None and not 1 <= focal_length <= 2000:
+        raise ToolError("focal_length must be 1-2000 mm")
+    if focus_distance is not None and focus_on is not None:
+        raise ToolError("give focus_distance or focus_on, not both")
+    if focus_distance is not None and focus_distance <= 0:
+        raise ToolError("focus_distance must be above 0")
+    if f_stop is not None and not 0.5 <= f_stop <= 64:
+        raise ToolError("f_stop must be 0.5-64")
+    if blur_level is not None and not 0 <= blur_level <= 1000:
+        raise ToolError("blur_level must be 0-1000 %")
+    return _call("set_camera", comp=comp, layer=layer, focalLength=focal_length, depthOfField=depth_of_field,
+                 focusDistance=focus_distance, focusOn=focus_on, fStop=f_stop, blurLevel=blur_level)
+
+
+BEVELS = {"none": 1, "angular": 2, "concave": 3, "convex": 4}
+
+
+@_tool
+def set_3d_layer(layer: int | str, extrusion: float | None = None, bevel: float | None = None,
+                 bevel_style: str = "angular", casts_shadows: bool | None = None,
+                 accepts_shadows: bool | None = None, accepts_lights: bool | None = None,
+                 specular: float | None = None, shininess: float | None = None, metal: float | None = None,
+                 reflection: float | None = None, comp: int | str | None = None) -> dict:
+    """Make a layer 3D and shape it: extrusion depth in pixels and a bevel (depth in pixels; bevel_style angular,
+    concave, convex or none) turn flat text and shapes into solid 3D objects (the comp switches to the Advanced 3D
+    renderer); material: casts_shadows, accepts_shadows, accepts_lights, specular and shininess (%, how glossy),
+    metal (%, how much highlights take the layer's color), reflection (%). Light it with lights (set_light)."""
+    if bevel_style not in BEVELS:
+        raise ToolError(f"bevel_style must be one of: {', '.join(BEVELS)}")
+    if extrusion is not None and extrusion < 0 or bevel is not None and bevel < 0:
+        raise ToolError("extrusion and bevel must be 0 or more pixels")
+    for n, v in (("specular", specular), ("shininess", shininess), ("metal", metal), ("reflection", reflection)):
+        if v is not None and not 0 <= v <= 100:
+            raise ToolError(f"{n} must be 0-100 %")
+    return _call("set_3d_layer", comp=comp, layer=layer, extrusion=extrusion, bevel=bevel,
+                 bevelStyle=BEVELS[bevel_style], castsShadows=casts_shadows, acceptsShadows=accepts_shadows,
+                 acceptsLights=accepts_lights, specular=specular, shininess=shininess, metal=metal,
+                 reflection=reflection)
+
+
+@_tool
+def depth_stack(layers: list[int | str], spacing: float = 500, compensate: bool = True,
+                camera: int | str | None = None, comp: int | str | None = None) -> dict:
+    """2.5D parallax from flat layers: turns them 3D and spreads them back in depth, `spacing` pixels apart, in the
+    given order (first nearest, e.g. foreground, subject, sky), scaled up (compensate) so each still looks the same
+    size from the camera (the comp's first camera, or a new one). Then move the camera (camera_move) and the layers
+    slide past each other at different speeds."""
+    if len(layers) < 2:
+        raise ToolError("give at least 2 layers")
+    if spacing <= 0:
+        raise ToolError("spacing must be above 0")
+    return _call("depth_stack", comp=comp, layers=layers, spacing=spacing, compensate=compensate, camera=camera)
 
 
 # --- Essential Graphics ---
