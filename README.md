@@ -1,6 +1,6 @@
 # aftereffects-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, masks, vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, import, the render queue and frame export.
+An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, masks, vector shapes, text animation and expression presets, precomposing, layer order and switches, track mattes, markers, time remapping, layer placement, project organization, import, the render queue and frame export.
 
 ## Use
 
@@ -56,6 +56,18 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `add_marker` | `time`, `comment`, `duration`, `layer` (default: the comp), `comp` | `{target, time, markers}` |
 | `set_comp` | `comp`, `name`, `width`, `height`, `duration`, `frame_rate`, `bg_color`, `work_area: [start, end]` | comp settings with the work area |
 | `render_templates` | — | `{outputModules, renderSettings}` template names |
+| `expression_preset` | `layer`, `property`, `preset` (wiggle, loop_cycle, loop_pingpong, loop_continue, bounce, spin, blink), `params`, `comp` | `set_expression` result + preset and params |
+| `property_tree` | `layer`, `depth = 3`, `comp` | `{layer, properties: [{name, matchName, value, keys, children}]}` |
+| `sequence_layers` | `layers` (in order), `start = 0`, `overlap = 0` (negative: gap), `comp` | `{layers: [{layer, inPoint, outPoint}], end}` |
+| `time_remap` | `layer`, `keys: [{time, source, hold}]`, `smooth = True`, `comp` | `{layer, keys, timeRemap}` |
+| `fit_to_comp` | `layer`, `mode` (fill, fit, width, height, stretch), `comp` | `{layer, mode, scale, size}` |
+| `center_anchor` | `layer`, `comp` | `{layer, anchor, position}` |
+| `null_control` | `layers`, `name = "Control"`, `comp` | `{control, index, children}` |
+| `apply_preset` | `layer`, `path` (.ffx), `comp` | layer info |
+| `replace_footage` | `item`, `path`, `sequence = False` | `{id, name, file}` |
+| `create_folder` | `name`, `parent` | `{id, name, parent}` |
+| `move_items` | `items`, `folder` | `{folder, moved}` |
+| `clean_project` | `remove_unused = True`, `consolidate = True` | `{consolidated, removedUnused, items: [before, after]}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -68,6 +80,13 @@ Notes:
 - `animate_text` adds a text animator with a range selector whose start runs 0 to 100 %, revealing characters in order; `typewriter` uses hard steps. Calling it again stacks another animator.
 - `set_switches` applies `locked` last, since a locked layer takes no more changes. Track mattes use `Layer.setTrackMatte` (After Effects 2023+).
 - `render_templates` lists the exact template names to pass to `add_to_render_queue(template=...)`; names depend on the installed templates and the application language.
+- `expression_preset` defaults: wiggle `freq 2, amp 30`; bounce `amp 0.05, freq 4, decay 8` (an overshoot after each keyframe); spin `speed 90` deg/s; blink `freq 2`. The loop presets repeat a property's keyframes after the last one.
+- `property_tree` shows the real names under a layer (they differ between layer types and application languages); match names are the same in every language.
+- `sequence_layers` moves each layer's start time so its in point follows the previous out point; trims are kept.
+- `time_remap` replaces the keys After Effects adds when time remapping is turned on (at the in and out points). It needs footage or a precomp.
+- `fit_to_comp` and `center_anchor` measure text and shapes with `sourceRectAtTime`; `center_anchor` ignores rotation when keeping the layer in place.
+- `null_control` parents the layers to a new null at their average position; parenting keeps each one where it is.
+- `clean_project` consolidates duplicate footage (same file) first, then removes footage no comp uses.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration

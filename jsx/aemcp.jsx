@@ -308,6 +308,39 @@ var aemcp = (function () {
         return s;
     }
 
+    function tree(group, depth) {
+        var out = [], i, p, row;
+        for (i = 1; i <= group.numProperties; i++) {
+            p = group.property(i);
+            row = {name: p.name, matchName: p.matchName};
+            if (p.propertyType === PropertyType.PROPERTY) {
+                row.value = p.propertyValueType === PropertyValueType.NO_VALUE ? null : plain(p.value);
+                if (p.numKeys) {
+                    row.keys = p.numKeys;
+                }
+            } else if (depth > 1) {
+                row.children = tree(p, depth - 1);
+            } else {
+                row.children = p.numProperties;  // count only, below the requested depth
+            }
+            out.push(row);
+        }
+        return out;
+    }
+
+    function contentRect(l) {
+        // what the layer draws, in layer space: text and shapes from sourceRectAtTime, others from the source
+        var r;
+        if (typeof l.sourceRectAtTime === "function" && !(l.source && l.source.width)) {
+            r = l.sourceRectAtTime(l.inPoint, false);
+            return {left: r.left, top: r.top, width: r.width, height: r.height};
+        }
+        if (l.source && l.source.width) {
+            return {left: 0, top: 0, width: l.source.width, height: l.source.height};
+        }
+        fail(l.name + " has no size to measure (cameras, lights and nulls)");
+    }
+
     // text reveal presets: [animator property match name, value that hides a character]
     var TEXT_PRESETS = {
         fade_in: [["ADBE Text Opacity", 0]],
@@ -861,12 +894,172 @@ var aemcp = (function () {
             return out;
         },
 
+        property_tree: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer);
+            return {layer: l.name, properties: tree(l, a.depth)};
+        },
+
+        sequence_layers: function (a) {
+            var c = findComp(a.comp), t = a.start, i, l, out = [];
+            for (i = 0; i < a.layers.length; i++) {
+                l = findLayer(c, a.layers[i]);
+                l.startTime += t - l.inPoint;  // moving startTime moves in and out with it
+                out.push({layer: l.name, inPoint: round(l.inPoint), outPoint: round(l.outPoint)});
+                t = l.outPoint - a.overlap;
+            }
+            return {layers: out, end: round(t + a.overlap)};
+        },
+
+        time_remap: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p, i, k, idx, kind;
+            if (!l.canSetTimeRemapEnabled) {
+                fail(l.name + " cannot be time remapped (it needs footage or a precomp with duration)");
+            }
+            l.timeRemapEnabled = true;
+            p = l.property("ADBE Time Remapping");
+            while (p.numKeys > 0) {
+                p.removeKey(p.numKeys);  // After Effects adds keys at the in and out points; the given ones replace them
+            }
+            for (i = 0; i < a.keys.length; i++) {
+                k = a.keys[i];
+                p.setValueAtTime(k.time, k.source);
+                idx = p.nearestKeyIndex(k.time);
+                kind = k.hold ? KeyframeInterpolationType.HOLD : (a.smooth ? KeyframeInterpolationType.BEZIER :
+                    KeyframeInterpolationType.LINEAR);
+                p.setInterpolationTypeAtKey(idx, kind, kind);
+            }
+            return {layer: l.name, keys: p.numKeys, timeRemap: l.timeRemapEnabled};
+        },
+
+        fit_to_comp: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), r = contentRect(l), sx = c.width / r.width,
+                sy = c.height / r.height, s, scale;
+            if (a.mode === "fill") {
+                s = Math.max(sx, sy);
+                scale = [s * 100, s * 100];
+            } else if (a.mode === "fit") {
+                s = Math.min(sx, sy);
+                scale = [s * 100, s * 100];
+            } else if (a.mode === "width") {
+                scale = [sx * 100, sx * 100];
+            } else if (a.mode === "height") {
+                scale = [sy * 100, sy * 100];
+            } else {
+                scale = [sx * 100, sy * 100];
+            }
+            l.property("ADBE Transform Group").property("ADBE Anchor Point")
+                .setValue([r.left + r.width / 2, r.top + r.height / 2]);
+            l.property("ADBE Transform Group").property("ADBE Position").setValue([c.width / 2, c.height / 2]);
+            l.property("ADBE Transform Group").property("ADBE Scale").setValue(scale);
+            return {layer: l.name, mode: a.mode, scale: [round(scale[0], 2), round(scale[1], 2)],
+                size: [round(r.width), round(r.height)]};
+        },
+
+        center_anchor: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), tg = l.property("ADBE Transform Group"),
+                anchor = tg.property("ADBE Anchor Point"), pos = tg.property("ADBE Position"),
+                scale = tg.property("ADBE Scale").value, r = contentRect(l), oldA = anchor.value, p = pos.value,
+                newA = [r.left + r.width / 2, r.top + r.height / 2];
+            if (anchor.numKeys || pos.numKeys) {
+                fail("anchor point or position is animated: center it before animating");
+            }
+            anchor.setValue(newA);
+            // keep the layer where it is: move the position by the anchor shift, scaled (rotation ignored)
+            pos.setValue([p[0] + (newA[0] - oldA[0]) * scale[0] / 100, p[1] + (newA[1] - oldA[1]) * scale[1] / 100]);
+            return {layer: l.name, anchor: [round(newA[0], 2), round(newA[1], 2)], position: plain(pos.value)};
+        },
+
+        null_control: function (a) {
+            var c = findComp(a.comp), layers = [], i, n, x = 0, y = 0, pos, names = [];
+            for (i = 0; i < a.layers.length; i++) {
+                layers.push(findLayer(c, a.layers[i]));
+            }
+            for (i = 0; i < layers.length; i++) {
+                pos = layers[i].property("ADBE Transform Group").property("ADBE Position").value;
+                x += pos[0];
+                y += pos[1];
+            }
+            n = c.layers.addNull(c.duration);
+            n.name = a.name;
+            n.property("ADBE Transform Group").property("ADBE Position").setValue([x / layers.length, y / layers.length]);
+            for (i = 0; i < layers.length; i++) {
+                layers[i].parent = n;  // parenting keeps each layer where it is on screen
+                names.push(layers[i].name);
+            }
+            return {control: n.name, index: n.index, children: names};
+        },
+
+        apply_preset: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), f = new File(a.path);
+            if (!f.exists) {
+                fail("preset not found: " + a.path);
+            }
+            l.applyPreset(f);
+            return layerInfo(l);
+        },
+
+        replace_footage: function (a) {
+            var it = findItem(a.item), f = new File(a.path);
+            if (!(it instanceof FootageItem)) {
+                fail(it.name + " is not footage");
+            }
+            if (!f.exists) {
+                fail("file not found: " + a.path);
+            }
+            if (a.sequence) {
+                it.replaceWithSequence(f, false);
+            } else {
+                it.replace(f);
+            }
+            return {id: it.id, name: it.name, file: it.file ? it.file.fsName : null};
+        },
+
+        create_folder: function (a) {
+            var f = app.project.items.addFolder(a.name), parent;
+            if (a.parent !== undefined) {
+                parent = findItem(a.parent);
+                if (!(parent instanceof FolderItem)) {
+                    fail(parent.name + " is not a folder");
+                }
+                f.parentFolder = parent;
+            }
+            return {id: f.id, name: f.name, parent: a.parent !== undefined ? parent.name : null};
+        },
+
+        move_items: function (a) {
+            var folder = findItem(a.folder), i, it, moved = [];
+            if (!(folder instanceof FolderItem)) {
+                fail(folder.name + " is not a folder");
+            }
+            for (i = 0; i < a.items.length; i++) {
+                it = findItem(a.items[i]);
+                if (it === folder) {
+                    fail("a folder cannot go into itself");
+                }
+                it.parentFolder = folder;
+                moved.push(it.name);
+            }
+            return {folder: folder.name, moved: moved};
+        },
+
+        clean_project: function (a) {
+            var before = app.project.numItems, out = {};
+            if (a.consolidate) {
+                out.consolidated = app.project.consolidateFootage();
+            }
+            if (a.removeUnused) {
+                out.removedUnused = app.project.removeUnusedFootage();
+            }
+            out.items = [before, app.project.numItems];
+            return out;
+        },
+
         run_jsx: function (a) {
             return plain(eval(a.code));
         }
     };
 
-    var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1};
+    var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1};
 
     function run(name, args) {
         var result, cmd = commands[name];

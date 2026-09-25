@@ -18,7 +18,9 @@ def test_all_tools_registered():
         "get_property", "set_property", "set_keyframes", "set_expression", "add_effect", "list_effects",
         "import_file", "add_to_render_queue", "render", "export_frame", "save_project", "run_jsx",
         "add_mask", "add_shape", "animate_text", "precompose", "duplicate_layer", "move_layer", "set_switches",
-        "add_marker", "set_comp", "render_templates",
+        "add_marker", "set_comp", "render_templates", "expression_preset", "property_tree", "sequence_layers",
+        "time_remap", "fit_to_comp", "center_anchor", "null_control", "apply_preset", "replace_footage",
+        "create_folder", "move_items", "clean_project",
     }
 
 
@@ -550,3 +552,199 @@ def test_render_templates(ae):
         "outputModules": ["High Quality", "H.264 - Match Render Settings - 15 Mbps", "Lossless"],
         "renderSettings": ["Best Settings", "Draft Settings", "Multi-Machine Settings"]}
     assert ae.inspect("ae.app.project.renderQueue.numItems") == 0  # the probe item is removed again
+
+
+
+# --- expression presets, timing, placement ---
+
+
+def test_expression_presets(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="Rig")
+    out = d.expression_preset("Rig", "position", "wiggle", {"freq": 3})
+    assert (out["expression"], out["params"], out["error"]) == ("wiggle(3, 30)", {"freq": 3, "amp": 30}, None)
+    assert d.expression_preset("Rig", "rotation", "spin", {"speed": 45})["expression"] == "value + time * 45"
+    assert d.expression_preset("Rig", "scale", "loop_pingpong")["expression"] == 'loopOut("pingpong")'
+    bounce = d.expression_preset("Rig", "position", "bounce", {"decay": 5})["expression"]
+    assert "var amp = 0.05, freq = 4, decay = 5;" in bounce and bounce.count("{") == bounce.count("}")
+    assert d.get_property("Rig", "position")["expression"] == bounce
+    with pytest.raises(ToolError, match="preset must be"):
+        d.expression_preset("Rig", "position", "shake")
+    with pytest.raises(ToolError, match=r"wiggle takes freq, amp \(got speed\)"):
+        d.expression_preset("Rig", "position", "wiggle", {"speed": 2})
+    with pytest.raises(ToolError, match="numbers"):
+        d.expression_preset("Rig", "position", "wiggle", {"freq": "fast"})
+
+
+def test_property_tree(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="Hi")
+    d.set_keyframes(1, "opacity", [{"time": 0, "value": 0}, {"time": 1, "value": 100}])
+    out = d.property_tree(1, depth=2)
+    groups = {g["matchName"]: g for g in out["properties"]}
+    assert groups["ADBE Text Properties"]["children"][1] == {"name": "Animators", "matchName": "ADBE Text Animators",
+                                                             "children": 0}
+    opacity = next(p for p in groups["ADBE Transform Group"]["children"] if p["name"] == "Opacity")
+    assert opacity == {"name": "Opacity", "matchName": "ADBE Opacity", "value": 0, "keys": 2}
+    assert groups["ADBE Marker"]["value"] is None
+    shallow = d.property_tree(1, depth=1)["properties"]
+    assert all(isinstance(r.get("children", 0), int) for r in shallow)
+    with pytest.raises(ToolError, match="depth"):
+        d.property_tree(1, depth=0)
+    assert ae.inspect("ae.undoLog").count("aemcp: property_tree") == 0  # read-only: no undo step
+
+
+def test_sequence_layers(ae):
+    d.create_comp("Main", duration=20)
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)
+    d.set_layer("A", out_point=4)
+    d.set_layer("B", in_point=1, out_point=3)
+    d.set_layer("C", out_point=5)
+    out = d.sequence_layers(["A", "B", "C"], start=1, overlap=0.5)
+    assert [(r["layer"], r["inPoint"], r["outPoint"]) for r in out["layers"]] == [
+        ("A", 1, 5), ("B", 4.5, 6.5), ("C", 6, 11)]  # durations kept, 0.5 s overlaps
+    assert out["end"] == 11
+    gap = d.sequence_layers(["C", "A"], overlap=-1)["layers"]
+    assert [(r["inPoint"], r["outPoint"]) for r in gap] == [(0, 5), (6, 10)]
+    with pytest.raises(ToolError, match="no layers"):
+        d.sequence_layers([])
+
+
+def test_time_remap(ae, tmp_path):
+    clip = tmp_path / "shot.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item="shot.mov")
+    out = d.time_remap(1, [{"time": 0, "source": 0}, {"time": 4, "source": 2},
+                           {"time": 5, "source": 2, "hold": True}], smooth=False)
+    assert out == {"layer": "shot.mov", "keys": 3, "timeRemap": True}
+    keys = d.get_property(1, ["ADBE Time Remapping"])["keys"]
+    assert keys == [{"time": 0, "value": 0}, {"time": 4, "value": 2}, {"time": 5, "value": 2}]  # AE's own keys gone
+    assert ae.inspect("ae.app.project.item(2).layer(1).groups[0].keys.map(k => k.outType)") == [6612, 6612, 6614]
+    d.add_layer("solid", name="BG")
+    with pytest.raises(ToolError, match="cannot be time remapped"):
+        d.time_remap("BG", [{"time": 0, "source": 0}])
+    for keys, msg in [([], "no keys"), ([{"time": 0}], "time and source"), ([{"time": 0, "source": -1}], "0 or more")]:
+        with pytest.raises(ToolError, match=msg):
+            d.time_remap(1, keys)
+
+
+# a 1920x1080 clip in a 1080x1920 comp: 0.5625 of its width fits across, 1.7778 of its height fills the height
+@pytest.mark.parametrize("mode, scale", [("fill", [177.78, 177.78]), ("fit", [56.25, 56.25]),
+                                         ("width", [56.25, 56.25]), ("height", [177.78, 177.78]),
+                                         ("stretch", [56.25, 177.78])])
+def test_fit_to_comp(ae, tmp_path, mode, scale):
+    clip = tmp_path / "wide.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))  # 1920x1080 in the fake
+    d.create_comp("Reel", 1080, 1920)
+    d.add_layer("item", item="wide.mov")
+    out = d.fit_to_comp(1, mode)
+    assert (out["scale"], out["size"]) == (scale, [1920, 1080])
+    # centered: anchor in the middle of the footage, position in the middle of the comp
+    assert d.get_property(1, "anchor")["value"][:2] == [960, 540]
+    assert d.get_property(1, "position")["value"][:2] == [540, 960]
+
+
+def test_fit_to_comp_text_and_errors(ae):
+    d.create_comp("Main", 1920, 1080)
+    d.add_layer("text", text="Title")  # 300 x 80 in the fake, drawn from (-150, -60)
+    out = d.fit_to_comp(1, "width")
+    assert out["scale"] == [640, 640] and d.get_property(1, "anchor")["value"][:2] == [0, -20]
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="no size to measure"):
+        d.fit_to_comp("Rig")
+    with pytest.raises(ToolError, match="mode must be"):
+        d.fit_to_comp(1, "zoom")
+
+
+def test_center_anchor(ae):
+    d.create_comp("Main", 1920, 1080)
+    d.add_layer("text", text="Title")
+    d.set_property(1, "scale", [200, 200])
+    out = d.center_anchor(1)
+    # anchor from (960, 540) to (0, -20): the position moves by the shift times the scale, so nothing moves on screen
+    assert out["anchor"] == [0, -20] and out["position"][:2] == [960 - 1920, 540 - 1120]
+    d.set_keyframes(1, "position", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [10, 10]}])
+    with pytest.raises(ToolError, match="animated"):
+        d.center_anchor(1)
+
+
+def test_null_control(ae):
+    d.create_comp("Main", 1000, 1000)
+    d.add_layer("null", name="A")
+    d.add_layer("null", name="B")
+    d.set_property("A", "position", [100, 200])
+    d.set_property("B", "position", [300, 600])
+    out = d.null_control(["A", "B"], name="Rig")
+    assert out == {"control": "Rig", "index": 1, "children": ["A", "B"]}
+    assert d.get_property("Rig", "position")["value"][:2] == [200, 400]
+    assert [l["parent"] for l in d.comp_info()["layers"]] == [None, 1, 1]
+    with pytest.raises(ToolError, match="no layers"):
+        d.null_control([])
+
+
+# --- presets, footage, project organization ---
+
+
+def test_apply_preset(ae, tmp_path):
+    d.create_comp("Main")
+    d.add_layer("solid", name="BG")
+    preset = tmp_path / "Glow Pulse.ffx"
+    preset.write_bytes(b"x")
+    assert d.apply_preset("BG", str(preset))["effects"] == ["Glow"]
+    with pytest.raises(ToolError, match=r"\.ffx"):
+        d.apply_preset("BG", str(tmp_path / "x.aep"))
+    with pytest.raises(ToolError, match="preset not found"):
+        d.apply_preset("BG", str(tmp_path / "missing.ffx"))
+
+
+def test_replace_footage(ae, tmp_path):
+    old, new, seq = tmp_path / "v1.mov", tmp_path / "v2.mov", tmp_path / "shot_0001.png"
+    for f in (old, new, seq):
+        f.write_bytes(b"x")
+    d.import_file(str(old))
+    assert d.replace_footage("v1.mov", str(new)) == {"id": 1, "name": "v2.mov", "file": str(new)}
+    assert d.replace_footage(1, str(seq), sequence=True)["name"] == "shot_[####].png"
+    with pytest.raises(ToolError, match="file not found"):
+        d.replace_footage(1, str(tmp_path / "gone.mov"))
+    d.create_comp("Main")
+    with pytest.raises(ToolError, match="Main is not footage"):
+        d.replace_footage("Main", str(new))
+
+
+def test_folders(ae, tmp_path):
+    clip = tmp_path / "a.mov"
+    clip.write_bytes(b"x")
+    d.import_file(str(clip))
+    d.create_comp("Main")
+    assert d.create_folder("Footage") == {"id": 3, "name": "Footage", "parent": None}
+    assert d.create_folder("Day 1", parent="Footage")["parent"] == "Footage"
+    assert d.move_items(["a.mov", "Main"], "Day 1") == {"folder": "Day 1", "moved": ["a.mov", "Main"]}
+    rows = {r["name"]: r["folder"] for r in d.list_items()}
+    assert (rows["a.mov"], rows["Main"], rows["Day 1"]) == ("Day 1", "Day 1", "Footage")
+    with pytest.raises(ToolError, match="Main is not a folder"):
+        d.move_items(["a.mov"], "Main")
+    with pytest.raises(ToolError, match="into itself"):
+        d.move_items(["Footage"], "Footage")
+    with pytest.raises(ToolError, match="not a folder"):
+        d.create_folder("x", parent="Main")
+
+
+def test_clean_project(ae, tmp_path):
+    a, b = tmp_path / "a.mov", tmp_path / "b.mov"
+    for f in (a, b):
+        f.write_bytes(b"x")
+    d.import_file(str(a))
+    d.import_file(str(a))  # the same file twice
+    d.import_file(str(b))  # never used
+    d.create_comp("Main")
+    d.add_layer("item", item=2)  # uses the duplicate
+    out = d.clean_project()
+    assert out == {"consolidated": 1, "removedUnused": 1, "items": [4, 2]}
+    assert [r["name"] for r in d.list_items()] == ["a.mov", "Main"]
+    assert d.comp_info()["layers"][0]["source"] == "a.mov"  # the layer now uses the kept item
+    with pytest.raises(ToolError, match="nothing to do"):
+        d.clean_project(False, False)
