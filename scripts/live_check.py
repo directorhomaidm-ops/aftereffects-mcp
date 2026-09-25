@@ -15,8 +15,11 @@ What it touches: only the open (empty) project, which it fills with test comps a
 aemcp_check.aep in a new temporary folder, printed at the start and kept with report.md / report.json inside.
 """
 import json
+import math
 import os
 import struct
+import time
+import wave
 import sys
 import tempfile
 import traceback
@@ -56,6 +59,21 @@ def _short(v, n=300):
 def expect(cond, msg):
     if not cond:
         raise AssertionError(msg)
+
+
+def write_wav(path, seconds=4, rate=44100):
+    """Clicks every half second on a low hum: something for the amplitude to follow."""
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = bytearray()
+        for i in range(rate * seconds):
+            t = i / rate
+            beat = math.exp(-(t % 0.5) * 30)
+            v = 0.1 * math.sin(2 * math.pi * 110 * t) + 0.8 * beat * math.sin(2 * math.pi * 880 * t)
+            frames += int(max(-1, min(1, v)) * 32767).to_bytes(2, "little", signed=True)
+        w.writeframes(bytes(frames))
 
 
 def write_png(path, w, h, rgb):
@@ -195,7 +213,31 @@ def main():
     step("replace_footage swatch with a second PNG", lambda: _replace(work), needs=have)
     step("clean_project", lambda: _clean(work), needs=have,
          note="consolidateFootage and removeUnusedFootage counts")
+
+    print("\nCamera, light, audio, captions, Essential Graphics")
+    step("camera_move push_in (new camera)", lambda: d.camera_move("push_in", amount=500, duration=2,
+                                                                     comp="aemcp check"), needs=have)
+    step("camera_move orbit 90 degrees", lambda: d.camera_move("orbit", duration=3, start=2, camera="Camera",
+                                                               comp="aemcp check"), needs=have,
+         note="rig null with Y Rotation; the camera parented to it")
+    step("set_light spot 120 %, warm, shadows", lambda: d.set_light(
+        "Light", type="spot", intensity=120, color=[1, 0.9, 0.8], cone_angle=60, shadows=True, comp="aemcp check"),
+         needs=have, note="light option match names")
+    wav = work / "beat.wav"
+    write_wav(wav)
+    step("import a WAV, audio_fade in 0.5 s / out 1 s at -6 dB", lambda: _audio(wav), needs=have)
+    step("audio_react: a circle's scale pumps with the beat", lambda: _react(), needs=have,
+         note="Convert Audio to Keyframes through app.findMenuCommandId / executeCommand")
+    srt = work / "captions.srt"
+    srt.write_text("1\n00:00:00,500 --> 00:00:02,000\nمرحبًا بكم\n\n2\n00:00:02,500 --> 00:00:04,000\n"
+                   "Second <i>line</i>\nand more\n", encoding="utf-8")
+    step("captions_from_srt (Arabic + two lines)", lambda: d.captions_from_srt(str(srt), comp="aemcp check"),
+         needs=have)
+    step("mogrt_add_property + export_mogrt", lambda: _mogrt(work), needs=have,
+         note="addToMotionGraphicsTemplateAs and exportAsMotionGraphicsTemplate")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
+    step("render_background through aerender", lambda: _background(work), needs=have,
+         note="set AE_RENDER if aerender is not next to the application")
     step("run_jsx", lambda: d.run_jsx("[app.project.numItems, app.version]"))
     step("list_items", d.list_items)
     return write_report(info, work)
@@ -257,6 +299,43 @@ def _clean(work):
     write_png(extra, 8, 8, (0, 0, 0))
     d.import_file(str(extra))
     return d.clean_project()
+
+
+def _audio(wav):
+    d.import_file(str(wav))
+    d.add_layer("item", item="beat.wav", comp="aemcp check")
+    return d.audio_fade("beat.wav", fade_in=0.5, fade_out=1, level_db=-6, comp="aemcp check")
+
+
+def _react():
+    d.add_shape("ellipse", size=[300, 300], layer_name="Pulse", comp="aemcp check")
+    out = d.audio_react("beat.wav", "Pulse", "scale", amount=2, comp="aemcp check")
+    expect(out["error"] is None, f"expression error: {out['error']}")
+    return out
+
+
+def _mogrt(work):
+    d.add_layer("text", text="Editable title", name="Title", comp="aemcp check")
+    d.mogrt_add_property("Title", "text", name="Title text", comp="aemcp check")
+    path = work / "aemcp_check.mogrt"
+    out = d.export_mogrt(str(path), name="aemcp check", comp="aemcp check")
+    expect(path.exists(), "no .mogrt written")
+    return {**out, "bytes": path.stat().st_size}
+
+
+def _background(work):
+    d.add_to_render_queue(str(work / "background_check"), comp="aemcp check")
+    job = d.render_background()
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        st = d.render_background_status(job["job"])
+        if st["state"] != "running":
+            break
+        time.sleep(3)
+    expect(st["state"] == "done", f"aerender: {st}")
+    files = [p.name for p in work.iterdir() if p.name.startswith("background_check")]
+    expect(files, f"no output from aerender in {work}")
+    return {"state": st["state"], "files": files, "log_tail": st["log_tail"][-3:]}
 
 
 def _types():

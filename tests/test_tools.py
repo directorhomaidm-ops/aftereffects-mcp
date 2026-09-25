@@ -20,7 +20,8 @@ def test_all_tools_registered():
         "add_mask", "add_shape", "animate_text", "precompose", "duplicate_layer", "move_layer", "set_switches",
         "add_marker", "set_comp", "render_templates", "expression_preset", "property_tree", "sequence_layers",
         "time_remap", "fit_to_comp", "center_anchor", "null_control", "apply_preset", "replace_footage",
-        "create_folder", "move_items", "clean_project",
+        "create_folder", "move_items", "clean_project", "camera_move", "set_light", "audio_fade", "audio_react",
+        "captions_from_srt", "render_background", "render_background_status", "mogrt_add_property", "export_mogrt",
     }
 
 
@@ -748,3 +749,234 @@ def test_clean_project(ae, tmp_path):
     assert d.comp_info()["layers"][0]["source"] == "a.mov"  # the layer now uses the kept item
     with pytest.raises(ToolError, match="nothing to do"):
         d.clean_project(False, False)
+
+
+
+# --- camera, light, audio ---
+
+CAM = "ae.app.project.item(1).layer(1)"
+
+
+def _keys_of(layer_expr, match):
+    return f"{layer_expr}.groups[0].children.find(p => p.matchName === {json.dumps(match)}).keys.map(k => [k.time, k.value])"
+
+
+def test_camera_push_in_and_pan(ae):
+    d.create_comp("Main", 1920, 1080, duration=10)
+    out = d.camera_move("push_in", amount=500, duration=2, start=1)
+    assert (out["camera"], out["from"], out["to"]) == ("Camera", 1, 3)
+    assert out["position"] == [[960, 540, -1777.8], [960, 540, -1277.8]]  # 500 px toward the point of interest
+    assert ae.inspect(_keys_of(CAM, "ADBE Anchor Point")) == []  # the point of interest stays
+    assert ae.inspect(f"{CAM}.groups[0].children[1].keys.map(k => k.outType)") == [6613, 6613]  # eased
+    d.camera_move("pan_right", amount=300, duration=1, start=5, ease=False, camera="Camera")
+    assert ae.inspect(_keys_of(CAM, "ADBE Anchor Point")) == [[5, [960, 540, 0]], [6, [1260, 540, 0]]]
+    pos = ae.inspect(_keys_of(CAM, "ADBE Position"))
+    assert pos[-2:] == [[5, [960, 540, -1277.8]], [6, [1260, 540, -1277.8]]]  # continues from where the push ended
+    pulled = d.camera_move("pull_out", amount=100, start=7, duration=1, camera="Camera")
+    assert pulled["position"][1][2] == pytest.approx(-1377.8)
+    crane = d.camera_move("crane_up", amount=200, start=8.5, duration=1, camera="Camera")
+    assert crane["position"][1][1] == 340  # up is -y
+
+
+def test_camera_orbit(ae):
+    d.create_comp("Main", 1920, 1080, duration=10)
+    out = d.camera_move("orbit", duration=4)
+    assert out == {"camera": "Camera", "move": "orbit", "rig": "Camera Orbit", "from": 0, "to": 4, "degrees": 90}
+    rig = "ae.app.project.item(1).layer(1)"
+    assert ae.inspect(f"[{rig}.threeDLayer, {rig}.groups[0].children[1]._value]") == [True, [960, 540, 0]]
+    assert ae.inspect(_keys_of(rig, "ADBE Rotate Y")) == [[0, 0], [4, 90]]
+    assert [l["parent"] for l in d.comp_info()["layers"]] == [None, 1]  # the camera hangs on the rig
+
+
+def test_camera_errors(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a camera"):
+        d.camera_move("push_in", camera="Rig")
+    for kwargs, msg in [({"move": "zoom"}, "move must be"), ({"move": "orbit", "duration": 0}, "duration"),
+                        ({"move": "pan_left", "amount": -5}, "amount")]:
+        with pytest.raises(ToolError, match=msg):
+            d.camera_move(**kwargs)
+    d.add_layer("camera")
+    ae.inspect("(ae.app.project.item(1).layer(1).groups[0].children[1]._value = [960, 540, 0], 1)")
+    with pytest.raises(ToolError, match="no direction"):
+        d.camera_move("push_in", camera="Camera")
+
+
+def test_set_light(ae):
+    d.create_comp("Main")
+    d.add_layer("light", name="Key")
+    out = d.set_light("Key", type="spot", intensity=150, color=[1, 0.9, 0.8], cone_angle=60, cone_feather=40,
+                      shadows=True)
+    assert out == {"light": "Key", "set": {"intensity": 150, "color": [1, 0.9, 0.8, 1], "coneAngle": 60,
+                                           "coneFeather": 40, "shadows": 1}}
+    with pytest.raises(ToolError, match="this light type has no coneAngle"):
+        d.set_light("Key", type="point", cone_angle=30)
+    with pytest.raises(ToolError, match="no shadows"):
+        d.set_light("Key", type="ambient", shadows=True)
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a light"):
+        d.set_light("Rig", intensity=10)
+    for kwargs, msg in [({"type": "neon"}, "type must be"), ({"cone_angle": 0}, "cone_angle"),
+                        ({"cone_feather": 120}, "cone_feather")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_light("Key", **kwargs)
+
+
+def _music(ae, tmp_path, name="song.wav"):
+    f = tmp_path / name
+    f.write_bytes(b"x")
+    d.import_file(str(f))
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item=name)  # 5 s in the fake
+
+
+def test_audio_fade(ae, tmp_path):
+    _music(ae, tmp_path)
+    out = d.audio_fade(1, fade_in=1, fade_out=2, level_db=-6)
+    assert out == {"layer": "song.wav", "level": -6, "fadeIn": 1, "fadeOut": 2, "keys": 4}
+    assert d.get_property(1, ["ADBE Audio Group", "ADBE Audio Levels"])["keys"] == [
+        {"time": 0, "value": [-48, -48]}, {"time": 1, "value": [-6, -6]}, {"time": 8, "value": [-6, -6]},
+        {"time": 10, "value": [-48, -48]}]
+    assert d.audio_fade(1, level_db=3)["keys"] == 0  # a level without fades: a static value
+    assert d.get_property(1, ["ADBE Audio Group", "ADBE Audio Levels"])["value"] == [3, 3]
+    with pytest.raises(ToolError, match="longer than the layer"):
+        d.audio_fade(1, fade_in=6, fade_out=6)
+    d.add_layer("solid", name="BG")
+    with pytest.raises(ToolError, match="BG has no audio"):
+        d.audio_fade("BG", fade_in=1)
+    for kwargs, msg in [({"fade_in": -1}, "fades"), ({"level_db": -60}, "level_db")]:
+        with pytest.raises(ToolError, match=msg):
+            d.audio_fade(1, **kwargs)
+
+
+def test_audio_react(ae, tmp_path):
+    _music(ae, tmp_path)
+    d.add_layer("shape", name="Logo")
+    out = d.audio_react("song.wav", "Logo", "scale", amount=2, name="Beat")
+    assert out["amplitude"] == "Beat" and out["error"] is None
+    assert out["expression"] == ('var a = thisComp.layer("Beat").effect("Both Channels")("Slider") * 2;\n'
+                                 "[value[0] + a, value[1] + a, value[2]]")  # z scale untouched
+    assert [l["name"] for l in d.comp_info()["layers"]] == ["Beat", "Logo", "song.wav"]
+    assert ae.inspect("ae.app.project.item(2).layer(3).selected") is True  # the command ran on the audio layer
+    rot = d.audio_react("song.wav", "Logo", "rotation", amount=5, name="Beat 2")
+    assert rot["expression"].endswith("value + a")
+    with pytest.raises(ToolError, match="Logo has no audio"):
+        d.audio_react("Logo", "Logo")
+    ae.inspect("(ae.app.findMenuCommandId = () => 0, 1)")
+    with pytest.raises(ToolError, match="not found in the menus"):
+        d.audio_react("song.wav", "Logo")
+
+
+def test_audio_react_command_does_nothing(ae, tmp_path):
+    _music(ae, tmp_path)
+    ae.inspect("(ae.app.executeCommand = () => {}, 1)")
+    with pytest.raises(ToolError, match="added no layer"):
+        d.audio_react("song.wav", "song.wav", "opacity")
+
+
+# --- captions ---
+
+SRT = """﻿1
+00:00:01,000 --> 00:00:02,500
+مرحبًا بكم
+
+2
+00:00:03,000 --> 00:00:05,000 X1:0 X2:100
+<i>Second</i> line
+and more
+
+3
+00:00:06,000 --> 00:00:05,000
+backwards: skipped
+"""
+
+
+def test_parse_srt():
+    cues = d._parse_srt(SRT)
+    assert cues == [{"start": 1, "end": 2.5, "text": "مرحبًا بكم"},
+                    {"start": 3, "end": 5, "text": "Second line\rand more"}]
+    with pytest.raises(ToolError, match="not an SRT time"):
+        d._parse_srt("1\n00:00:1 --> 00:00:02,000\nx")
+
+
+def test_captions_from_srt(ae, tmp_path):
+    srt = tmp_path / "ar.srt"
+    srt.write_text(SRT, encoding="utf-8")
+    d.create_comp("Main", 1080, 1920, duration=10)
+    out = d.captions_from_srt(str(srt), size=72, color=[1, 1, 0], y=0.8, offset=0.5)
+    assert out == {"comp": "Main", "captions": 2, "first": "Caption 1", "last": "Caption 2"}
+    layers = d.comp_info()["layers"]
+    assert [(l["name"], l["inPoint"], l["outPoint"]) for l in layers] == [("Caption 2", 3.5, 5.5),
+                                                                           ("Caption 1", 1.5, 3)]
+    text = d.get_property("Caption 1", "text")["value"]
+    assert (text["text"], text["fontSize"], text["fillColor"]) == ("مرحبًا بكم", 72, [1, 1, 0])
+    assert d.get_property("Caption 1", "position")["value"][:2] == [540, 1536]
+    empty = tmp_path / "empty.srt"
+    empty.write_text("nothing here", encoding="utf-8")
+    with pytest.raises(ToolError, match="no subtitles"):
+        d.captions_from_srt(str(empty))
+    with pytest.raises(ToolError, match="cannot read"):
+        d.captions_from_srt(str(tmp_path / "missing.srt"))
+    with pytest.raises(ToolError, match="before 0"):
+        d.captions_from_srt(str(srt), offset=-2)
+
+
+# --- background rendering ---
+
+
+def test_render_background(ae, tmp_path, monkeypatch):
+    exe = tmp_path / "aerender"
+    exe.write_text("#!/bin/sh\necho \"PROGRESS: rendering $2\"\necho 'Finished composition'\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("AE_RENDER", str(exe))
+    d.create_comp("Main")
+    with pytest.raises(ToolError, match="never saved"):
+        d.render_background()
+    d.save_project(str(tmp_path / "p.aep"))
+    job = d.render_background()
+    assert job["project"] == str(tmp_path / "p.aep")
+    d._JOBS[job["job"]][0].wait(timeout=10)
+    st = d.render_background_status(job["job"])
+    assert (st["state"], st["exit_code"]) == ("done", 0)
+    assert st["log_tail"] == [f"PROGRESS: rendering {tmp_path / 'p.aep'}", "Finished composition"]
+    with pytest.raises(ToolError, match="unknown render job"):
+        d.render_background_status(1)
+
+
+def test_render_background_failures(ae, tmp_path, monkeypatch):
+    monkeypatch.setenv("AE_RENDER", str(tmp_path / "nowhere"))
+    with pytest.raises(ToolError, match="aerender not found"):
+        d.render_background()
+    exe = tmp_path / "aerender"
+    exe.write_text("#!/bin/sh\necho 'aerender ERROR: No comps to render'\n")  # exits 0 all the same
+    exe.chmod(0o755)
+    monkeypatch.setenv("AE_RENDER", str(exe))
+    d.create_comp("Main")
+    d.save_project(str(tmp_path / "p.aep"))
+    job = d.render_background()
+    d._JOBS[job["job"]][0].wait(timeout=10)
+    assert d.render_background_status(job["job"])["state"] == "failed"
+
+
+# --- Essential Graphics ---
+
+
+def test_mogrt(ae, tmp_path):
+    d.create_comp("Lower Third")
+    d.add_layer("text", text="Name")
+    with pytest.raises(ToolError, match="add properties to Essential Graphics first"):
+        d.export_mogrt(str(tmp_path / "lt.mogrt"))
+    assert d.mogrt_add_property(1, "text", name="Name") == {"comp": "Lower Third", "layer": "Name",
+                                                             "property": "Source Text", "name": "Name"}
+    d.mogrt_add_property(1, "opacity")
+    out = d.export_mogrt(str(tmp_path / "lt.mogrt"), name="LT Clean")
+    assert out["template"] == "LT Clean"
+    assert json.loads((tmp_path / "lt.mogrt").read_text()) == {"name": "LT Clean",
+                                                               "props": [["Source Text", "Name"], ["Opacity", "Opacity"]]}
+    with pytest.raises(ToolError, match=r"\.mogrt"):
+        d.export_mogrt(str(tmp_path / "lt.aep"))
+    ae.inspect("(delete Object.getPrototypeOf(ae.app.project.item(1).layer(1).groups[0].children[0])"
+               ".addToMotionGraphicsTemplateAs, 1)")
+    with pytest.raises(ToolError, match="needs After Effects 2018"):
+        d.mogrt_add_property(1, "text")

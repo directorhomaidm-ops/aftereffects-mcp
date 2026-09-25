@@ -17,6 +17,7 @@ const MaskMode = {NONE: 6812, ADD: 6813, SUBTRACT: 6814, INTERSECT: 6815, LIGHTE
 const BlendingMode = {NORMAL: 5212, DISSOLVE: 5213, DARKEN: 5214, MULTIPLY: 5215, COLOR_BURN: 5216, LINEAR_BURN: 5217,
     LIGHTEN: 5218, SCREEN: 5219, COLOR_DODGE: 5220, LINEAR_DODGE: 5221, ADD: 5222, OVERLAY: 5223, SOFT_LIGHT: 5224,
     HARD_LIGHT: 5225, DIFFERENCE: 5226, EXCLUSION: 5227, HUE: 5228, SATURATION: 5229, COLOR: 5230, LUMINOSITY: 5231};
+const LightType = {PARALLEL: 4412, SPOT: 4413, POINT: 4414, AMBIENT: 4415};
 const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
 // PNG signature + an empty IEND chunk: export_frame waits for IEND.
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
@@ -159,6 +160,20 @@ function makeAE(CtxArray) {
         }
         get numKeys() {
             return this.keys.length;
+        }
+        valueAtTime(t) {
+            if (!this.keys.length) {
+                return this.value;
+            }
+            const before = this.keys.filter((k) => k.time <= t + 1e-9);
+            return clone((before.length ? before[before.length - 1] : this.keys[0]).value);
+        }
+        addToMotionGraphicsTemplateAs(comp, name) {
+            if (this.propertyValueType === PropertyValueType.NO_VALUE) {
+                return false;
+            }
+            comp._mogrt.push([this.name, name]);
+            return true;
         }
         setValue(v) {
             this._check();
@@ -383,6 +398,7 @@ function makeAE(CtxArray) {
             this.height = opts.height || 1080;
             this.duration = opts.duration || 0;
             this.frameRate = opts.frameRate || 0;
+            this.hasAudio = !!file && /\.(wav|mp3|aif|aiff|m4a|mov|mp4)$/i.test(file.fsName);
         }
         replace(file) {
             needUndo();
@@ -414,6 +430,8 @@ function makeAE(CtxArray) {
                     new Property("Anchor Point", "ADBE Anchor Point", [w / 2, h / 2, 0], PropertyValueType.ThreeD_SPATIAL, true),
                     new Property("Position", "ADBE Position", [w / 2, h / 2, 0], PropertyValueType.ThreeD_SPATIAL, true),
                     new Property("Scale", "ADBE Scale", [100, 100, 100], PropertyValueType.ThreeD),
+                    new Property("X Rotation", "ADBE Rotate X", 0, PropertyValueType.OneD),
+                    new Property("Y Rotation", "ADBE Rotate Y", 0, PropertyValueType.OneD),
                     new Property("Rotation", "ADBE Rotate Z", 0, PropertyValueType.OneD),
                     new Property("Opacity", "ADBE Opacity", 100, PropertyValueType.OneD),
                 ]),
@@ -421,6 +439,11 @@ function makeAE(CtxArray) {
                 masks(),
                 new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER),
             ];
+            if (source && source.hasAudio) {
+                this.groups.push(new PropertyGroup("Audio", "ADBE Audio Group", [
+                    new Property("Audio Levels", "ADBE Audio Levels", [0, 0], PropertyValueType.TwoD)]));
+            }
+            this.selected = false;
             Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
                 solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
         }
@@ -505,6 +528,9 @@ function makeAE(CtxArray) {
         get index() {
             return this.containingComp._layers.indexOf(this) + 1;
         }
+        get hasAudio() {
+            return !!this.property("ADBE Audio Group");
+        }
         get startTime() {
             return this._start;
         }
@@ -566,12 +592,40 @@ function makeAE(CtxArray) {
         constructor(comp, name) {
             super(comp, name);
             this.groups = this.groups.filter((g) => !NOT_ON_3D.includes(g.matchName));
+            // a camera's anchor point is its point of interest; it starts 1777.8 px in front of the comp
+            const t = this.groups[0].children;
+            t[0]._value = [comp.width / 2, comp.height / 2, 0];
+            t[1]._value = [comp.width / 2, comp.height / 2, -1777.8];
         }
     }
     class LightLayer extends AVLayer {
         constructor(comp, name) {
             super(comp, name);
             this.groups = this.groups.filter((g) => !NOT_ON_3D.includes(g.matchName));
+            this._type = LightType.SPOT;
+            this._options();
+        }
+        get lightType() { return this._type; }
+        set lightType(t) {
+            if (!Object.values(LightType).includes(t)) {
+                throw new Error("After Effects error: bad light type");
+            }
+            this._type = t;
+            this._options();
+        }
+        _options() {
+            // ambient lights have no shadows; only spots have a cone
+            const opts = [new Property("Intensity", "ADBE Light Intensity", 100, PropertyValueType.OneD),
+                new Property("Color", "ADBE Light Color", [1, 1, 1, 1], PropertyValueType.COLOR)];
+            if (this._type === LightType.SPOT) {
+                opts.push(new Property("Cone Angle", "ADBE Light Cone Angle", 90, PropertyValueType.OneD),
+                    new Property("Cone Feather", "ADBE Light Cone Feather 2", 50, PropertyValueType.OneD));
+            }
+            if (this._type !== LightType.AMBIENT) {
+                opts.push(new Property("Casts Shadows", "ADBE Light Shadow Casting", 0, PropertyValueType.OneD));
+            }
+            this.groups = this.groups.filter((g) => g.matchName !== "ADBE Light Options Group");
+            this.groups.push(new PropertyGroup("Light Options", "ADBE Light Options Group", opts));
         }
     }
 
@@ -642,6 +696,8 @@ function makeAE(CtxArray) {
             this._layers = [];
             this.layers = new LayerCollection(this);
             this.markerProperty = new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER);
+            this._mogrt = [];
+            this.motionGraphicsTemplateName = name;
             this._wa = [0, dur];
         }
         get workAreaStart() { return this._wa[0]; }
@@ -666,6 +722,13 @@ function makeAE(CtxArray) {
         }
         openInViewer() {
             project.activeItem = this;
+        }
+        exportAsMotionGraphicsTemplate(overwrite, p) {
+            if (!this._mogrt.length || (!overwrite && fs.existsSync(p))) {
+                return false;
+            }
+            fs.writeFileSync(p, JSON.stringify({name: this.motionGraphicsTemplateName, props: this._mogrt}));
+            return true;
         }
         saveFrameToPng(t, file) {
             if (t < 0 || t > this.duration) {
@@ -815,6 +878,24 @@ function makeAE(CtxArray) {
         version: "26.0x10",
         project,
         effects: arr(EFFECTS.map((e) => ({displayName: e.displayName, matchName: e.matchName, category: e.category}))),
+        findMenuCommandId(name) {
+            return name === "Convert Audio to Keyframes" ? 5015 : 0;
+        },
+        executeCommand(id) {
+            needUndo();
+            const comp = project.activeItem;
+            const sel = comp ? comp._layers.filter((l) => l.selected) : [];
+            if (id !== 5015 || sel.length !== 1 || !sel[0].hasAudio) {
+                return;  // like the menu: nothing happens without one selected layer with audio
+            }
+            const amp = new AVLayer(comp, "Audio Amplitude");
+            amp.nullLayer = true;
+            const slider = (n) => new PropertyGroup(n, "ADBE Slider Control", [
+                new Property("Slider", "ADBE Slider Control-0001", 0, PropertyValueType.OneD)]);
+            amp.property("ADBE Effect Parade").children.push(slider("Left Channel"), slider("Right Channel"),
+                slider("Both Channels"));
+            comp._layers.unshift(amp);
+        },
         beginUndoGroup(name) {
             undo.push(name);
             undoLog.push(name);
@@ -831,7 +912,8 @@ function makeAE(CtxArray) {
         app, undo, undoLog,
         globals: {app, CompItem, FolderItem, FootageItem, SolidSource, TextLayer, ShapeLayer, CameraLayer, LightLayer,
             PropertyType, PropertyValueType, KeyframeInterpolationType, KeyframeEase, RQItemStatus,
-            ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue},
+            ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue,
+            LightType},
     };
 }
 
