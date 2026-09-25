@@ -1,6 +1,6 @@
 # aftereffects-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, import, the render queue and frame export.
+An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, masks, vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, import, the render queue and frame export.
 
 ## Use
 
@@ -46,6 +46,16 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `render` | `timeout = 1800` | `{rendered, items: [{comp, status, output}]}` |
 | `export_frame` | `path` (.png), `time = 0`, `comp` | `{comp, time, path}` |
 | `save_project` | `path` (.aep) | `{project}` |
+| `add_mask` | `layer`, `shape` (rect, ellipse, path), `rect: [x, y, w, h]`, `points`, `mode`, `feather`, `expansion`, `opacity`, `inverted`, `name`, `comp` | `{layer, mask, masks, mode, vertices}` |
+| `add_shape` | `shape` (rect, ellipse, star, polygon), `size = [200, 200]`, `fill`, `stroke`, `stroke_width = 4`, `roundness`, `points = 5`, `position`, `layer` (existing shape layer), `layer_name`, `name`, `comp` | `{layer, index, group, shape}` |
+| `animate_text` | `layer`, `preset` (fade_in, typewriter, slide_up, scale_in, blur_in), `duration = 1`, `start`, `comp` | `{layer, animator, preset, from, to, keys}` |
+| `precompose` | `layers`, `name`, `move_attributes = True`, `comp` | `{comp, precomp, id, precompLayers, layer}` |
+| `duplicate_layer` | `layer`, `name`, `comp` | layer info of the copy (right above the original) |
+| `move_layer` | `layer`, `to` (top, bottom, before, after), `other`, `comp` | `{layer, index}` |
+| `set_switches` | `layer`, `blending`, `three_d`, `motion_blur`, `shy`, `solo`, `locked`, `matte` (alpha, alpha_inverted, luma, luma_inverted, none), `matte_layer`, `comp` | `{layer, threeD, motionBlur, shy, solo, locked, matteLayer}` |
+| `add_marker` | `time`, `comment`, `duration`, `layer` (default: the comp), `comp` | `{target, time, markers}` |
+| `set_comp` | `comp`, `name`, `width`, `height`, `duration`, `frame_rate`, `bg_color`, `work_area: [start, end]` | comp settings with the work area |
+| `render_templates` | — | `{outputModules, renderSettings}` template names |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -53,6 +63,11 @@ Notes:
 - `property` is a short name (`anchor`, `position`, `scale`, `rotation`, `opacity`, `text`) or a path of display or match names: `["Effects", "Gaussian Blur", "Blurriness"]`, `["ADBE Transform Group", "ADBE Position"]`. A wrong name lists what is there.
 - Easing: `ease` (both sides, default), `ease_in` (slows into the key), `ease_out` (slows out of it), `linear`, `hold`; `influence` 0.1-100 (default 33.33). Spatial properties such as position take one ease per side, others one per dimension; the server handles that.
 - `render` keeps After Effects busy until the queue is done. A render queue item whose setup fails (e.g. an unknown template) is removed again, so it cannot stop the next render.
+- Masks are in layer pixels from the layer's top left. A mask's properties animate like any other: `set_keyframes(layer, ["Masks", "Spot", "Mask Feather"], ...)`.
+- `add_shape` puts each shape in its own group; colors are `[r, g, b]` 0-1 (the alpha the shape properties need is added). Without `layer` it makes a new shape layer.
+- `animate_text` adds a text animator with a range selector whose start runs 0 to 100 %, revealing characters in order; `typewriter` uses hard steps. Calling it again stacks another animator.
+- `set_switches` applies `locked` last, since a locked layer takes no more changes. Track mattes use `Layer.setTrackMatte` (After Effects 2023+).
+- `render_templates` lists the exact template names to pass to `add_to_render_queue(template=...)`; names depend on the installed templates and the application language.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration
