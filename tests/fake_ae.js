@@ -443,6 +443,21 @@ function makeAE(CtxArray) {
                 const tr = new Property("Time Remap", "ADBE Time Remapping", 0, PropertyValueType.OneD);
                 tr.keys.push({time: this.inPoint, value: 0, inType: 6612, outType: 6612},
                     {time: this.outPoint, value: this.source.duration, inType: 6612, outType: 6612});
+                // Removing the last key turns time remapping off, and the property then refuses values
+                const layer = this, removeKey = tr.removeKey, setValueAtTime = tr.setValueAtTime;
+                tr.removeKey = function (i) {
+                    removeKey.call(this, i);
+                    if (!this.keys.length) {
+                        layer.groups = layer.groups.filter((g) => g !== tr);
+                    }
+                };
+                tr.setValueAtTime = function (t, v) {
+                    if (!layer.groups.includes(tr)) {
+                        throw new Error("After Effects error: Can not “set value at time” with this property, " +
+                            "because the property or a parent property is hidden.");
+                    }
+                    setValueAtTime.call(this, t, v);
+                };
                 this.groups.unshift(tr);
             }
         }
