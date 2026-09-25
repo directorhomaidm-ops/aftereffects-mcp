@@ -1,6 +1,6 @@
 # aftereffects-mcp
 
-An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, masks, vector shapes, text animation and expression presets, precomposing, layer order and switches, track mattes, markers, time remapping, layer placement, project organization, import, the render queue and frame export.
+An [MCP](https://modelcontextprotocol.io) server that drives Adobe After Effects: compositions, layers, properties, keyframes with easing, expressions, effects, masks, vector shapes, text animation and expression presets, precomposing, layer order and switches, track mattes, markers, time remapping, layer placement, project organization, camera moves, lights, audio fades and audio-reactive animation, captions from SRT, Motion Graphics templates, import, the render queue (in After Effects or in the background through aerender) and frame export.
 
 ## Use
 
@@ -68,6 +68,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `create_folder` | `name`, `parent` | `{id, name, parent}` |
 | `move_items` | `items`, `folder` | `{folder, moved}` |
 | `clean_project` | `remove_unused = True`, `consolidate = True` | `{consolidated, removedUnused, items: [before, after]}` |
+| `camera_move` | `move` (push_in, pull_out, pan_left, pan_right, crane_up, crane_down, orbit), `amount` (px, or degrees for orbit), `duration = 3`, `start = 0`, `ease = True`, `camera`, `comp` | `{camera, move, from, to, position}` or the orbit rig |
+| `set_light` | `layer`, `type` (parallel, spot, point, ambient), `intensity`, `color`, `cone_angle`, `cone_feather`, `shadows`, `comp` | `{light, set}` |
+| `audio_fade` | `layer`, `fade_in`, `fade_out` (s), `level_db = 0`, `comp` | `{layer, level, fadeIn, fadeOut, keys}` |
+| `audio_react` | `audio` (layer with sound), `layer`, `property = "scale"`, `amount = 1`, `name = "Audio Amplitude"`, `comp` | `{amplitude, target, property, expression, error}` |
+| `captions_from_srt` | `path`, `comp`, `size = 60`, `font`, `color`, `y = 0.85`, `prefix = "Caption"`, `offset = 0` | `{comp, captions, first, last}` |
+| `render_background` | — | `{job, project, log}` |
+| `render_background_status` | `job` | `{job, state, exit_code, log_tail}` |
+| `mogrt_add_property` | `layer`, `property`, `name`, `comp` | `{comp, layer, property, name}` |
+| `export_mogrt` | `path` (.mogrt), `name`, `comp` | `{comp, template, path}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -87,6 +96,11 @@ Notes:
 - `fit_to_comp` and `center_anchor` measure text and shapes with `sourceRectAtTime`; `center_anchor` ignores rotation when keeping the layer in place.
 - `null_control` parents the layers to a new null at their average position; parenting keeps each one where it is.
 - `clean_project` consolidates duplicate footage (same file) first, then removes footage no comp uses.
+- `camera_move` creates a camera when none is named and continues from the camera's position at `start`. Push and pull move along the line to the point of interest; pans and cranes move camera and point of interest together; orbit parents the camera to a 3D null at the point of interest and turns its Y rotation. Layers need their 3D switch (`set_switches(three_d=True)`) to show depth.
+- `audio_react` runs Animation > Keyframe Assistant > Convert Audio to Keyframes (found by its English menu name) and links the property to the "Both Channels" slider: x and y move for scale and position, z stays.
+- `captions_from_srt` makes one centered text layer per cue; tags such as `<i>` are dropped, line breaks kept.
+- `render_background` saves the project, then runs `aerender -project` on it (next to the application, or `AE_RENDER`), so After Effects stays usable. The job lives as long as the server; aerender can exit 0 after an error, so its log decides the state.
+- `mogrt_add_property` uses `addToMotionGraphicsTemplateAs`; `export_mogrt` writes the comp's template for Premiere Pro.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration
@@ -94,6 +108,7 @@ Notes:
 | Variable | Default | Purpose |
 |---|---|---|
 | `AE_APP` | `Adobe After Effects 2026` | The application name AppleScript talks to |
+| `AE_RENDER` | `/Applications/<AE_APP>/aerender` | aerender for `render_background` |
 | `AE_MCP_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` (JSON lines on stderr) |
 
 ## Live check

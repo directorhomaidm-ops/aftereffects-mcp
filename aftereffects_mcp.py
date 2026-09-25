@@ -23,6 +23,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -695,6 +696,192 @@ def clean_project(remove_unused: bool = True, consolidate: bool = True) -> dict:
     if not (remove_unused or consolidate):
         raise ToolError("nothing to do")
     return _call("clean_project", removeUnused=remove_unused or None, consolidate=consolidate or None)
+
+
+# --- camera, light, audio ---
+
+CAMERA_MOVES = ("push_in", "pull_out", "pan_left", "pan_right", "crane_up", "crane_down", "orbit")
+
+
+@_tool
+def camera_move(move: str, amount: float | None = None, duration: float = 3.0, start: float = 0.0,
+                ease: bool = True, camera: int | str | None = None, comp: int | str | None = None) -> dict:
+    """Animate a 3D camera (a new one unless `camera` names one): push_in / pull_out along its line of sight,
+    pan_left / pan_right / crane_up / crane_down (camera and point of interest together), each by `amount` pixels
+    (default 400), or orbit around the point of interest by `amount` degrees (default 90) through a 3D null rig.
+    Over `duration` seconds from `start`, eased unless ease=False. Layers need their 3D switch on (set_switches)."""
+    if move not in CAMERA_MOVES:
+        raise ToolError(f"move must be one of: {', '.join(CAMERA_MOVES)}")
+    if duration <= 0 or start < 0:
+        raise ToolError("duration must be above 0 and start 0 or more")
+    amount = amount if amount is not None else (90.0 if move == "orbit" else 400.0)
+    if amount <= 0:
+        raise ToolError("amount must be above 0 (the move sets the direction)")
+    return _call("camera_move", comp=comp, camera=camera, move=move, amount=amount, duration=duration, start=start,
+                 ease=ease)
+
+
+LIGHT_TYPES = ("parallel", "spot", "point", "ambient")
+
+
+@_tool
+def set_light(layer: int | str, type: str | None = None, intensity: float | None = None,
+              color: list[float] | None = None, cone_angle: float | None = None, cone_feather: float | None = None,
+              shadows: bool | None = None, comp: int | str | None = None) -> dict:
+    """Set up a light layer: type parallel, spot, point or ambient; intensity in % (100 = normal); color [r, g, b]
+    0-1; cone_angle (degrees) and cone_feather (%) for spots; shadows makes it cast shadows (layers also need their
+    shadow switches)."""
+    if type is not None and type not in LIGHT_TYPES:
+        raise ToolError(f"type must be one of: {', '.join(LIGHT_TYPES)}")
+    if cone_angle is not None and not 0 < cone_angle <= 180:
+        raise ToolError("cone_angle must be above 0 and at most 180 degrees")
+    if cone_feather is not None and not 0 <= cone_feather <= 100:
+        raise ToolError("cone_feather must be 0-100")
+    rgba = _color("color", color) + [1.0] if color is not None else None
+    return _call("set_light", comp=comp, layer=layer, type=type, intensity=intensity, color=rgba,
+                 coneAngle=cone_angle, coneFeather=cone_feather, shadows=shadows)
+
+
+@_tool
+def audio_fade(layer: int | str, fade_in: float = 0.0, fade_out: float = 0.0, level_db: float = 0.0,
+               comp: int | str | None = None) -> dict:
+    """Audio level and fades of a layer with sound: fade_in / fade_out in seconds (from and to -48 dB), level_db the
+    level in between (0 = unchanged, -6 = half as loud). Replaces the layer's audio level keyframes."""
+    if fade_in < 0 or fade_out < 0:
+        raise ToolError("fades must be 0 or more seconds")
+    if not -48 < level_db <= 24:
+        raise ToolError("level_db must be above -48 and at most 24")
+    return _call("audio_fade", comp=comp, layer=layer, fadeIn=fade_in, fadeOut=fade_out, level=level_db)
+
+
+@_tool
+def audio_react(audio: int | str, layer: int | str, property: str | list[str] = "scale", amount: float = 1.0,
+                name: str = "Audio Amplitude", comp: int | str | None = None) -> dict:
+    """Make a property move with the music: runs Animation > Keyframe Assistant > Convert Audio to Keyframes on the
+    `audio` layer (a new "Audio Amplitude" layer, renamed to `name`) and adds an expression to the target property
+    that adds amplitude x amount to it (x and y for scale and position). E.g. amount 2 on scale pumps it with each
+    beat."""
+    if amount == 0:
+        raise ToolError("amount must not be 0")
+    return _call("audio_react", comp=comp, audio=audio, layer=layer, property=property, amount=amount, name=name)
+
+
+# --- captions ---
+
+_SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{1,3})")
+
+
+def _srt_seconds(stamp):
+    m = _SRT_TIME.fullmatch(stamp.strip())
+    if not m:
+        raise ToolError(f"not an SRT time: {stamp!r}")
+    h, mi, s, ms = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + int(s) + int(ms.ljust(3, "0")) / 1000
+
+
+def _parse_srt(text):
+    cues = []
+    for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n").strip().lstrip("﻿")):
+        lines = [ln for ln in block.split("\n") if ln.strip()]
+        timing = next((i for i, ln in enumerate(lines) if "-->" in ln), None)
+        if timing is None:
+            continue
+        start, end = (_srt_seconds(part.split()[0]) for part in lines[timing].split("-->")[:2])
+        # After Effects breaks text lines on \r
+        body = "\r".join(re.sub(r"</?[a-zA-Z][^>]*>", "", ln).strip() for ln in lines[timing + 1:])
+        if body and end > start:
+            cues.append({"start": start, "end": end, "text": body})
+    return cues
+
+
+@_tool
+def captions_from_srt(path: str, comp: int | str | None = None, size: float = 60, font: str | None = None,
+                      color: list[float] = [1, 1, 1], y: float = 0.85, prefix: str = "Caption",
+                      offset: float = 0.0) -> dict:
+    """Turn an .srt subtitle file into text layers, one per cue, timed to it (plus `offset` seconds), centered at
+    `y` (0 top, 1 bottom) with the given size, font (PostScript name) and color. Any language, right-to-left
+    included. Tags like <i> are dropped; line breaks are kept."""
+    path = _path(path)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            cues = _parse_srt(f.read())
+    except OSError as e:
+        raise ToolError(f"cannot read {path}: {e}") from e
+    if not cues:
+        raise ToolError(f"no subtitles found in {path}")
+    if not 0 <= y <= 1:
+        raise ToolError("y must be 0-1")
+    for c in cues:
+        c["start"], c["end"] = round(c["start"] + offset, 3), round(c["end"] + offset, 3)
+    if cues[0]["start"] < 0:
+        raise ToolError("the offset moves the first subtitle before 0")
+    return _call("add_captions", comp=comp, cues=cues, size=size, font=font, color=_color("color", color), y=y,
+                 prefix=prefix)
+
+
+# --- background rendering (aerender) ---
+
+_JOBS = {}
+
+
+def _aerender():
+    exe = os.environ.get("AE_RENDER")
+    if not exe:
+        app = os.environ.get("AE_APP", "Adobe After Effects 2026")
+        exe = f"/Applications/{app}/aerender"
+    if not os.path.exists(exe):
+        raise ToolError(f"aerender not found at {exe}: set AE_RENDER to its path")
+    return exe
+
+
+@_tool
+def render_background() -> dict:
+    """Render the queued items in a separate aerender process so After Effects stays free: the project is saved
+    first (aerender reads the saved file). Follow it with render_background_status."""
+    exe = _aerender()
+    project = _call("save_project")["project"]
+    log_path = os.path.join(tempfile.mkdtemp(prefix="aemcp_render_"), "aerender.log")
+    log = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen([exe, "-project", project], stdout=log, stderr=subprocess.STDOUT)
+    _JOBS[proc.pid] = (proc, log, log_path)
+    return {"job": proc.pid, "project": project, "log": log_path}
+
+
+@_tool
+def render_background_status(job: int) -> dict:
+    """State of a render_background job: running, done or failed, with the end of aerender's log."""
+    if job not in _JOBS:
+        raise ToolError(f"unknown render job {job} (jobs live as long as this server)")
+    proc, log, log_path = _JOBS[job]
+    code = proc.poll()
+    if code is not None and not log.closed:
+        log.close()
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    state = "running" if code is None else ("done" if code == 0 else "failed")
+    if code == 0 and any("error" in ln.lower() for ln in lines):
+        state = "failed"  # aerender can exit 0 after a failed render; its log says so
+    return {"job": job, "state": state, "exit_code": code, "log_tail": lines[-15:]}
+
+
+# --- Essential Graphics ---
+
+
+@_tool
+def mogrt_add_property(layer: int | str, property: str | list[str], name: str | None = None,
+                       comp: int | str | None = None) -> dict:
+    """Expose a property in the comp's Essential Graphics panel (e.g. a title's Source Text or a color) under
+    `name`, for a Motion Graphics template editors can change in Premiere Pro."""
+    return _call("mogrt_add_property", comp=comp, layer=layer, property=property, name=name)
+
+
+@_tool
+def export_mogrt(path: str, name: str | None = None, comp: int | str | None = None) -> dict:
+    """Export the comp as a Motion Graphics template (.mogrt) with its Essential Graphics properties."""
+    path = _path(path)
+    if not path.lower().endswith(".mogrt"):
+        raise ToolError("the path must end in .mogrt")
+    return _call("export_mogrt", comp=comp, path=path, name=name)
 
 
 @_tool

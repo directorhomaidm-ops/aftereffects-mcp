@@ -283,6 +283,33 @@ var aemcp = (function () {
 
     var EASE = {linear: 1, ease: 1, ease_in: 1, ease_out: 1, hold: 1};
 
+    function keyAt(p, time, value, kind, influence) {
+        // set a keyframe and its interpolation; returns its index
+        var idx, dims, eases = [], low = [], j;
+        p.setValueAtTime(time, value);
+        idx = p.nearestKeyIndex(time);
+        if (kind === "hold") {
+            p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
+        } else if (kind === "linear") {
+            p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);
+        } else if (p.propertyValueType !== PropertyValueType.TEXT_DOCUMENT) {
+            // one ease per dimension, except spatial properties (position) which take a single one
+            dims = (p.value instanceof Array && !p.isSpatial) ? p.value.length : 1;
+            for (j = 0; j < dims; j++) {
+                eases.push(new KeyframeEase(0, influence || 33.33));
+                low.push(new KeyframeEase(0, 0.1));  // 0.1 is the smallest influence: no easing
+            }
+            p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER);
+            // ease_in slows into the key (incoming side), ease_out slows out of it (outgoing side)
+            p.setTemporalEaseAtKey(idx, kind === "ease_out" ? low : eases, kind === "ease_in" ? low : eases);
+        }
+        return idx;
+    }
+
+    function transform(l, match) {
+        return l.property("ADBE Transform Group").property(match);
+    }
+
     function enumValue(table, name, what) {
         var key = String(name).toUpperCase(), v = table[key];
         if (v === undefined) {
@@ -478,8 +505,7 @@ var aemcp = (function () {
         },
 
         set_keyframes: function (a) {
-            var l = findLayer(findComp(a.comp), a.layer), p = findProperty(l, a.property), i, k, idx, dims, eases,
-                low, j, kind, influence, times = [];
+            var l = findLayer(findComp(a.comp), a.layer), p = findProperty(l, a.property), i, k, kind, times = [];
             if (a.clear) {
                 while (p.numKeys > 0) {
                     p.removeKey(p.numKeys);
@@ -491,27 +517,7 @@ var aemcp = (function () {
                 if (!EASE[kind]) {
                     fail("ease must be linear, ease, ease_in, ease_out or hold (got " + kind + ")");
                 }
-                p.setValueAtTime(k.time, toValue(p, k.value));
-                idx = p.nearestKeyIndex(k.time);
-                if (kind === "hold") {
-                    p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.HOLD, KeyframeInterpolationType.HOLD);
-                } else if (kind === "linear") {
-                    p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);
-                } else if (p.propertyValueType !== PropertyValueType.TEXT_DOCUMENT) {
-                    influence = k.influence || 33.33;
-                    // one ease per dimension, except spatial properties (position) which take a single one
-                    dims = (p.value instanceof Array && !p.isSpatial) ? p.value.length : 1;
-                    eases = [];
-                    low = [];
-                    for (j = 0; j < dims; j++) {
-                        eases.push(new KeyframeEase(0, influence));
-                        low.push(new KeyframeEase(0, 0.1));  // 0.1 is the smallest influence: no easing
-                    }
-                    p.setInterpolationTypeAtKey(idx, KeyframeInterpolationType.BEZIER, KeyframeInterpolationType.BEZIER);
-                    // ease_in slows into the key (incoming side), ease_out slows out of it (outgoing side)
-                    p.setTemporalEaseAtKey(idx, kind === "ease_out" ? low : eases, kind === "ease_in" ? low : eases);
-                }
-                times.push(round(p.keyTime(idx)));
+                times.push(round(p.keyTime(keyAt(p, k.time, toValue(p, k.value), kind, k.influence))));
             }
             return {property: p.name, keys: p.numKeys, times: times};
         },
@@ -1052,6 +1058,204 @@ var aemcp = (function () {
             }
             out.items = [before, app.project.numItems];
             return out;
+        },
+
+        camera_move: function (a) {
+            var c = findComp(a.comp), cam, pos, poi, p0, q0, p1, q1, d, len, t0 = a.start, t1 = a.start + a.duration,
+                kind = a.ease ? "ease" : "linear", rig = null, rot, out;
+            if (a.camera !== undefined) {
+                cam = findLayer(c, a.camera);
+                if (!(cam instanceof CameraLayer)) {
+                    fail(cam.name + " is not a camera");
+                }
+            } else {
+                cam = c.layers.addCamera("Camera", [c.width / 2, c.height / 2]);
+            }
+            pos = transform(cam, "ADBE Position");
+            poi = transform(cam, "ADBE Anchor Point");  // a camera's anchor point is its point of interest
+            p0 = pos.valueAtTime(t0, false);
+            q0 = poi.valueAtTime(t0, false);
+            if (a.move === "orbit") {
+                // a 3D null at the point of interest carries the camera around it
+                rig = c.layers.addNull(c.duration);
+                rig.name = cam.name + " Orbit";
+                rig.threeDLayer = true;
+                transform(rig, "ADBE Position").setValue([q0[0], q0[1], q0[2]]);
+                cam.parent = rig;
+                rot = transform(rig, "ADBE Rotate Y");
+                keyAt(rot, t0, 0, kind);
+                keyAt(rot, t1, a.amount, kind);
+                return {camera: cam.name, move: a.move, rig: rig.name, from: round(t0), to: round(t1), degrees: a.amount};
+            }
+            if (a.move === "push_in" || a.move === "pull_out") {
+                d = [q0[0] - p0[0], q0[1] - p0[1], q0[2] - p0[2]];
+                len = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                if (len === 0) {
+                    fail("the camera sits on its point of interest: no direction to move in");
+                }
+                len = (a.move === "push_in" ? a.amount : -a.amount) / len;
+                p1 = [p0[0] + d[0] * len, p0[1] + d[1] * len, p0[2] + d[2] * len];
+                q1 = q0;
+            } else {
+                d = {pan_left: [-1, 0], pan_right: [1, 0], crane_up: [0, -1], crane_down: [0, 1]}[a.move];
+                p1 = [p0[0] + d[0] * a.amount, p0[1] + d[1] * a.amount, p0[2]];
+                q1 = [q0[0] + d[0] * a.amount, q0[1] + d[1] * a.amount, q0[2]];
+            }
+            keyAt(pos, t0, p0, kind);
+            keyAt(pos, t1, p1, kind);
+            if (q1 !== q0) {
+                keyAt(poi, t0, q0, kind);
+                keyAt(poi, t1, q1, kind);
+            }
+            out = {camera: cam.name, move: a.move, from: round(t0), to: round(t1), position: [plain(p0), plain(p1)]};
+            return out;
+        },
+
+        set_light: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), opts, set = {};
+            if (!(l instanceof LightLayer)) {
+                fail(l.name + " is not a light");
+            }
+            if (a.type !== undefined) {
+                l.lightType = enumValue(LightType, a.type, "light type");
+            }
+            opts = l.property("ADBE Light Options Group");
+            function put(match, v, key) {
+                var p = opts.property(match);
+                if (!p) {
+                    fail("this light type has no " + key);
+                }
+                p.setValue(v);
+                set[key] = plain(p.value);
+            }
+            if (a.intensity !== undefined) {
+                put("ADBE Light Intensity", a.intensity, "intensity");
+            }
+            if (a.color !== undefined) {
+                put("ADBE Light Color", a.color, "color");
+            }
+            if (a.coneAngle !== undefined) {
+                put("ADBE Light Cone Angle", a.coneAngle, "coneAngle");
+            }
+            if (a.coneFeather !== undefined) {
+                put("ADBE Light Cone Feather 2", a.coneFeather, "coneFeather");
+            }
+            if (a.shadows !== undefined) {
+                put("ADBE Light Shadow Casting", a.shadows ? 1 : 0, "shadows");
+            }
+            return {light: l.name, set: set};
+        },
+
+        audio_fade: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p, lv = a.level, lo = -48, t0 = l.inPoint, t1 = l.outPoint;
+            if (!l.hasAudio) {
+                fail(l.name + " has no audio");
+            }
+            if (a.fadeIn + a.fadeOut > t1 - t0) {
+                fail("the fades (" + (a.fadeIn + a.fadeOut) + " s) are longer than the layer (" + round(t1 - t0) + " s)");
+            }
+            p = l.property("ADBE Audio Group").property("ADBE Audio Levels");
+            while (p.numKeys > 0) {
+                p.removeKey(p.numKeys);
+            }
+            if (a.fadeIn > 0) {
+                keyAt(p, t0, [lo, lo], "linear");
+                keyAt(p, t0 + a.fadeIn, [lv, lv], "linear");
+            }
+            if (a.fadeOut > 0) {
+                keyAt(p, t1 - a.fadeOut, [lv, lv], "linear");
+                keyAt(p, t1, [lo, lo], "linear");
+            }
+            if (!p.numKeys) {
+                p.setValue([lv, lv]);
+            }
+            return {layer: l.name, level: lv, fadeIn: a.fadeIn, fadeOut: a.fadeOut, keys: p.numKeys};
+        },
+
+        audio_react: function (a) {
+            var c = findComp(a.comp), src = findLayer(c, a.audio), target = findLayer(c, a.layer),
+                p = findProperty(target, a.property), cmd, i, amp, dims, parts = [], expr, before = c.numLayers;
+            if (!src.hasAudio) {
+                fail(src.name + " has no audio");
+            }
+            cmd = app.findMenuCommandId("Convert Audio to Keyframes");
+            if (!cmd) {
+                fail("Convert Audio to Keyframes was not found in the menus (a non-English After Effects?)");
+            }
+            c.openInViewer();
+            for (i = 1; i <= c.numLayers; i++) {
+                c.layer(i).selected = false;
+            }
+            src.selected = true;  // the command works on the selected layer of the active comp
+            app.executeCommand(cmd);
+            if (c.numLayers !== before + 1) {
+                fail("Convert Audio to Keyframes added no layer");
+            }
+            amp = c.layer(1);
+            amp.name = a.name;
+            dims = p.value instanceof Array ? p.value.length : 1;
+            expr = 'var a = thisComp.layer("' + amp.name + '").effect("Both Channels")("Slider") * ' + a.amount + ';\n';
+            if (dims === 1) {
+                expr += "value + a";
+            } else {
+                for (i = 0; i < dims; i++) {
+                    parts.push(i < 2 ? "value[" + i + "] + a" : "value[" + i + "]");
+                }
+                expr += "[" + parts.join(", ") + "]";
+            }
+            p.expression = expr;
+            p.expressionEnabled = true;
+            return {amplitude: amp.name, target: target.name, property: p.name, expression: expr,
+                error: p.expressionError || null};
+        },
+
+        add_captions: function (a) {
+            var c = findComp(a.comp), i, cue, l, doc, made = [];
+            for (i = 0; i < a.cues.length; i++) {
+                cue = a.cues[i];
+                l = c.layers.addText(cue.text);
+                doc = l.property("ADBE Text Properties").property("ADBE Text Document").value;
+                doc.fontSize = a.size;
+                if (a.font) {
+                    doc.font = a.font;
+                }
+                doc.applyFill = true;
+                doc.fillColor = a.color;
+                doc.justification = ParagraphJustification.CENTER_JUSTIFY;
+                l.property("ADBE Text Properties").property("ADBE Text Document").setValue(doc);
+                transform(l, "ADBE Position").setValue([c.width / 2, c.height * a.y]);
+                l.inPoint = cue.start;
+                l.outPoint = cue.end;
+                l.name = (a.prefix || "Caption") + " " + (i + 1);
+                made.push(l.name);
+            }
+            return {comp: c.name, captions: made.length, first: made[0] || null, last: made[made.length - 1] || null};
+        },
+
+        mogrt_add_property: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), p = findProperty(l, a.property), ok;
+            if (typeof p.addToMotionGraphicsTemplateAs === "function") {
+                ok = p.addToMotionGraphicsTemplateAs(c, a.name || p.name);
+            } else if (typeof p.addToMotionGraphicsTemplate === "function") {
+                ok = p.addToMotionGraphicsTemplate(c);
+            } else {
+                fail("Essential Graphics scripting needs After Effects 2018 or later");
+            }
+            if (!ok) {
+                fail(p.name + " cannot be added to the Essential Graphics panel");
+            }
+            return {comp: c.name, layer: l.name, property: p.name, name: a.name || p.name};
+        },
+
+        export_mogrt: function (a) {
+            var c = findComp(a.comp);
+            if (a.name) {
+                c.motionGraphicsTemplateName = a.name;
+            }
+            if (!c.exportAsMotionGraphicsTemplate(true, a.path)) {
+                fail("exportAsMotionGraphicsTemplate failed (add properties to Essential Graphics first)");
+            }
+            return {comp: c.name, template: c.motionGraphicsTemplateName, path: a.path};
         },
 
         run_jsx: function (a) {
