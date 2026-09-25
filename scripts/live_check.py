@@ -73,9 +73,9 @@ def main():
     print(f"Work folder (kept): {work}\n")
 
     print("Transport")
-    raw = step("transport: DoScript returns the result on stdout",
+    raw = step("transport: what DoScript prints on stdout (no result file)",
                lambda: d._osascript("'stdout ' + (1 + 1);", 30),
-               note="empty means results come only through the result file")
+               note="After Effects 26.5 prints 0 whatever the script returns: results come through the result file")
     st = step("status", d.status)
     if not st:
         print("\nCannot reach After Effects: is it open with no dialog showing, and is AE_APP right?")

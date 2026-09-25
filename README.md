@@ -17,7 +17,7 @@ Requirements: macOS, After Effects 2026 (other versions: set `AE_APP`), [uv](htt
 
 ## How it works
 
-Each tool runs one command of `jsx/aemcp.jsx` inside After Effects. The server writes the script to a temporary UTF-8 file and has After Effects read and run it through AppleScript's `DoScript` (`osascript`), so text in any language survives. The JSON result comes back on stdout, or from a result file when `DoScript` returns nothing. Every change runs inside one undo group (`aemcp: <command>`), so Cmd+Z undoes a whole tool call.
+Each tool runs one command of `jsx/aemcp.jsx` inside After Effects. The server writes the script to a temporary UTF-8 file and has After Effects read and run it through AppleScript's `DoScript` (`osascript`), so text in any language survives. The JSON result comes back through a result file (After Effects 2026's `DoScript` prints `0` on stdout whatever the script returns), or on stdout when the file is missing. `export_frame` waits until After Effects has finished writing the PNG, since `saveFrameToPng` returns before the file is complete. Every change runs inside one undo group (`aemcp: <command>`), so Cmd+Z undoes a whole tool call.
 
 `jsx/aemcp.jsx` is plain ECMAScript 3, the dialect of ExtendScript: it has its own JSON writer and no ES5 built-ins.
 

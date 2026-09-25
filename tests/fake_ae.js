@@ -18,7 +18,8 @@ const BlendingMode = {NORMAL: 5212, DISSOLVE: 5213, DARKEN: 5214, MULTIPLY: 5215
     LIGHTEN: 5218, SCREEN: 5219, COLOR_DODGE: 5220, LINEAR_DODGE: 5221, ADD: 5222, OVERLAY: 5223, SOFT_LIGHT: 5224,
     HARD_LIGHT: 5225, DIFFERENCE: 5226, EXCLUSION: 5227, HUE: 5228, SATURATION: 5229, COLOR: 5230, LUMINOSITY: 5231};
 const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
-const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// PNG signature + an empty IEND chunk: export_frame waits for IEND.
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
 
 const EFFECTS = [
     {displayName: "Gaussian Blur", matchName: "ADBE Gaussian Blur 2", category: "Blur & Sharpen",
