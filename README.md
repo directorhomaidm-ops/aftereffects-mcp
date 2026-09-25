@@ -54,7 +54,7 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `move_layer` | `layer`, `to` (top, bottom, before, after), `other`, `comp` | `{layer, index}` |
 | `set_switches` | `layer`, `blending`, `three_d`, `motion_blur`, `shy`, `solo`, `locked`, `matte` (alpha, alpha_inverted, luma, luma_inverted, none), `matte_layer`, `comp` | `{layer, threeD, motionBlur, shy, solo, locked, matteLayer}` |
 | `add_marker` | `time`, `comment`, `duration`, `layer` (default: the comp), `comp` | `{target, time, markers}` |
-| `set_comp` | `comp`, `name`, `width`, `height`, `duration`, `frame_rate`, `bg_color`, `work_area: [start, end]` | comp settings with the work area |
+| `set_comp` | `comp`, `name`, `width`, `height`, `duration`, `frame_rate`, `bg_color`, `work_area: [start, end]`, `motion_blur`, `shutter_angle` (0-720) | comp settings with the work area and motion blur |
 | `render_templates` | — | `{outputModules, renderSettings}` template names |
 | `expression_preset` | `layer`, `property`, `preset` (wiggle, loop_cycle, loop_pingpong, loop_continue, bounce, spin, blink), `params`, `comp` | `set_expression` result + preset and params |
 | `property_tree` | `layer`, `depth = 3`, `comp` | `{layer, properties: [{name, matchName, value, keys, children}]}` |
@@ -86,6 +86,13 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `make_variants` | `rows: [{name, texts: {layer: text}}]`, `comp`, `output_dir`, `template` | `{from, variants: [{comp, id, queued}]}` |
 | `import_layered` | `path` (.psd, .ai), `mode` (comp_cropped, comp, footage) | `{id, name, type, layers}` |
 | `find_missing_footage` | `search` (folder), `max_files = 200000` | `{missing, relinked, still_missing, files_searched}` |
+| `motion_path` | `layer`, `points: [[x, y(, z)], ...]`, `duration = 2`, `start = 0`, `times`, `smooth = True`, `ease = True`, `constant_speed = False`, `auto_orient = False`, `comp` | `{layer, keys, from, to, smooth, constantSpeed, autoOrient}` |
+| `bezier_ease` | `layer`, `property`, `curve` (a named easing or `[x1, y1, x2, y2]`), `keys: [first, last]`, `comp` | `{property, segments, keys, curve}` |
+| `track_point` | `layer`, `point: [x, y]` (layer pixels), `start`, `end`, `feature = 31`, `search = 40`, `tracker = "aemcp track"`, `name = "Track Point 1"`, `comp` | `{layer, tracker, point, keys, from, to, start, end, min_confidence, lost_frames, first_lost}` |
+| `attach_to_track` | `layer` (follower), `tracked`, `tracker`, `point`, `keep_offset = False`, `comp` | `{layer, follows, expression, error}` |
+| `set_camera` | `layer`, `focal_length` (mm), `depth_of_field`, `focus_distance`, `focus_on` (layer: autofocus), `f_stop`, `blur_level`, `comp` | `{camera, set, error}` |
+| `set_3d_layer` | `layer`, `extrusion`, `bevel`, `bevel_style` (angular, concave, convex, none), `casts_shadows`, `accepts_shadows`, `accepts_lights`, `specular`, `shininess`, `metal`, `reflection`, `comp` | `{layer, threeD, renderer, set}` |
+| `depth_stack` | `layers` (nearest first), `spacing = 500`, `compensate = True`, `camera`, `comp` | `{camera, layers: [{layer, z, scale}]}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -114,6 +121,15 @@ Notes:
 - `copy_keyframes` keeps each key's interpolation and easing; its offset cascades (target 1: offset, target 2: 2 x offset...).
 - `make_variants` duplicates the template comp per row and replaces the named text layers' text; with `output_dir` each copy is queued with its name as the file name. Render them with `render` or `render_background`.
 - `find_missing_footage(search=...)` matches missing files by name (any case) under a folder and relinks them with `FootageItem.replace`.
+- `motion_path` replaces the position keyframes. Inner points keep their speed (continuous Bezier); with `constant_speed` they rove, so After Effects spreads their timing for an even speed. `auto_orient` sets Auto-Orient Along Path.
+- `bezier_ease` turns a CSS `cubic-bezier(x1, y1, x2, y2)` into temporal ease on every segment: the outgoing handle gets influence `x1` and speed `y1 / x1` x the segment's average speed, the incoming one influence `1 - x2` and speed `(1 - y2) / (1 - x2)` x average (signed per dimension; spatial properties use the speed along the path). The live check samples the result against the curve. Named curves: `ease`, `ease_in`, `ease_out`, `ease_in_out` (CSS) and `ease_in` / `ease_out` / `ease_in_out` + `_sine`, `_quad`, `_cubic`, `_quart`, `_quint`, `_expo`, `_circ`, `_back` (easings.net). Overshoot (`_back`) does not work on position: spatial motion stays on its path.
+- `track_point` does its own tracking, since After Effects' Tracker analysis cannot be scripted: each frame it renders a window of the layer's source around where the feature should be (a temporary comp, removed afterwards), and matches the first frame's feature there (normalized cross-correlation, coarse to fine, sub-pixel). It follows position only, with a fixed template: a feature that turns or grows a lot is lost (low confidence). The result is written as a regular tracker on the layer, editable in the Tracker panel. About 0.2 s a frame; time-remapped layers need precomposing first.
+- `attach_to_track` works with any tracker on the layer, including ones made in the Tracker panel or Mocha. It sets an expression: the attach point, through the tracked layer's transform, into the follower's parent if it has one.
+- Stabilizing and camera tracking: `add_effect(layer, "Warp Stabilizer")` and `add_effect(layer, "3D Camera Tracker")` apply them; After Effects analyzes in the background. Creating the camera from a camera track is a button in the effect's panel.
+- `set_camera` converts `focal_length` for a 36 mm film back across the comp width, and `f_stop` to the aperture in pixels (zoom / f-stop). `focus_on` sets an expression on Focus Distance: the target's distance along the camera's line of sight.
+- New cameras (`add_layer`, `camera_move`, `depth_stack`) are placed in front of the comp center facing it: After Effects 26 itself puts them at x = y = 0.
+- `set_3d_layer` switches the comp to the Advanced 3D renderer when extruding or beveling (Classic 3D cannot extrude).
+- `depth_stack` sets z = 0, spacing, 2 x spacing... and multiplies each layer's scale by (d + z) / d, d being the camera's distance to z = 0, so every layer looks as it did; a background meant to be panned across should be larger than the frame.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration
