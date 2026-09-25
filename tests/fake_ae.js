@@ -91,9 +91,12 @@ function makeAE(CtxArray) {
             this.fillColor = [1, 1, 1];
             this.applyFill = true;
             this.justification = ParagraphJustification.LEFT_JUSTIFY;
+            Object.assign(this, {tracking: 0, autoLeading: true, leading: 72, applyStroke: false,
+                strokeColor: [0, 0, 0], strokeWidth: 0, allCaps: false, boxText: false});
         }
         copy() {
-            return Object.assign(new TextDocument(this.text), this, {fillColor: arr(this.fillColor)});
+            return Object.assign(new TextDocument(this.text), this, {fillColor: arr(this.fillColor),
+                strokeColor: arr(this.strokeColor)});
         }
     }
 
@@ -337,6 +340,19 @@ function makeAE(CtxArray) {
             new Property("Stroke Width", "ADBE Vector Stroke Width", 2, PropertyValueType.OneD)]],
     };
     const shapeRoot = () => new AddGroup("Contents", "ADBE Root Vectors Group", {
+        "ADBE Vector Filter - Trim": ["Trim Paths", () => [
+            new Property("Start", "ADBE Vector Trim Start", 0, PropertyValueType.OneD),
+            new Property("End", "ADBE Vector Trim End", 100, PropertyValueType.OneD),
+            new Property("Offset", "ADBE Vector Trim Offset", 0, PropertyValueType.OneD)]],
+        "ADBE Vector Filter - Repeater": ["Repeater", () => [
+            new Property("Copies", "ADBE Vector Repeater Copies", 3, PropertyValueType.OneD),
+            new Property("Offset", "ADBE Vector Repeater Offset", 0, PropertyValueType.OneD),
+            new PropertyGroup("Transform", "ADBE Vector Repeater Transform", [
+                new Property("Position", "ADBE Vector Repeater Position", [100, 0], PropertyValueType.TwoD_SPATIAL, true),
+                new Property("Scale", "ADBE Vector Repeater Scale", [100, 100], PropertyValueType.TwoD),
+                new Property("Rotation", "ADBE Vector Repeater Rotation", 0, PropertyValueType.OneD),
+                new Property("Start Opacity", "ADBE Vector Repeater Opacity 1", 100, PropertyValueType.OneD),
+                new Property("End Opacity", "ADBE Vector Repeater Opacity 2", 100, PropertyValueType.OneD)])]],
         "ADBE Vector Group": ["Group", () => [
             new AddGroup("Contents", "ADBE Vectors Group", SHAPE_CONTENTS),
             new PropertyGroup("Transform", "ADBE Vector Transform Group", [
@@ -670,6 +686,15 @@ function makeAE(CtxArray) {
         addText(text) {
             return this._top(new TextLayer(this.comp, text));
         }
+        addBoxText(size, text) {
+            if (!Array.isArray(size) || size.length !== 2 || size[0] <= 0 || size[1] <= 0) {
+                throw new Error("After Effects error: addBoxText needs [width, height]");
+            }
+            const l = new TextLayer(this.comp, text);
+            const doc = l.groups[0].children[0]._value;
+            Object.assign(doc, {boxText: true, boxTextSize: arr(size)});
+            return this._top(l);
+        }
         addSolid(color, name, w, h, pa, dur) {
             const src = new FootageItem(name, null, {solid: color, width: w, height: h, duration: dur});
             project._items.push(src);
@@ -724,6 +749,7 @@ function makeAE(CtxArray) {
             this.layers = new LayerCollection(this);
             this.markerProperty = new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER);
             this._mogrt = [];
+            Object.assign(this, {motionBlur: false, shutterAngle: 180, shutterPhase: -90});
             this.motionGraphicsTemplateName = name;
             this._wa = [0, dur];
         }
@@ -896,6 +922,24 @@ function makeAE(CtxArray) {
                 }
             });
             return used;
+        },
+        reduceProject(comps) {
+            needUndo();
+            const keep = new Set();
+            const visit = (it) => {
+                if (keep.has(it)) {
+                    return;
+                }
+                keep.add(it);
+                if (it instanceof CompItem) {
+                    it._layers.forEach((l) => l.source && visit(l.source));
+                }
+            };
+            Array.prototype.forEach.call(comps, visit);
+            keep.forEach((it) => { for (let f = it.parentFolder; f && f !== root; f = f.parentFolder) { keep.add(f); } });
+            const before = this._items.length;
+            this._items = this._items.filter((it) => keep.has(it));
+            return before - this._items.length;
         },
         removeUnusedFootage() {
             needUndo();

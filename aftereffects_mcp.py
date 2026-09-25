@@ -22,6 +22,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -29,6 +30,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
+from array import array
 from time import monotonic, sleep  # export_frame has a parameter named time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1007,6 +1010,168 @@ def find_missing_footage(search: str | None = None, max_files: int = 200000) -> 
                             os.path.basename(m["file"]).lower() not in found]
     out["files_searched"] = seen
     return out
+
+
+# --- shape animation, text, rhythm, project ---
+
+
+@_tool
+def trim_paths(layer: int | str, duration: float = 1.0, start: float | None = None, erase: bool = False,
+               offset: float = 0.0, ease: bool = True, comp: int | str | None = None) -> dict:
+    """Draw a shape layer's strokes on (or erase=True: off) with Trim Paths over `duration` seconds from `start`
+    (default the layer's in point); offset (degrees) rotates where the line starts. Works best on stroked shapes
+    (add_shape with a stroke)."""
+    if duration <= 0:
+        raise ToolError("duration must be above 0")
+    return _call("trim_paths", comp=comp, layer=layer, duration=duration, start=start, erase=erase or None,
+                 offset=offset or None, ease=ease)
+
+
+@_tool
+def shape_repeater(layer: int | str, copies: int = 5, offset: list[float] = [100, 0], scale: float = 100,
+                   rotation: float = 0, end_opacity: float = 100, comp: int | str | None = None) -> dict:
+    """Repeat a shape layer's contents: `copies` copies, each moved by offset [x, y] px, scaled by `scale` % and
+    rotated by `rotation` degrees from the previous one, fading to end_opacity % on the last."""
+    if not 1 <= copies <= 500:
+        raise ToolError("copies must be 1-500")
+    if len(offset) != 2:
+        raise ToolError("offset needs [x, y]")
+    if not 0 <= end_opacity <= 100:
+        raise ToolError("end_opacity must be 0-100")
+    return _call("shape_repeater", comp=comp, layer=layer, copies=copies, offset=[float(v) for v in offset],
+                 scale=scale, rotation=rotation, endOpacity=end_opacity)
+
+
+@_tool
+def text_style(layer: int | str, tracking: float | None = None, leading: float | None = None,
+               stroke_color: list[float] | None = None, stroke_width: float | None = None,
+               all_caps: bool | None = None, comp: int | str | None = None) -> dict:
+    """Typography of a text layer: tracking (letter spacing, 1/1000 em), leading (line spacing in px), an outline
+    stroke (color [r, g, b] 0-1 and width px), all caps. Use set_text for text, font, size, fill and alignment."""
+    if stroke_width is not None and stroke_width < 0:
+        raise ToolError("stroke_width must be 0 or more")
+    if leading is not None and leading <= 0:
+        raise ToolError("leading must be above 0")
+    value = {k: v for k, v in (("tracking", tracking), ("leading", leading),
+                               ("strokeColor", _color("stroke_color", stroke_color)), ("strokeWidth", stroke_width),
+                               ("allCaps", all_caps)) if v is not None}
+    if not value:
+        raise ToolError("nothing to change")
+    return _call("set_property", comp=comp, layer=layer, property="text", value=value)
+
+
+@_tool
+def add_paragraph(text: str, box: list[float] = [800, 400], name: str | None = None,
+                  comp: int | str | None = None) -> dict:
+    """Add paragraph text: a text layer that wraps inside a box [width, height] in pixels. Style it with set_text
+    and text_style."""
+    if len(box) != 2 or min(box) <= 0:
+        raise ToolError("box needs [width, height] above 0")
+    return _call("add_paragraph", comp=comp, text=text, box=[float(v) for v in box], name=name)
+
+
+@_tool
+def set_motion_blur(on: bool = True, layers: str | list[int | str] | None = "all", shutter_angle: float | None = None,
+                    shutter_phase: float | None = None, comp: int | str | None = None) -> dict:
+    """Motion blur: the comp switch, and the layers' switches (layers "all", a list, or None to leave them);
+    shutter_angle 0-720 degrees (180 is filmic), shutter_phase -360 to 360."""
+    if shutter_angle is not None and not 0 <= shutter_angle <= 720:
+        raise ToolError("shutter_angle must be 0-720")
+    if shutter_phase is not None and not -360 <= shutter_phase <= 360:
+        raise ToolError("shutter_phase must be -360 to 360")
+    if isinstance(layers, str) and layers != "all":
+        raise ToolError('layers must be "all", a list of layers, or None')
+    return _call("set_motion_blur", comp=comp, on=on, layers=layers, shutterAngle=shutter_angle,
+                 shutterPhase=shutter_phase)
+
+
+def _onsets(path, sensitivity, min_gap):
+    """Times (s) of sharp rises in loudness in a PCM WAV: an energy envelope in 10 ms hops, the positive change,
+    peaks above mean + sensitivity x deviation, at least min_gap apart."""
+    try:
+        w = wave.open(path, "rb")
+    except (wave.Error, EOFError, OSError) as e:
+        raise ToolError(f"{os.path.basename(path)} is not a PCM WAV ({e}); beat markers read WAV files") from None
+    with w:
+        rate, ch, width, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+        raw = w.readframes(n)
+    if width == 2:
+        pcm = array("h", raw)
+    elif width in (3, 4):  # the top two bytes are enough for loudness
+        hi = bytearray(len(raw) // width * 2)
+        hi[0::2], hi[1::2] = raw[width - 2::width], raw[width - 1::width]
+        pcm = array("h", bytes(hi))
+    else:
+        raise ToolError(f"unsupported WAV sample width: {8 * width}-bit")
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    hop = max(1, rate // 100) * ch
+    env = []
+    for i in range(0, len(pcm) - hop + 1, hop):
+        chunk = pcm[i:i + hop:max(1, ch * (rate // 8000))]
+        env.append(math.sqrt(math.fsum(x * x for x in chunk) / max(1, len(chunk))))
+    rise = [max(0.0, b - a) for a, b in zip(env, env[1:])]
+    if not rise or max(rise) == 0:
+        return []
+    mean = math.fsum(rise) / len(rise)
+    dev = math.sqrt(math.fsum((r - mean) ** 2 for r in rise) / len(rise))
+    floor, gap, out = mean + sensitivity * dev, int(min_gap * 100), []
+    for i in range(1, len(rise) - 1):
+        if rise[i] > floor and rise[i] >= rise[i - 1] and rise[i] >= rise[i + 1]:
+            if out and i - out[-1] < gap:
+                continue
+            out.append(i)
+    return [round((i + 1) / 100, 3) for i in out]  # the rise ends at hop i + 1
+
+
+@_tool
+def markers_from_audio(layer: int | str, sensitivity: float = 1.5, min_gap: float = 0.25, max_markers: int = 300,
+                       comment: str = "beat", comp: int | str | None = None) -> dict:
+    """Put comp markers on the beats (sharp rises in loudness) of an audio layer's WAV file, within the layer's
+    trim: for cutting and animating to the music. Raise sensitivity for fewer, stronger hits; min_gap (s) keeps
+    markers apart. Analysis runs here, not in After Effects. Then sequence_to_markers cuts layers to them."""
+    if sensitivity <= 0 or min_gap <= 0:
+        raise ToolError("sensitivity and min_gap must be above 0")
+    src = _call("audio_source", comp=comp, layer=layer)
+    times = [src["startTime"] + t for t in _onsets(src["file"], sensitivity, min_gap)]
+    times = [round(t, 3) for t in times if src["inPoint"] <= t < src["outPoint"]][:max_markers]
+    if not times:
+        raise ToolError("no beats found: lower the sensitivity")
+    gaps = sorted(b - a for a, b in zip(times, times[1:]))
+    bpm = round(60 / gaps[len(gaps) // 2], 1) if gaps else None
+    out = _call("add_markers", comp=comp, times=times, comment=comment)
+    return {**out, "bpm_estimate": bpm, "first": times[:8]}
+
+
+@_tool
+def sequence_to_markers(layers: list[int | str], trim: bool = True, comp: int | str | None = None) -> dict:
+    """Place layers on the comp's markers in order: the first starts at the first marker, the second at the second,
+    and so on; trim=True also cuts each at the next marker (a cut on every beat)."""
+    if not layers:
+        raise ToolError("no layers")
+    return _call("sequence_to_markers", comp=comp, layers=layers, trim=trim)
+
+
+@_tool
+def reduce_project(comps: list[int | str]) -> dict:
+    """Remove everything the given comps do not use (other comps, footage, empty folders): File > Dependencies >
+    Reduce Project. Save a copy first if unsure."""
+    if not comps:
+        raise ToolError("name the comps to keep")
+    return _call("reduce_project", comps=comps)
+
+
+@_tool
+def render_queue_list() -> list[dict]:
+    """The render queue: index, comp, status (queued, done, rendering...) and output file of each item."""
+    return _call("render_queue_list")
+
+
+@_tool
+def clear_render_queue(all_items: bool = False) -> dict:
+    """Remove finished (done) items from the render queue, or every item with all_items=True; an item rendering is
+    kept."""
+    return _call("clear_render_queue", all=all_items or None)
 
 
 @_tool

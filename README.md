@@ -86,6 +86,16 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `make_variants` | `rows: [{name, texts: {layer: text}}]`, `comp`, `output_dir`, `template` | `{from, variants: [{comp, id, queued}]}` |
 | `import_layered` | `path` (.psd, .ai), `mode` (comp_cropped, comp, footage) | `{id, name, type, layers}` |
 | `find_missing_footage` | `search` (folder), `max_files = 200000` | `{missing, relinked, still_missing, files_searched}` |
+| `trim_paths` | `layer`, `duration = 1`, `start`, `erase = False`, `offset`, `ease = True`, `comp` | `{layer, trim, animated, from, to}` |
+| `shape_repeater` | `layer`, `copies = 5`, `offset = [100, 0]`, `scale = 100`, `rotation`, `end_opacity = 100`, `comp` | `{layer, repeater, copies}` |
+| `text_style` | `layer`, `tracking`, `leading`, `stroke_color`, `stroke_width`, `all_caps`, `comp` | `{property, value}` |
+| `add_paragraph` | `text`, `box = [800, 400]`, `name`, `comp` | layer info |
+| `set_motion_blur` | `on = True`, `layers = "all"` (or a list, or None), `shutter_angle`, `shutter_phase`, `comp` | `{comp, motionBlur, shutterAngle, shutterPhase, layers}` |
+| `markers_from_audio` | `layer` (WAV audio), `sensitivity = 1.5`, `min_gap = 0.25`, `max_markers = 300`, `comment = "beat"`, `comp` | `{comp, added, markers, bpm_estimate, first}` |
+| `sequence_to_markers` | `layers`, `trim = True`, `comp` | `{layers: [{layer, inPoint, outPoint}]}` |
+| `reduce_project` | `comps` | `{kept, removed, items: [before, after]}` |
+| `render_queue_list` | — | `[{index, comp, status, output}]` |
+| `clear_render_queue` | `all_items = False` | `{removed, left}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -114,6 +124,9 @@ Notes:
 - `copy_keyframes` keeps each key's interpolation and easing; its offset cascades (target 1: offset, target 2: 2 x offset...).
 - `make_variants` duplicates the template comp per row and replaces the named text layers' text; with `output_dir` each copy is queued with its name as the file name. Render them with `render` or `render_background`.
 - `find_missing_footage(search=...)` matches missing files by name (any case) under a folder and relinks them with `FootageItem.replace`.
+- `trim_paths` and `shape_repeater` add the operator at the top of the shape layer's contents, so they act on every group in it.
+- `markers_from_audio` reads the layer's WAV file here (sharp rises in loudness in 10 ms steps), keeps the beats inside the layer's trim and converts them to comp time; `sequence_to_markers` then lays layers on those markers and, with `trim`, cuts each at the next one.
+- `reduce_project` is After Effects' File > Dependencies > Reduce Project: everything the named comps do not use is removed.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration
