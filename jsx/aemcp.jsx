@@ -917,22 +917,31 @@ var aemcp = (function () {
         },
 
         time_remap: function (a) {
-            var l = findLayer(findComp(a.comp), a.layer), p, i, k, idx, kind;
+            var l = findLayer(findComp(a.comp), a.layer), p, i, k, idx, kind, oldTime, keepOld = false;
             if (!l.canSetTimeRemapEnabled) {
                 fail(l.name + " cannot be time remapped (it needs footage or a precomp with duration)");
             }
             l.timeRemapEnabled = true;
             p = l.property("ADBE Time Remapping");
-            while (p.numKeys > 0) {
-                p.removeKey(p.numKeys);  // After Effects adds keys at the in and out points; the given ones replace them
+            // After Effects adds keys at the in and out points; the given ones replace them. Removing the last key
+            // turns time remapping off, so one old key stays until the new ones are in.
+            while (p.numKeys > 1) {
+                p.removeKey(p.numKeys);
             }
+            oldTime = p.numKeys ? p.keyTime(1) : null;
             for (i = 0; i < a.keys.length; i++) {
                 k = a.keys[i];
+                if (oldTime !== null && Math.abs(k.time - oldTime) < 1e-6) {
+                    keepOld = true;
+                }
                 p.setValueAtTime(k.time, k.source);
                 idx = p.nearestKeyIndex(k.time);
                 kind = k.hold ? KeyframeInterpolationType.HOLD : (a.smooth ? KeyframeInterpolationType.BEZIER :
                     KeyframeInterpolationType.LINEAR);
                 p.setInterpolationTypeAtKey(idx, kind, kind);
+            }
+            if (oldTime !== null && !keepOld && p.numKeys > 1) {
+                p.removeKey(p.nearestKeyIndex(oldTime));
             }
             return {layer: l.name, keys: p.numKeys, timeRemap: l.timeRemapEnabled};
         },
