@@ -548,6 +548,155 @@ def render_templates() -> dict:
     return _call("render_templates")
 
 
+# --- expression presets, timing, placement ---
+
+BOUNCE = """// inertial bounce after each keyframe
+var amp = {amp}, freq = {freq}, decay = {decay};
+var n = 0;
+if (numKeys > 0) {{ n = nearestKey(time).index; if (key(n).time > time) n--; }}
+var t = n === 0 ? 0 : time - key(n).time;
+if (n > 0 && t < 1) {{
+  var v = velocityAtTime(key(n).time - thisComp.frameDuration / 10);
+  value + v * amp * Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t);
+}} else {{ value; }}"""
+
+EXPRESSION_PRESETS = {
+    "wiggle": ("wiggle({freq}, {amp})", {"freq": 2, "amp": 30}),
+    "loop_cycle": ('loopOut("cycle")', {}),
+    "loop_pingpong": ('loopOut("pingpong")', {}),
+    "loop_continue": ('loopOut("continue")', {}),
+    "bounce": (BOUNCE, {"amp": 0.05, "freq": 4, "decay": 8}),
+    "spin": ("value + time * {speed}", {"speed": 90}),
+    "blink": ("Math.floor(time * {freq} * 2) % 2 === 0 ? value : 0", {"freq": 2}),
+}
+
+
+@_tool
+def expression_preset(layer: int | str, property: str | list[str], preset: str, params: dict | None = None,
+                      comp: int | str | None = None) -> dict:
+    """Put a ready-made expression on a property: wiggle (freq per second, amp in the property's units), loop_cycle,
+    loop_pingpong or loop_continue (repeat the keyframes after the last one), bounce (inertial overshoot after each
+    keyframe: amp, freq, decay), spin (rotation: speed in degrees per second), blink (opacity: freq per second).
+    params overrides the defaults, e.g. {"freq": 3, "amp": 50}."""
+    if preset not in EXPRESSION_PRESETS:
+        raise ToolError(f"preset must be one of: {', '.join(EXPRESSION_PRESETS)}")
+    template, defaults = EXPRESSION_PRESETS[preset]
+    unknown = set(params or {}) - set(defaults)
+    if unknown:
+        raise ToolError(f"{preset} takes {', '.join(defaults) or 'no params'} (got {', '.join(sorted(unknown))})")
+    values = {**defaults, **(params or {})}
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values.values()):
+        raise ToolError("params must be numbers")
+    out = _call("set_expression", comp=comp, layer=layer, property=property, expression=template.format(**values))
+    return {**out, "preset": preset, "params": values}
+
+
+@_tool
+def property_tree(layer: int | str, depth: int = 3, comp: int | str | None = None) -> dict:
+    """A layer's property hierarchy: names and match names of every group and property down to `depth`, with
+    values and keyframe counts, to find the path for get_property / set_property / set_keyframes."""
+    if not 1 <= depth <= 8:
+        raise ToolError("depth must be 1-8")
+    return _call("property_tree", comp=comp, layer=layer, depth=depth)
+
+
+@_tool
+def sequence_layers(layers: list[int | str], start: float = 0.0, overlap: float = 0.0,
+                    comp: int | str | None = None) -> dict:
+    """Place layers one after another in the given order from `start` (seconds): each begins where the previous
+    ends, minus `overlap` seconds (negative for a gap). Durations are kept."""
+    if not layers:
+        raise ToolError("no layers")
+    if start < 0:
+        raise ToolError("start must be 0 or more")
+    return _call("sequence_layers", comp=comp, layers=layers, start=start, overlap=overlap)
+
+
+@_tool
+def time_remap(layer: int | str, keys: list[dict], smooth: bool = True, comp: int | str | None = None) -> dict:
+    """Retime footage or a precomp: keys [{"time": comp seconds, "source": source seconds}] replace its time
+    remapping, e.g. slow motion ({0: 0}, {4: 2}), speed ramps, or a freeze frame ("hold": true holds a key).
+    smooth eases between keys."""
+    if not keys:
+        raise ToolError("no keys")
+    for k in keys:
+        if not isinstance(k, dict) or "time" not in k or "source" not in k:
+            raise ToolError(f"each key needs time and source: {k!r}")
+        if k["source"] < 0:
+            raise ToolError("source times must be 0 or more")
+    return _call("time_remap", comp=comp, layer=layer, keys=keys, smooth=smooth)
+
+
+FIT_MODES = ("fill", "fit", "width", "height", "stretch")
+
+
+@_tool
+def fit_to_comp(layer: int | str, mode: str = "fill", comp: int | str | None = None) -> dict:
+    """Scale a layer to the comp and center it: fill (cover the frame, cropping), fit (whole layer visible), width,
+    height, or stretch (both axes). The anchor point moves to the layer's center."""
+    if mode not in FIT_MODES:
+        raise ToolError(f"mode must be one of: {', '.join(FIT_MODES)}")
+    return _call("fit_to_comp", comp=comp, layer=layer, mode=mode)
+
+
+@_tool
+def center_anchor(layer: int | str, comp: int | str | None = None) -> dict:
+    """Move a layer's anchor point to the center of what it draws (text, shapes, footage) without moving it on
+    screen, so scale and rotation happen around its middle. Do it before animating anchor or position."""
+    return _call("center_anchor", comp=comp, layer=layer)
+
+
+@_tool
+def null_control(layers: list[int | str], name: str = "Control", comp: int | str | None = None) -> dict:
+    """Add a null at the layers' average position and parent them to it, so one null moves, scales and rotates them
+    together."""
+    if not layers:
+        raise ToolError("no layers")
+    return _call("null_control", comp=comp, layers=layers, name=name)
+
+
+# --- presets, footage, project organization ---
+
+
+@_tool
+def apply_preset(layer: int | str, path: str, comp: int | str | None = None) -> dict:
+    """Apply an animation preset (.ffx, e.g. from After Effects' Presets folder) to a layer."""
+    path = _path(path)
+    if not path.lower().endswith(".ffx"):
+        raise ToolError("an animation preset is an .ffx file")
+    return _call("apply_preset", comp=comp, layer=layer, path=path)
+
+
+@_tool
+def replace_footage(item: int | str, path: str, sequence: bool = False) -> dict:
+    """Swap a footage item's file (every layer using it follows); sequence=True for an image sequence (first
+    file)."""
+    return _call("replace_footage", item=item, path=_path(path), sequence=sequence or None)
+
+
+@_tool
+def create_folder(name: str, parent: int | str | None = None) -> dict:
+    """Create a project folder, optionally inside another folder."""
+    return _call("create_folder", name=name, parent=parent)
+
+
+@_tool
+def move_items(items: list[int | str], folder: int | str) -> dict:
+    """Move project items (names or ids) into a folder."""
+    if not items:
+        raise ToolError("no items")
+    return _call("move_items", items=items, folder=folder)
+
+
+@_tool
+def clean_project(remove_unused: bool = True, consolidate: bool = True) -> dict:
+    """Tidy the project: consolidate merges duplicate footage items of the same file, remove_unused deletes footage
+    no comp uses. Returns the counts and the item total before and after."""
+    if not (remove_unused or consolidate):
+        raise ToolError("nothing to do")
+    return _call("clean_project", removeUnused=remove_unused or None, consolidate=consolidate or None)
+
+
 @_tool
 def run_jsx(code: str) -> Any:
     """Run ExtendScript in After Effects and return its value (numbers, strings, arrays; other objects as text).

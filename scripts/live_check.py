@@ -169,6 +169,32 @@ def main():
     job = step("add_to_render_queue (default template)", lambda: d.add_to_render_queue(str(work / "check_render")),
                needs=have)
     step("render and find the output", lambda: _render(work), needs=True if job else "nothing queued")
+
+    print("\nExpression presets, timing, placement, project")
+    step("expression_preset wiggle on the null", lambda: d.expression_preset("Null", "position", "wiggle",
+                                                                             comp="aemcp check"), needs=have)
+    step("expression_preset bounce on the keyed solid position", lambda: _bounce(), needs=have,
+         note="the bounce expression must evaluate without an error")
+    step("expression_preset spin + blink", lambda: (
+        d.expression_preset("Null", "rotation", "spin", comp="aemcp check"),
+        d.expression_preset("Null", "opacity", "blink", comp="aemcp check")), needs=have)
+    step("property_tree of a text layer (depth 2)", lambda: _tree(), needs=have,
+         note="the real group and property names under a text layer")
+    step("sequence_layers the preset text layers, 0.2 s overlap", lambda: d.sequence_layers(
+        [f"{p} aemcp" for p in ("fade_in", "typewriter", "slide_up", "scale_in", "blur_in")], start=0, overlap=0.2,
+        comp="aemcp check"), needs=have)
+    step("center_anchor on a text layer", lambda: d.center_anchor("fade_in aemcp", comp="aemcp check"), needs=have,
+         note="sourceRectAtTime on text")
+    step("fit_to_comp the swatch (fill)", lambda: d.fit_to_comp("swatch.png", "fill", comp="aemcp check"),
+         needs=have, note="a 64x64 image in 1080x1920: expect scale 3000%")
+    step("time_remap a precomp: slow then freeze", lambda: _remap(), needs=have)
+    step("null_control over two text layers", lambda: d.null_control(
+        ["typewriter aemcp", "slide_up aemcp"], name="Text Rig", comp="aemcp check"), needs=have)
+    step("create_folder + move_items", lambda: (d.create_folder("Check Assets"), d.move_items(
+        ["swatch.png"], "Check Assets"))[1], needs=have)
+    step("replace_footage swatch with a second PNG", lambda: _replace(work), needs=have)
+    step("clean_project", lambda: _clean(work), needs=have,
+         note="consolidateFootage and removeUnusedFootage counts")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("run_jsx", lambda: d.run_jsx("[app.project.numItems, app.version]"))
     step("list_items", d.list_items)
@@ -199,6 +225,38 @@ def _render_h264(work, template):
     files = [p.name for p in work.iterdir() if p.name.startswith("h264_check")]
     expect(files, f"no H.264 output in {work}: {out}")
     return {"render": out, "files": files}
+
+
+def _bounce():
+    out = d.expression_preset("Solid", "position", "bounce", comp="aemcp check")
+    expect(out["error"] is None, f"expression error: {out['error']}")
+    return {k: out[k] for k in ("preset", "params", "error")}
+
+
+def _tree():
+    out = d.property_tree("fade_in aemcp", depth=2, comp="aemcp check")
+    return [(g["name"], g["matchName"]) for g in out["properties"]]
+
+
+def _remap():
+    d.create_comp("remap source", 1080, 1920, 4, 30)
+    d.add_layer("solid", name="Source BG", comp="remap source")
+    d.add_layer("item", item="remap source", comp="aemcp check")
+    return d.time_remap("remap source", [{"time": 0, "source": 0}, {"time": 2, "source": 1},
+                                         {"time": 3, "source": 1, "hold": True}], comp="aemcp check")
+
+
+def _replace(work):
+    other = work / "swatch_v2.png"
+    write_png(other, 64, 64, (220, 60, 30))
+    return d.replace_footage("swatch.png", str(other))
+
+
+def _clean(work):
+    extra = work / "unused.png"
+    write_png(extra, 8, 8, (0, 0, 0))
+    d.import_file(str(extra))
+    return d.clean_project()
 
 
 def _types():

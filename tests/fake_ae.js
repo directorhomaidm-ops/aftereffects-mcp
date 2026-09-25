@@ -384,6 +384,16 @@ function makeAE(CtxArray) {
             this.duration = opts.duration || 0;
             this.frameRate = opts.frameRate || 0;
         }
+        replace(file) {
+            needUndo();
+            this.file = file;
+            this.name = path.basename(file.fsName);
+        }
+        replaceWithSequence(file) {
+            needUndo();
+            this.file = file;
+            this.name = path.basename(file.fsName).replace(/\d+(\.\w+)$/, "[####]$1");
+        }
     }
 
     class AVLayer {
@@ -391,7 +401,7 @@ function makeAE(CtxArray) {
             this.containingComp = comp;
             this.name = name;
             this.source = source || null;
-            this.startTime = 0;
+            this._start = 0;
             this.inPoint = 0;
             this.outPoint = comp.duration;
             this.enabled = true;
@@ -413,6 +423,35 @@ function makeAE(CtxArray) {
             ];
             Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
                 solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
+        }
+        get canSetTimeRemapEnabled() {
+            const src = this.source;
+            return !!src && (src instanceof CompItem || (src instanceof FootageItem && !src.mainSource.color &&
+                src.duration > 0));
+        }
+        get timeRemapEnabled() {
+            return !!this.property("ADBE Time Remapping");
+        }
+        set timeRemapEnabled(on) {
+            needUndo();
+            if (on && !this.canSetTimeRemapEnabled) {
+                throw new Error("After Effects error: time remapping is not available for this layer");
+            }
+            this.groups = this.groups.filter((g) => g.matchName !== "ADBE Time Remapping");
+            if (on) {
+                // After Effects starts time remapping with keys at the in and out points
+                const tr = new Property("Time Remap", "ADBE Time Remapping", 0, PropertyValueType.OneD);
+                tr.keys.push({time: this.inPoint, value: 0, inType: 6612, outType: 6612},
+                    {time: this.outPoint, value: this.source.duration, inType: 6612, outType: 6612});
+                this.groups.unshift(tr);
+            }
+        }
+        applyPreset(file) {
+            needUndo();
+            if (!file.exists) {
+                throw new Error("After Effects error: preset file not found");
+            }
+            this.property("ADBE Effect Parade").addProperty("ADBE Glo2");  // the fake preset holds a Glow
         }
         setTrackMatte(layer, type) {
             needUndo();
@@ -451,6 +490,16 @@ function makeAE(CtxArray) {
         get index() {
             return this.containingComp._layers.indexOf(this) + 1;
         }
+        get startTime() {
+            return this._start;
+        }
+        set startTime(t) {
+            // moving a layer in time moves its in and out points with it
+            const shift = t - this._start;
+            this._start = t;
+            this.inPoint += shift;
+            this.outPoint += shift;
+        }
         get parent() {
             return this._parent;
         }
@@ -478,16 +527,23 @@ function makeAE(CtxArray) {
     class TextLayer extends AVLayer {
         constructor(comp, text) {
             super(comp, text);
+            this.rect = {left: -150, top: -60, width: 300, height: 80};  // text grows up and right from its anchor
             this.groups.unshift(new PropertyGroup("Text", "ADBE Text Properties", [
                 new Property("Source Text", "ADBE Text Document", new TextDocument(text), PropertyValueType.TEXT_DOCUMENT),
                 textAnimators(),
             ]));
         }
     }
+    TextLayer.prototype.sourceRectAtTime = function () {
+        return this.rect;
+    };
     class ShapeLayer extends AVLayer {
         constructor(comp, name) {
             super(comp, name);
             this.groups.unshift(shapeRoot());
+        }
+        sourceRectAtTime() {
+            return {left: -100, top: -100, width: 200, height: 200};
         }
     }
     const NOT_ON_3D = ["ADBE Effect Parade", "ADBE Mask Parade"];
@@ -693,6 +749,44 @@ function makeAE(CtxArray) {
             it.parentFolder = root;
             project._items.push(it);
             return it;
+        },
+        _uses() {
+            const used = new Set();
+            this._items.forEach((it) => {
+                if (it instanceof CompItem) {
+                    it._layers.forEach((l) => l.source && used.add(l.source));
+                }
+            });
+            return used;
+        },
+        removeUnusedFootage() {
+            needUndo();
+            const used = this._uses();
+            const gone = this._items.filter((it) => it instanceof FootageItem && !used.has(it));
+            this._items = this._items.filter((it) => !gone.includes(it));
+            return gone.length;
+        },
+        consolidateFootage() {
+            needUndo();
+            const keep = new Map(), gone = [];
+            this._items.forEach((it) => {
+                if (!(it instanceof FootageItem) || !it.file) {
+                    return;
+                }
+                const k = it.file.fsName;
+                if (keep.has(k)) {
+                    gone.push([it, keep.get(k)]);
+                } else {
+                    keep.set(k, it);
+                }
+            });
+            gone.forEach(([dup, kept]) => this._items.forEach((c) => {
+                if (c instanceof CompItem) {
+                    c._layers.forEach((l) => { if (l.source === dup) { l.source = kept; } });
+                }
+            }));
+            this._items = this._items.filter((it) => !gone.some(([dup]) => dup === it));
+            return gone.length;
         },
         save(file) {
             if (file) {
