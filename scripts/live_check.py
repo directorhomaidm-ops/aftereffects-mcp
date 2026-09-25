@@ -73,9 +73,9 @@ def main():
     print(f"Work folder (kept): {work}\n")
 
     print("Transport")
-    raw = step("transport: DoScript returns the result on stdout",
+    raw = step("transport: what DoScript prints on stdout (no result file)",
                lambda: d._osascript("'stdout ' + (1 + 1);", 30),
-               note="empty means results come only through the result file")
+               note="After Effects 26.5 prints 0 whatever the script returns: results come through the result file")
     st = step("status", d.status)
     if not st:
         print("\nCannot reach After Effects: is it open with no dialog showing, and is AE_APP right?")
@@ -124,6 +124,42 @@ def main():
     step("get_property through the effect path", lambda: d.get_property(
         "Solid", ["Effects", "Gaussian Blur", "Blurriness"]), needs=have)
 
+    print("\nMasks, shapes, text animation")
+    step("add_mask ellipse, feather 20, on the solid", lambda: d.add_mask(
+        "Solid", "ellipse", rect=[140, 560, 800, 800], feather=20, name="Spot"), needs=have,
+         note="Shape, MaskMode and the mask property match names")
+    step("add_mask path, subtract, inverted", lambda: d.add_mask(
+        "Solid", "path", points=[[0, 0], [300, 0], [150, 260]], mode="subtract", inverted=True), needs=have)
+    step("add_shape rect with fill + stroke, new layer", lambda: d.add_shape(
+        "rect", size=[600, 200], fill=[0.1, 0.4, 0.9], stroke=[1, 1, 1], stroke_width=6, roundness=30,
+        layer_name="Card"), needs=have, note="shape contents match names; colors with alpha")
+    step("add_shape star into the same layer", lambda: d.add_shape(
+        "star", size=[160, 160], points=5, layer="Card", position=[380, 0]), needs=have)
+    for preset in ("fade_in", "typewriter", "slide_up", "scale_in", "blur_in"):
+        step(f"animate_text {preset}", lambda p=preset: _text_preset(p), needs=have,
+             note="text animator, selector and property match names")
+    step("export_frame mid reveal (text half shown)", lambda: _frame_at(work, "frame_text.png", 0.5), needs=have)
+
+    print("\nLayer structure and switches")
+    step("duplicate_layer the card", lambda: d.duplicate_layer("Card", name="Card copy"), needs=have,
+         note="shows how After Effects names a duplicate when renamed")
+    step("move_layer: copy to bottom, then above the card", lambda: (
+        d.move_layer("Card copy", "bottom"), d.move_layer("Card copy", "before", other="Card"))[1], needs=have)
+    step("set_switches screen + 3D + motion blur", lambda: d.set_switches(
+        "Card copy", blending="screen", three_d=True, motion_blur=True), needs=have)
+    step("set_switches track matte luma from the text", lambda: _matte(), needs=have,
+         note="Layer.setTrackMatte (After Effects 2023+)")
+    step("precompose the card and its copy", lambda: d.precompose(["Card", "Card copy"], "Cards"), needs=have)
+    step("add_marker on the comp and on a layer", lambda: (
+        d.add_marker(1, "beat", duration=0.5, comp="aemcp check"), d.add_marker(2, "hit", layer="Null",
+                                                                             comp="aemcp check")), needs=have)
+    step("set_comp work area 1-4 s", lambda: d.set_comp("aemcp check", work_area=[1, 4]), needs=have)
+    templates = step("render_templates", d.render_templates, needs=have,
+                     note="the names to pass as add_to_render_queue(template=...)")
+    h264 = next((t for t in (templates or {}).get("outputModules", []) if "264" in t), None)
+    step(f"add_to_render_queue with template {h264!r} + render", lambda: _render_h264(work, h264),
+         needs=True if h264 else "no H.264 output module template found")
+
     print("\nImport, frame, render, save")
     png = work / "swatch.png"
     write_png(png, 64, 64, (30, 120, 220))
@@ -137,6 +173,32 @@ def main():
     step("run_jsx", lambda: d.run_jsx("[app.project.numItems, app.version]"))
     step("list_items", d.list_items)
     return write_report(info, work)
+
+
+def _text_preset(preset):
+    d.add_layer("text", text=f"{preset} aemcp", comp="aemcp check")
+    return d.animate_text(1, preset, duration=1, start=0, comp="aemcp check")
+
+
+def _frame_at(work, name, t):
+    path = work / name
+    d.export_frame(str(path), time=t, comp="aemcp check")
+    expect(path.exists(), "no frame written")
+    return {"path": str(path), "bytes": path.stat().st_size}
+
+
+def _matte():
+    d.add_layer("text", text="MATTE", name="Matte text", comp="aemcp check")
+    d.move_layer("Matte text", "before", other="Card copy", comp="aemcp check")
+    return d.set_switches("Card copy", matte="luma", matte_layer="Matte text", comp="aemcp check")
+
+
+def _render_h264(work, template):
+    d.add_to_render_queue(str(work / "h264_check"), comp="aemcp check", template=template)
+    out = d.render(timeout=600)
+    files = [p.name for p in work.iterdir() if p.name.startswith("h264_check")]
+    expect(files, f"no H.264 output in {work}: {out}")
+    return {"render": out, "files": files}
 
 
 def _types():

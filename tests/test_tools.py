@@ -17,6 +17,8 @@ def test_all_tools_registered():
         "status", "list_items", "create_comp", "comp_info", "add_layer", "delete_layer", "set_layer", "set_text",
         "get_property", "set_property", "set_keyframes", "set_expression", "add_effect", "list_effects",
         "import_file", "add_to_render_queue", "render", "export_frame", "save_project", "run_jsx",
+        "add_mask", "add_shape", "animate_text", "precompose", "duplicate_layer", "move_layer", "set_switches",
+        "add_marker", "set_comp", "render_templates",
     }
 
 
@@ -347,3 +349,204 @@ def test_replies_are_ascii(ae, monkeypatch):
     d.create_comp("عربي")
     assert d.comp_info()["name"] == "عربي"
     assert all(r.isascii() for r in raw) and "\\u0639" in raw[-1]
+
+
+
+# --- masks, shapes, text animation ---
+
+L1 = "ae.app.project.item(1).layer(1)"
+
+
+def _group(layer_expr, match):
+    return f"{layer_expr}.groups.find(g => g.matchName === {json.dumps(match)})"
+
+
+def test_add_mask_rect_ellipse_path(ae):
+    d.create_comp("Main", 1000, 500)
+    d.add_layer("solid", name="BG")
+    out = d.add_mask("BG", "rect", rect=[100, 50, 200, 100], mode="subtract", feather=12, expansion=-3, opacity=80,
+                     inverted=True, name="Hole")
+    assert out == {"layer": "BG", "mask": "Hole", "masks": 1, "mode": "subtract", "vertices": 4}
+    m = _group(L1, "ADBE Mask Parade") + ".children[0]"
+    assert ae.inspect(f"{m}.children[0]._value.vertices") == [[100, 50], [300, 50], [300, 150], [100, 150]]
+    assert ae.inspect(f"[{m}.maskMode, {m}.inverted, {m}.children[1]._value, {m}.children[2]._value, "
+                      f"{m}.children[3]._value]") == [6814, True, [12, 12], 80, -3]
+    d.add_mask("BG", "ellipse", rect=[0, 0, 200, 100])
+    e = _group(L1, "ADBE Mask Parade") + ".children[1].children[0]._value"
+    assert ae.inspect(f"{e}.vertices") == [[100, 0], [200, 50], [100, 100], [0, 50]]
+    assert ae.inspect(f"{e}.outTangents[0][0]") == pytest.approx(100 * 0.5523)  # round quarter arcs
+    assert d.add_mask("BG", "path", points=[[0, 0], [50, 100], [100, 0]])["vertices"] == 3
+    # the mask's feather animates through the normal property path
+    assert d.set_keyframes("BG", ["Masks", "Hole", "Mask Feather"], [{"time": 0, "value": [0, 0]},
+                                                                      {"time": 1, "value": [40, 40]}])["keys"] == 2
+    for kwargs, msg in [({"rect": [0, 0, 0, 5]}, "positive width"), ({"shape": "path", "points": [[0, 0]]}, "3 points"),
+                        ({"shape": "star"}, "shape must be"), ({"rect": [0, 0, 5, 5], "mode": "xor"}, "mode must"),
+                        ({"rect": [0, 0, 5, 5], "opacity": 120}, "opacity")]:
+        with pytest.raises(ToolError, match=msg):
+            d.add_mask("BG", **kwargs)
+    d.add_layer("camera")
+    with pytest.raises(ToolError, match="cannot take masks"):
+        d.add_mask("Camera", "rect", rect=[0, 0, 5, 5])
+
+
+def test_add_shape_layers_and_groups(ae):
+    d.create_comp("Main")
+    out = d.add_shape("rect", size=[300, 120], fill=[1, 0, 0], stroke=[0, 0, 0], stroke_width=6, roundness=20,
+                      layer_name="Card", name="Box")
+    assert out == {"layer": "Card", "index": 1, "group": "Box", "shape": "rect"}
+    grp = _group(L1, "ADBE Root Vectors Group") + ".children[0]"
+    contents = grp + ".children[0].children"
+    assert ae.inspect(f"{contents}.map(c => c.matchName)") == [
+        "ADBE Vector Shape - Rect", "ADBE Vector Graphic - Fill", "ADBE Vector Graphic - Stroke"]
+    assert ae.inspect(f"[{contents}[0].children[0]._value, {contents}[0].children[2]._value, "
+                      f"{contents}[1].children[0]._value, {contents}[2].children[1]._value]") == \
+        [[300, 120], 20, [1, 0, 0, 1], 6]  # colors carry alpha
+    # a second shape into the same layer, as its own group, moved off the anchor
+    d.add_shape("star", size=[100, 100], points=6, layer="Card", position=[150, 0])
+    star = _group(L1, "ADBE Root Vectors Group") + ".children[1]"
+    assert ae.inspect(f"{star}.name") == "Group 2"
+    assert ae.inspect(f"{star}.children[0].children[0].children.map(c => c._value)") == [1, 6, 50, 25]
+    assert ae.inspect(f"{star}.children[0].children[1].children[0]._value") == [1, 1, 1, 1]  # default white fill
+    assert ae.inspect(f"{star}.children[1].children[0]._value") == [150, 0]
+    d.add_shape("polygon", points=3)
+    assert ae.inspect(_group(L1, "ADBE Root Vectors Group") + ".children[0].children[0].children[0]"
+                      ".children.map(c => c._value)") == [2, 3, 100, 25]  # no inner radius on a polygon
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a shape layer"):
+        d.add_shape("rect", layer="Rig")
+    for kwargs, msg in [({"shape": "heart"}, "shape must"), ({"shape": "rect", "size": [0, 5]}, "size"),
+                        ({"shape": "star", "points": 2}, "points"), ({"shape": "rect", "stroke_width": 0}, "stroke")]:
+        with pytest.raises(ToolError, match=msg):
+            d.add_shape(**kwargs)
+
+
+@pytest.mark.parametrize("preset, props, smooth, interp", [
+    ("fade_in", {"ADBE Text Opacity": 0}, 100, 6613),
+    ("typewriter", {"ADBE Text Opacity": 0}, 0, 6612),
+    ("slide_up", {"ADBE Text Opacity": 0, "ADBE Text Position 3D": [0, 60, 0]}, 100, 6613),
+    ("blur_in", {"ADBE Text Opacity": 0, "ADBE Text Blur": [30, 30]}, 100, 6613),
+])
+def test_animate_text(ae, preset, props, smooth, interp):
+    d.create_comp("Main", duration=6)
+    d.add_layer("text", text="Hello")
+    d.set_layer(1, in_point=1)
+    out = d.animate_text(1, preset, duration=1.5)
+    assert out == {"layer": "Hello", "animator": f"aemcp {preset}", "preset": preset, "from": 1, "to": 2.5, "keys": 2}
+    anim = _group(L1, "ADBE Text Properties") + ".children[1].children[0]"
+    assert ae.inspect(f"Object.fromEntries({anim}.children[1].children.map(p => [p.matchName, p._value]))") == props
+    sel = anim + ".children[0].children[0]"
+    assert ae.inspect(f"{sel}.children[0].keys.map(k => [k.time, k.value, k.outType])") == \
+        [[1, 0, interp], [2.5, 100, interp]]
+    assert ae.inspect(f"{sel}.children[3].children[0]._value") == smooth
+
+
+def test_animate_text_errors(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a text layer"):
+        d.animate_text("Rig")
+    with pytest.raises(ToolError, match="preset must be"):
+        d.animate_text("Rig", "explode")
+    with pytest.raises(ToolError, match="duration"):
+        d.animate_text("Rig", duration=0)
+
+
+# --- layer structure and switches ---
+
+
+def test_precompose(ae):
+    d.create_comp("Main")
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)
+    out = d.precompose(["B", 3], "Inner")
+    assert out == {"comp": "Main", "precomp": "Inner", "id": 2, "precompLayers": 2, "layer": 2}
+    assert [(l["name"], l["type"]) for l in d.comp_info("Main")["layers"]] == [("C", "null"), ("Inner", "precomp")]
+    assert [l["name"] for l in d.comp_info("Inner")["layers"]] == ["B", "A"]
+    with pytest.raises(ToolError, match="one layer only"):
+        d.precompose([1, 2], "X", move_attributes=False)
+    assert d.precompose([1], "Solo", move_attributes=False)["precompLayers"] == 1
+
+
+def test_duplicate_and_move(ae):
+    d.create_comp("Main")
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)  # C, B, A from the top
+    d.set_keyframes("A", "opacity", [{"time": 0, "value": 0}, {"time": 1, "value": 100}])
+    copy = d.duplicate_layer("A", name="A copy")
+    assert (copy["name"], copy["index"]) == ("A copy", 3)
+    assert d.get_property("A copy", "opacity")["keys"] == d.get_property("A", "opacity")["keys"]
+    d.set_property("A copy", "rotation", 45)
+    assert d.get_property("A", "rotation")["value"] == 0  # the copy is independent
+    names = lambda: [l["name"] for l in d.comp_info()["layers"]]  # noqa: E731
+    assert d.move_layer("A", "top") == {"layer": "A", "index": 1}
+    assert names() == ["A", "C", "B", "A copy"]
+    d.move_layer("C", "bottom")
+    d.move_layer("A copy", "before", other="A")
+    d.move_layer("B", "after", other="C")
+    assert names() == ["A copy", "A", "C", "B"]
+    with pytest.raises(ToolError, match="needs the other layer"):
+        d.move_layer("A", "before")
+    with pytest.raises(ToolError, match="relative to itself"):
+        d.move_layer("A", "after", other="A")
+    with pytest.raises(ToolError, match="to must be"):
+        d.move_layer("A", "up")
+
+
+def test_switches_and_track_matte(ae):
+    d.create_comp("Main")
+    d.add_layer("solid", name="Footage")
+    d.add_layer("text", text="MATTE")
+    out = d.set_switches("Footage", blending="screen", three_d=True, motion_blur=True, shy=True, matte="luma",
+                         matte_layer="MATTE", locked=True)
+    assert out == {"layer": "Footage", "threeD": True, "motionBlur": True, "shy": True, "solo": False,
+                   "locked": True, "matteLayer": "MATTE"}
+    layer = "ae.app.project.item(1).layer(2)"
+    assert ae.inspect(f"[{layer}.blendingMode, {layer}.trackMatteType]") == [5219, 5015]
+    d.set_switches("Footage", locked=False, matte="none")
+    assert ae.inspect(f"{layer}.trackMatteLayer") is None
+    for kwargs, msg in [({"blending": "glow"}, "blending must"), ({"matte": "shape"}, "matte must"),
+                        ({"matte": "alpha"}, "needs matte_layer")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_switches("Footage", **kwargs)
+    with pytest.raises(ToolError, match="another layer of the same comp"):
+        d.set_switches("Footage", matte="alpha", matte_layer="Footage")
+    ae.inspect(f"(delete Object.getPrototypeOf({layer}).setTrackMatte, 1)")
+    with pytest.raises(ToolError, match="needs After Effects 2023"):
+        d.set_switches("Footage", matte="alpha", matte_layer="MATTE")
+
+
+def test_markers(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="Rig")
+    assert d.add_marker(1.5, "Beat", duration=0.5) == {"target": "Main", "time": 1.5, "markers": 1}
+    assert d.add_marker(2, "Hit", layer="Rig") == {"target": "Rig", "time": 2, "markers": 1}
+    assert ae.inspect("[ae.app.project.item(1).markerProperty.keys[0].value.comment, "
+                      "ae.app.project.item(1).markerProperty.keys[0].value.duration]") == ["Beat", 0.5]
+    with pytest.raises(ToolError, match="0 or more"):
+        d.add_marker(-1)
+
+
+def test_set_comp(ae):
+    d.create_comp("Main", duration=10, frame_rate=25)
+    out = d.set_comp(name="Final", width=1080, height=1350, frame_rate=30, bg_color=[1, 1, 1], work_area=[2, 6])
+    assert out == {"id": 1, "name": "Final", "width": 1080, "height": 1350, "duration": 10, "frameRate": 30,
+                   "workArea": [2, 6]}
+    assert d.set_comp("Final", work_area=[8, 9.5])["workArea"] == [8, 9.5]  # moving later than the old end
+    assert d.set_comp("Final", work_area=[0, 10])["workArea"] == [0, 10]  # longer than 10 - 8: start moves first
+    assert d.set_comp("Final", work_area=[0, 1])["workArea"] == [0, 1]
+    with pytest.raises(ToolError, match="inside the comp"):
+        d.set_comp("Final", work_area=[5, 12])
+    for kwargs, msg in [({"width": 2}, "width"), ({"duration": 0}, "duration"), ({"frame_rate": 0}, "frame_rate"),
+                        ({"work_area": [1]}, r"\[start, end\]")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_comp("Final", **kwargs)
+
+
+def test_render_templates(ae):
+    with pytest.raises(ToolError, match="no comp"):
+        d.render_templates()
+    d.create_comp("Main")
+    assert d.render_templates() == {
+        "outputModules": ["High Quality", "H.264 - Match Render Settings - 15 Mbps", "Lossless"],
+        "renderSettings": ["Best Settings", "Draft Settings", "Multi-Machine Settings"]}
+    assert ae.inspect("ae.app.project.renderQueue.numItems") == 0  # the probe item is removed again

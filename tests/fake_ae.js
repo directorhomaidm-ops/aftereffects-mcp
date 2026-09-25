@@ -13,6 +13,11 @@ const KeyframeInterpolationType = {LINEAR: 6612, BEZIER: 6613, HOLD: 6614};
 const RQItemStatus = {WILL_CONTINUE: 3012, NEEDS_OUTPUT: 3013, UNQUEUED: 3014, QUEUED: 3015, RENDERING: 3016,
     USER_STOPPED: 3017, ERR_STOPPED: 3018, DONE: 3019};
 const ParagraphJustification = {LEFT_JUSTIFY: 7413, RIGHT_JUSTIFY: 7414, CENTER_JUSTIFY: 7415};
+const MaskMode = {NONE: 6812, ADD: 6813, SUBTRACT: 6814, INTERSECT: 6815, LIGHTEN: 6816, DARKEN: 6817, DIFFERENCE: 6818};
+const BlendingMode = {NORMAL: 5212, DISSOLVE: 5213, DARKEN: 5214, MULTIPLY: 5215, COLOR_BURN: 5216, LINEAR_BURN: 5217,
+    LIGHTEN: 5218, SCREEN: 5219, COLOR_DODGE: 5220, LINEAR_DODGE: 5221, ADD: 5222, OVERLAY: 5223, SOFT_LIGHT: 5224,
+    HARD_LIGHT: 5225, DIFFERENCE: 5226, EXCLUSION: 5227, HUE: 5228, SATURATION: 5229, COLOR: 5230, LUMINOSITY: 5231};
+const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
 // PNG signature + an empty IEND chunk: export_frame waits for IEND.
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
 
@@ -54,6 +59,28 @@ function makeAE(CtxArray) {
         }
     }
 
+    class Shape {
+        constructor() {
+            this.vertices = [];
+            this.inTangents = [];
+            this.outTangents = [];
+            this.closed = true;
+        }
+    }
+
+    class MarkerValue {
+        constructor(comment) {
+            this.comment = comment;
+            this.duration = 0;
+        }
+    }
+
+    function needUndo() {
+        if (undo.length === 0) {
+            throw new Error("fake AE: change outside an undo group");
+        }
+    }
+
     class TextDocument {
         constructor(text) {
             this.text = text;
@@ -87,6 +114,21 @@ function makeAE(CtxArray) {
             }
         }
         _v(v) {
+            if (this.propertyValueType === PropertyValueType.SHAPE) {
+                if (!(v instanceof Shape) || v.vertices.length < 2) {
+                    throw new Error(this.name + " takes a Shape with at least two vertices");
+                }
+                return v;
+            }
+            if (this.propertyValueType === PropertyValueType.MARKER) {
+                if (!(v instanceof MarkerValue)) {
+                    throw new Error(this.name + " takes a MarkerValue");
+                }
+                return v;
+            }
+            if (this.propertyValueType === PropertyValueType.COLOR && (!Array.isArray(v) || v.length !== 4)) {
+                throw new Error(this.name + " takes [r, g, b, a]");
+            }
             if (this.propertyValueType === PropertyValueType.TEXT_DOCUMENT) {
                 if (!(v instanceof TextDocument)) {
                     throw new Error("Source Text takes a TextDocument");
@@ -169,6 +211,10 @@ function makeAE(CtxArray) {
             }
             Object.assign(this.keys[i - 1], {inEase, outEase});
         }
+        copy() {
+            return Object.assign(Object.create(Object.getPrototypeOf(this)), this,
+                {keys: this.keys.map((k) => Object.assign({}, k)), _value: clone(this._value)});
+        }
         get expressionError() {
             if (!this.expressionEnabled) {
                 return "";
@@ -197,7 +243,102 @@ function makeAE(CtxArray) {
             }
             return this.children.find((c) => c.name === ref || c.matchName === ref) || null;
         }
+        copy() {
+            return Object.assign(Object.create(Object.getPrototypeOf(this)), this,
+                {children: this.children.map((c) => c.copy())});
+        }
     }
+
+    // An indexed group that takes addProperty(matchName): masks, shape contents, text animators and selectors.
+    // factories: {matchName: [display name, () => children array | a single Property, extra fields]}.
+    class AddGroup extends PropertyGroup {
+        constructor(name, matchName, factories) {
+            super(name, matchName, [], PropertyType.INDEXED_GROUP);
+            this.factories = factories;
+        }
+        canAddProperty(n) {
+            return n in this.factories;
+        }
+        addProperty(n) {
+            needUndo();
+            if (!(n in this.factories)) {
+                throw new Error("After Effects error: can not add property " + n + " to " + this.name);
+            }
+            const [display, build, extra] = this.factories[n];
+            const made = build();
+            let prop = made;
+            if (Array.isArray(made)) {
+                const count = this.children.filter((c) => c.matchName === n).length + 1;
+                prop = Object.assign(new PropertyGroup(display + " " + count, n, made), extra ? extra() : {});
+            }
+            this.children.push(prop);
+            return prop;
+        }
+    }
+
+    const P = (name, match, value, type, spatial) => () => new Property(name, match, value, type, spatial);
+    const SHAPE_CONTENTS = {
+        "ADBE Vector Shape - Rect": ["Rectangle Path", () => [
+            new Property("Size", "ADBE Vector Rect Size", [100, 100], PropertyValueType.TwoD),
+            new Property("Position", "ADBE Vector Rect Position", [0, 0], PropertyValueType.TwoD_SPATIAL, true),
+            new Property("Roundness", "ADBE Vector Rect Roundness", 0, PropertyValueType.OneD)]],
+        "ADBE Vector Shape - Ellipse": ["Ellipse Path", () => [
+            new Property("Size", "ADBE Vector Ellipse Size", [100, 100], PropertyValueType.TwoD),
+            new Property("Position", "ADBE Vector Ellipse Position", [0, 0], PropertyValueType.TwoD_SPATIAL, true)]],
+        "ADBE Vector Shape - Star": ["Polystar Path", () => [
+            new Property("Type", "ADBE Vector Star Type", 1, PropertyValueType.OneD),
+            new Property("Points", "ADBE Vector Star Points", 5, PropertyValueType.OneD),
+            new Property("Outer Radius", "ADBE Vector Star Outer Radius", 50, PropertyValueType.OneD),
+            new Property("Inner Radius", "ADBE Vector Star Inner Radius", 25, PropertyValueType.OneD)]],
+        "ADBE Vector Graphic - Fill": ["Fill", () => [
+            new Property("Color", "ADBE Vector Fill Color", [1, 0, 0, 1], PropertyValueType.COLOR),
+            new Property("Opacity", "ADBE Vector Fill Opacity", 100, PropertyValueType.OneD)]],
+        "ADBE Vector Graphic - Stroke": ["Stroke", () => [
+            new Property("Color", "ADBE Vector Stroke Color", [1, 1, 1, 1], PropertyValueType.COLOR),
+            new Property("Stroke Width", "ADBE Vector Stroke Width", 2, PropertyValueType.OneD)]],
+    };
+    const shapeRoot = () => new AddGroup("Contents", "ADBE Root Vectors Group", {
+        "ADBE Vector Group": ["Group", () => [
+            new AddGroup("Contents", "ADBE Vectors Group", SHAPE_CONTENTS),
+            new PropertyGroup("Transform", "ADBE Vector Transform Group", [
+                new Property("Position", "ADBE Vector Position", [0, 0], PropertyValueType.TwoD_SPATIAL, true),
+                new Property("Scale", "ADBE Vector Scale", [100, 100], PropertyValueType.TwoD),
+                new Property("Rotation", "ADBE Vector Rotation", 0, PropertyValueType.OneD),
+                new Property("Opacity", "ADBE Vector Group Opacity", 100, PropertyValueType.OneD)])]],
+    });
+    const masks = () => new AddGroup("Masks", "ADBE Mask Parade", {
+        "ADBE Mask Atom": ["Mask", () => [
+            new Property("Mask Path", "ADBE Mask Shape", new Shape(), PropertyValueType.SHAPE),
+            new Property("Mask Feather", "ADBE Mask Feather", [0, 0], PropertyValueType.TwoD),
+            new Property("Mask Opacity", "ADBE Mask Opacity", 100, PropertyValueType.OneD),
+            new Property("Mask Expansion", "ADBE Mask Offset", 0, PropertyValueType.OneD)],
+        () => ({_mode: MaskMode.ADD, inverted: false,
+            get maskMode() { return this._mode; },
+            set maskMode(m) {
+                if (!Object.values(MaskMode).includes(m)) {
+                    throw new Error("After Effects error: bad mask mode " + m);
+                }
+                this._mode = m;
+            }})],
+    });
+    const textAnimators = () => new AddGroup("Animators", "ADBE Text Animators", {
+        "ADBE Text Animator": ["Animator", () => [
+            new AddGroup("Selectors", "ADBE Text Selectors", {
+                "ADBE Text Selector": ["Range Selector", () => [
+                    new Property("Start", "ADBE Text Percent Start", 0, PropertyValueType.OneD),
+                    new Property("End", "ADBE Text Percent End", 100, PropertyValueType.OneD),
+                    new Property("Offset", "ADBE Text Percent Offset", 0, PropertyValueType.OneD),
+                    new PropertyGroup("Advanced", "ADBE Text Range Advanced", [
+                        new Property("Smoothness", "ADBE Text Selector Smoothness", 100, PropertyValueType.OneD)])]],
+            }),
+            new AddGroup("Properties", "ADBE Text Animator Properties", {
+                "ADBE Text Opacity": ["Opacity", P("Opacity", "ADBE Text Opacity", 100, PropertyValueType.OneD)],
+                "ADBE Text Position 3D": ["Position", P("Position", "ADBE Text Position 3D", [0, 0, 0],
+                    PropertyValueType.ThreeD_SPATIAL, true)],
+                "ADBE Text Scale 3D": ["Scale", P("Scale", "ADBE Text Scale 3D", [100, 100, 100], PropertyValueType.ThreeD)],
+                "ADBE Text Blur": ["Blur", P("Blur", "ADBE Text Blur", [0, 0], PropertyValueType.TwoD)],
+            })]],
+    });
 
     class EffectParade extends PropertyGroup {
         constructor() {
@@ -267,8 +408,46 @@ function makeAE(CtxArray) {
                     new Property("Opacity", "ADBE Opacity", 100, PropertyValueType.OneD),
                 ]),
                 new EffectParade(),
+                masks(),
+                new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER),
             ];
+            Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
+                solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
         }
+        setTrackMatte(layer, type) {
+            needUndo();
+            if (this.locked) {
+                throw new Error("After Effects error: the layer is locked");
+            }
+            if (layer === this || layer.containingComp !== this.containingComp) {
+                throw new Error("After Effects error: the track matte must be another layer of the same comp");
+            }
+            if (!Object.values(TrackMatteType).includes(type) || type === TrackMatteType.NO_TRACK_MATTE) {
+                throw new Error("After Effects error: bad track matte type");
+            }
+            Object.assign(this, {trackMatteLayer: layer, trackMatteType: type});
+        }
+        removeTrackMatte() {
+            Object.assign(this, {trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
+        }
+        duplicate() {
+            needUndo();
+            const layers = this.containingComp._layers;
+            const d = Object.assign(Object.create(Object.getPrototypeOf(this)), this,
+                {groups: this.groups.map((g) => g.copy())});
+            layers.splice(layers.indexOf(this), 0, d);  // the copy goes right above the original
+            return d;
+        }
+        _move(to) {
+            needUndo();
+            const layers = this.containingComp._layers;
+            layers.splice(layers.indexOf(this), 1);
+            layers.splice(to(layers), 0, this);
+        }
+        moveToBeginning() { this._move(() => 0); }
+        moveToEnd() { this._move((ls) => ls.length); }
+        moveBefore(l) { this._move((ls) => ls.indexOf(l)); }
+        moveAfter(l) { this._move((ls) => ls.indexOf(l) + 1); }
         get index() {
             return this.containingComp._layers.indexOf(this) + 1;
         }
@@ -301,20 +480,27 @@ function makeAE(CtxArray) {
             super(comp, text);
             this.groups.unshift(new PropertyGroup("Text", "ADBE Text Properties", [
                 new Property("Source Text", "ADBE Text Document", new TextDocument(text), PropertyValueType.TEXT_DOCUMENT),
+                textAnimators(),
             ]));
         }
     }
-    class ShapeLayer extends AVLayer {}
+    class ShapeLayer extends AVLayer {
+        constructor(comp, name) {
+            super(comp, name);
+            this.groups.unshift(shapeRoot());
+        }
+    }
+    const NOT_ON_3D = ["ADBE Effect Parade", "ADBE Mask Parade"];
     class CameraLayer extends AVLayer {
         constructor(comp, name) {
             super(comp, name);
-            this.groups = this.groups.filter((g) => g.matchName !== "ADBE Effect Parade");
+            this.groups = this.groups.filter((g) => !NOT_ON_3D.includes(g.matchName));
         }
     }
     class LightLayer extends AVLayer {
         constructor(comp, name) {
             super(comp, name);
-            this.groups = this.groups.filter((g) => g.matchName !== "ADBE Effect Parade");
+            this.groups = this.groups.filter((g) => !NOT_ON_3D.includes(g.matchName));
         }
     }
 
@@ -354,6 +540,27 @@ function makeAE(CtxArray) {
         add(item) {
             return this._top(new AVLayer(this.comp, item.name, item));
         }
+        precompose(indices, name, moveAll) {
+            needUndo();
+            const layers = this.comp._layers;
+            const idx = Array.prototype.slice.call(indices).sort((a, b) => a - b);
+            if (!idx.length || idx.some((i) => i < 1 || i > layers.length)) {
+                throw new Error("After Effects error: bad layer indices for precompose");
+            }
+            if (!moveAll && idx.length > 1) {
+                throw new Error("After Effects error: leaving attributes is only possible with one layer");
+            }
+            const c = this.comp;
+            const nc = project.items.addComp(name, c.width, c.height, c.pixelAspect, c.duration, c.frameRate);
+            const moving = idx.map((i) => layers[i - 1]);
+            moving.forEach((l) => {
+                layers.splice(layers.indexOf(l), 1);
+                l.containingComp = nc;
+                nc._layers.push(l);
+            });
+            layers.splice(idx[0] - 1, 0, new AVLayer(c, name, nc));
+            return nc;
+        }
     }
 
     class CompItem extends Item {
@@ -363,6 +570,22 @@ function makeAE(CtxArray) {
             this.bgColor = [0, 0, 0];
             this._layers = [];
             this.layers = new LayerCollection(this);
+            this.markerProperty = new Property("Marker", "ADBE Marker", null, PropertyValueType.MARKER);
+            this._wa = [0, dur];
+        }
+        get workAreaStart() { return this._wa[0]; }
+        set workAreaStart(v) {
+            if (v < 0 || v >= this.duration) {
+                throw new Error("After Effects error: work area start outside the comp");
+            }
+            this._wa[0] = v;
+        }
+        get workAreaDuration() { return this._wa[1]; }
+        set workAreaDuration(v) {
+            if (v <= 0 || this._wa[0] + v > this.duration + 1e-9) {
+                throw new Error("After Effects error: work area outside the comp");
+            }
+            this._wa[1] = v;
         }
         get numLayers() {
             return this._layers.length;
@@ -407,7 +630,8 @@ function makeAE(CtxArray) {
         constructor(comp) {
             this.comp = comp;
             this.status = RQItemStatus.QUEUED;
-            const om = {file: null, template: "High Quality", applyTemplate(n) {
+            this.templates = arr(["Best Settings", "Draft Settings", "Multi-Machine Settings"]);
+            const om = {file: null, template: "High Quality", templates: arr(TEMPLATES), applyTemplate(n) {
                 if (!TEMPLATES.includes(n)) {
                     throw new Error("After Effects error: no output module template named " + n);
                 }
@@ -498,7 +722,7 @@ function makeAE(CtxArray) {
         app, undo, undoLog,
         globals: {app, CompItem, FolderItem, FootageItem, SolidSource, TextLayer, ShapeLayer, CameraLayer, LightLayer,
             PropertyType, PropertyValueType, KeyframeInterpolationType, KeyframeEase, RQItemStatus,
-            ParagraphJustification, File, ImportOptions},
+            ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue},
     };
 }
 

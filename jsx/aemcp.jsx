@@ -283,6 +283,40 @@ var aemcp = (function () {
 
     var EASE = {linear: 1, ease: 1, ease_in: 1, ease_out: 1, hold: 1};
 
+    function enumValue(table, name, what) {
+        var key = String(name).toUpperCase(), v = table[key];
+        if (v === undefined) {
+            fail("unknown " + what + ": " + name);
+        }
+        return v;
+    }
+
+    function ellipse(x, y, w, h) {
+        // four Bezier points, clockwise from the top; k makes quarter arcs round
+        var s = new Shape(), k = 0.5523, rx = w / 2, ry = h / 2, cx = x + rx, cy = y + ry;
+        s.vertices = [[cx, y], [x + w, cy], [cx, y + h], [x, cy]];
+        s.inTangents = [[-rx * k, 0], [0, -ry * k], [rx * k, 0], [0, ry * k]];
+        s.outTangents = [[rx * k, 0], [0, ry * k], [-rx * k, 0], [0, -ry * k]];
+        s.closed = true;
+        return s;
+    }
+
+    function polygon(points) {
+        var s = new Shape();
+        s.vertices = points;
+        s.closed = true;
+        return s;
+    }
+
+    // text reveal presets: [animator property match name, value that hides a character]
+    var TEXT_PRESETS = {
+        fade_in: [["ADBE Text Opacity", 0]],
+        typewriter: [["ADBE Text Opacity", 0]],
+        slide_up: [["ADBE Text Opacity", 0], ["ADBE Text Position 3D", [0, 60, 0]]],
+        scale_in: [["ADBE Text Opacity", 0], ["ADBE Text Scale 3D", [0, 0, 100]]],
+        blur_in: [["ADBE Text Opacity", 0], ["ADBE Text Blur", [30, 30]]]
+    };
+
     function statusName(s) {
         var names = ["DONE", "ERR_STOPPED", "USER_STOPPED", "RENDERING", "QUEUED", "UNQUEUED", "NEEDS_OUTPUT",
             "WILL_CONTINUE"], i;
@@ -559,6 +593,272 @@ var aemcp = (function () {
                 fail("the project was never saved: pass a path");
             }
             return {project: app.project.file.fsName};
+        },
+
+        add_mask: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), group = l.property("ADBE Mask Parade"), m, shape, r;
+            if (!group) {
+                fail(l.name + " cannot take masks (cameras and lights have none)");
+            }
+            if (a.shape === "rect") {
+                r = a.rect;
+                shape = polygon([[r[0], r[1]], [r[0] + r[2], r[1]], [r[0] + r[2], r[1] + r[3]], [r[0], r[1] + r[3]]]);
+            } else if (a.shape === "ellipse") {
+                shape = ellipse(a.rect[0], a.rect[1], a.rect[2], a.rect[3]);
+            } else {
+                shape = polygon(a.points);
+            }
+            m = group.addProperty("ADBE Mask Atom");
+            m.property("ADBE Mask Shape").setValue(shape);
+            m.maskMode = enumValue(MaskMode, a.mode || "add", "mask mode");
+            if (a.feather !== undefined) {
+                m.property("ADBE Mask Feather").setValue([a.feather, a.feather]);
+            }
+            if (a.expansion !== undefined) {
+                m.property("ADBE Mask Offset").setValue(a.expansion);
+            }
+            if (a.opacity !== undefined) {
+                m.property("ADBE Mask Opacity").setValue(a.opacity);
+            }
+            if (a.inverted) {
+                m.inverted = true;
+            }
+            if (a.name) {
+                m.name = a.name;
+            }
+            return {layer: l.name, mask: m.name, masks: group.numProperties, mode: a.mode || "add",
+                vertices: shape.vertices.length};
+        },
+
+        add_shape: function (a) {
+            var c = findComp(a.comp), l = a.layer !== undefined ? findLayer(c, a.layer) : c.layers.addShape(),
+                root = l.property("ADBE Root Vectors Group"), grp, contents, path, fill, stroke;
+            if (!root) {
+                fail(l.name + " is not a shape layer");
+            }
+            if (a.layerName && a.layer === undefined) {
+                l.name = a.layerName;
+            }
+            grp = root.addProperty("ADBE Vector Group");
+            if (a.name) {
+                grp.name = a.name;
+            }
+            contents = grp.property("ADBE Vectors Group");
+            if (a.shape === "rect") {
+                path = contents.addProperty("ADBE Vector Shape - Rect");
+                path.property("ADBE Vector Rect Size").setValue(a.size);
+                if (a.roundness) {
+                    path.property("ADBE Vector Rect Roundness").setValue(a.roundness);
+                }
+            } else if (a.shape === "ellipse") {
+                path = contents.addProperty("ADBE Vector Shape - Ellipse");
+                path.property("ADBE Vector Ellipse Size").setValue(a.size);
+            } else {
+                path = contents.addProperty("ADBE Vector Shape - Star");
+                path.property("ADBE Vector Star Type").setValue(a.shape === "star" ? 1 : 2);
+                path.property("ADBE Vector Star Points").setValue(a.points);
+                path.property("ADBE Vector Star Outer Radius").setValue(a.size[0] / 2);
+                if (a.shape === "star") {
+                    path.property("ADBE Vector Star Inner Radius").setValue(a.size[0] / 4);
+                }
+            }
+            if (a.fill) {
+                fill = contents.addProperty("ADBE Vector Graphic - Fill");
+                fill.property("ADBE Vector Fill Color").setValue(a.fill);
+            }
+            if (a.stroke) {
+                stroke = contents.addProperty("ADBE Vector Graphic - Stroke");
+                stroke.property("ADBE Vector Stroke Color").setValue(a.stroke);
+                stroke.property("ADBE Vector Stroke Width").setValue(a.strokeWidth);
+            }
+            if (a.position) {
+                grp.property("ADBE Vector Transform Group").property("ADBE Vector Position").setValue(a.position);
+            }
+            return {layer: l.name, index: l.index, group: grp.name, shape: a.shape};
+        },
+
+        animate_text: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), text = l.property("ADBE Text Properties"), anim, props,
+                sel, start, preset = TEXT_PRESETS[a.preset], i, p, t0, t1, idx, kind;
+            if (!text) {
+                fail(l.name + " is not a text layer");
+            }
+            if (!preset) {
+                fail("unknown preset: " + a.preset);
+            }
+            anim = text.property("ADBE Text Animators").addProperty("ADBE Text Animator");
+            anim.name = "aemcp " + a.preset;
+            props = anim.property("ADBE Text Animator Properties");
+            for (i = 0; i < preset.length; i++) {
+                p = props.addProperty(preset[i][0]);
+                p.setValue(preset[i][1]);
+            }
+            sel = anim.property("ADBE Text Selectors").addProperty("ADBE Text Selector");
+            if (a.preset === "typewriter") {
+                // hard steps: each character appears whole
+                sel.property("ADBE Text Range Advanced").property("ADBE Text Selector Smoothness").setValue(0);
+            }
+            // the selector covers the characters still hidden: moving its start from 0 to 100 reveals them in order
+            start = sel.property("ADBE Text Percent Start");
+            t0 = a.start !== undefined ? a.start : l.inPoint;
+            t1 = t0 + a.duration;
+            kind = a.preset === "typewriter" ? KeyframeInterpolationType.LINEAR : KeyframeInterpolationType.BEZIER;
+            start.setValueAtTime(t0, 0);
+            start.setValueAtTime(t1, 100);
+            for (i = 1; i <= start.numKeys; i++) {
+                start.setInterpolationTypeAtKey(i, kind, kind);
+            }
+            idx = start.numKeys;
+            return {layer: l.name, animator: anim.name, preset: a.preset, from: round(t0), to: round(t1), keys: idx};
+        },
+
+        precompose: function (a) {
+            var c = findComp(a.comp), idx = [], i, nc, j, layer = null;
+            for (i = 0; i < a.layers.length; i++) {
+                idx.push(findLayer(c, a.layers[i]).index);
+            }
+            nc = c.layers.precompose(idx, a.name, a.moveAttributes);
+            for (j = 1; j <= c.numLayers; j++) {
+                if (c.layer(j).source === nc) {
+                    layer = j;
+                }
+            }
+            return {comp: c.name, precomp: nc.name, id: nc.id, precompLayers: nc.numLayers, layer: layer};
+        },
+
+        duplicate_layer: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), d = l.duplicate();
+            if (a.name) {
+                d.name = a.name;
+            }
+            return layerInfo(d);
+        },
+
+        move_layer: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), other;
+            if (a.to === "top") {
+                l.moveToBeginning();
+            } else if (a.to === "bottom") {
+                l.moveToEnd();
+            } else {
+                other = findLayer(c, a.other);
+                if (other === l) {
+                    fail("a layer cannot move relative to itself");
+                }
+                if (a.to === "before") {
+                    l.moveBefore(other);
+                } else {
+                    l.moveAfter(other);
+                }
+            }
+            return {layer: l.name, index: l.index};
+        },
+
+        set_switches: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), out = {};
+            if (a.blending !== undefined) {
+                l.blendingMode = enumValue(BlendingMode, a.blending, "blending mode");
+            }
+            if (a.threeD !== undefined) {
+                l.threeDLayer = a.threeD;
+            }
+            if (a.motionBlur !== undefined) {
+                l.motionBlur = a.motionBlur;
+            }
+            if (a.shy !== undefined) {
+                l.shy = a.shy;
+            }
+            if (a.solo !== undefined) {
+                l.solo = a.solo;
+            }
+            if (a.matte !== undefined) {
+                if (a.matte === "none") {
+                    l.removeTrackMatte();
+                } else {
+                    if (typeof l.setTrackMatte !== "function") {
+                        fail("setting a track matte needs After Effects 2023 or later");
+                    }
+                    l.setTrackMatte(findLayer(c, a.matteLayer), enumValue(TrackMatteType, a.matte, "matte type"));
+                }
+            }
+            if (a.locked !== undefined) {
+                l.locked = a.locked;  // last: a locked layer takes no more changes
+            }
+            out = {layer: l.name, threeD: l.threeDLayer, motionBlur: l.motionBlur, shy: l.shy, solo: l.solo,
+                locked: l.locked, matteLayer: l.trackMatteLayer ? l.trackMatteLayer.name : null};
+            return out;
+        },
+
+        add_marker: function (a) {
+            var c = findComp(a.comp), prop, mv, target;
+            if (a.layer !== undefined) {
+                target = findLayer(c, a.layer);
+                prop = target.property("ADBE Marker");
+            } else {
+                prop = c.markerProperty;
+            }
+            if (!prop) {
+                fail("no marker track here (comp markers need After Effects 2017 or later)");
+            }
+            mv = new MarkerValue(a.comment || "");
+            if (a.duration) {
+                mv.duration = a.duration;
+            }
+            prop.setValueAtTime(a.time, mv);
+            return {target: target ? target.name : c.name, time: a.time, markers: prop.numKeys};
+        },
+
+        set_comp: function (a) {
+            var c = findComp(a.comp);
+            if (a.name !== undefined) {
+                c.name = a.name;
+            }
+            if (a.width !== undefined) {
+                c.width = a.width;
+            }
+            if (a.height !== undefined) {
+                c.height = a.height;
+            }
+            if (a.frameRate !== undefined) {
+                c.frameRate = a.frameRate;
+            }
+            if (a.duration !== undefined) {
+                c.duration = a.duration;
+            }
+            if (a.bgColor !== undefined) {
+                c.bgColor = a.bgColor;
+            }
+            if (a.workArea !== undefined) {
+                if (a.workArea[0] < 0 || a.workArea[1] <= a.workArea[0] || a.workArea[1] > c.duration) {
+                    fail("work_area must be [start, end] inside the comp (0-" + round(c.duration) + " s)");
+                }
+                c.workAreaStart = 0;  // shrink first so the new start always fits
+                c.workAreaDuration = a.workArea[1] - a.workArea[0];
+                c.workAreaStart = a.workArea[0];
+            }
+            return {id: c.id, name: c.name, width: c.width, height: c.height, duration: round(c.duration),
+                frameRate: round(c.frameRate), workArea: [round(c.workAreaStart),
+                    round(c.workAreaStart + c.workAreaDuration)]};
+        },
+
+        render_templates: function () {
+            var comps = allItems(), comp = null, i, rq, out;
+            for (i = 0; i < comps.length; i++) {
+                if (comps[i] instanceof CompItem) {
+                    comp = comps[i];
+                    break;
+                }
+            }
+            if (!comp) {
+                fail("the project has no comp: create one first (the template lists come from a render queue item)");
+            }
+            rq = app.project.renderQueue.items.add(comp);
+            try {
+                out = {outputModules: plain(rq.outputModule(1).templates), renderSettings: plain(rq.templates)};
+            } finally {
+                rq.remove();
+            }
+            return out;
         },
 
         run_jsx: function (a) {

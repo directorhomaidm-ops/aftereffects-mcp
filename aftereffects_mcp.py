@@ -42,7 +42,8 @@ DEFAULT_TIMEOUT = 60
 mcp = MCPServer(
     "aftereffects",
     instructions="Controls the running Adobe After Effects: project items, compositions, layers (text, solid, shape, "
-    "null, adjustment, camera, light, footage), properties, keyframes with easing, expressions, effects, import, "
+    "null, adjustment, camera, light, footage), properties, keyframes with easing, expressions, effects, masks, "
+    "vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, import, "
     "the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
@@ -375,6 +376,176 @@ def export_frame(path: str, time: float = 0.0, comp: int | str | None = None) ->
 def save_project(path: str | None = None) -> dict:
     """Save the project (to `path`, an .aep, when given or never saved)."""
     return _call("save_project", path=_path(path) if path else None)
+
+
+# --- masks, shapes, text animation ---
+
+MASK_MODES = ("none", "add", "subtract", "intersect", "lighten", "darken", "difference")
+
+
+def _rect(name, r):
+    if r is None or len(r) != 4 or float(r[2]) <= 0 or float(r[3]) <= 0:
+        raise ToolError(f"{name} needs [x, y, width, height] with a positive width and height")
+    return [float(v) for v in r]
+
+
+@_tool
+def add_mask(layer: int | str, shape: str = "rect", rect: list[float] | None = None,
+             points: list[list[float]] | None = None, mode: str = "add", feather: float | None = None,
+             expansion: float | None = None, opacity: float | None = None, inverted: bool = False,
+             name: str | None = None, comp: int | str | None = None) -> dict:
+    """Add a mask to a layer: shape rect or ellipse inside rect [x, y, width, height] (layer pixels, from the
+    layer's top left), or path through points [[x, y], ...] (at least 3, closed). mode none, add, subtract,
+    intersect, lighten, darken or difference; feather and expansion in pixels, opacity 0-100, inverted flips it.
+    Animate its shape or feather afterwards with set_keyframes on ["Masks", "<mask name>", "Mask Feather"]."""
+    if mode not in MASK_MODES:
+        raise ToolError(f"mode must be one of: {', '.join(MASK_MODES)}")
+    if shape in ("rect", "ellipse"):
+        rect = _rect("rect", rect)
+    elif shape == "path":
+        if not points or len(points) < 3 or any(len(pt) != 2 for pt in points):
+            raise ToolError("path needs at least 3 points [x, y]")
+    else:
+        raise ToolError("shape must be rect, ellipse or path")
+    if feather is not None and feather < 0:
+        raise ToolError("feather must be 0 or more")
+    if opacity is not None and not 0 <= opacity <= 100:
+        raise ToolError("opacity must be 0-100")
+    return _call("add_mask", comp=comp, layer=layer, shape=shape, rect=rect, points=points, mode=mode,
+                 feather=feather, expansion=expansion, opacity=opacity, inverted=inverted or None, name=name)
+
+
+SHAPES = ("rect", "ellipse", "star", "polygon")
+
+
+@_tool
+def add_shape(shape: str, size: list[float] = [200, 200], fill: list[float] | None = None,
+              stroke: list[float] | None = None, stroke_width: float = 4, roundness: float = 0, points: int = 5,
+              position: list[float] | None = None, layer: int | str | None = None, layer_name: str | None = None,
+              name: str | None = None, comp: int | str | None = None) -> dict:
+    """Draw a vector shape: rect (with corner roundness), ellipse, star or polygon (`points` corners; size[0] is the
+    diameter), sized [width, height] in pixels, with fill and/or stroke colors [r, g, b] 0-1 (white fill when
+    neither is given) and stroke_width. It goes into a new shape layer (named layer_name), or into an existing shape
+    layer when `layer` is given, as its own group (`name`); position offsets it from the layer's anchor."""
+    if shape not in SHAPES:
+        raise ToolError(f"shape must be one of: {', '.join(SHAPES)}")
+    if len(size) != 2 or min(size) <= 0:
+        raise ToolError("size needs [width, height] above 0")
+    if shape in ("star", "polygon") and not 3 <= points <= 100:
+        raise ToolError("points must be 3-100")
+    if stroke_width <= 0 or roundness < 0:
+        raise ToolError("stroke_width must be above 0 and roundness 0 or more")
+    if fill is None and stroke is None:
+        fill = [1.0, 1.0, 1.0]
+    rgba = lambda n, v: _color(n, v) + [1.0] if v is not None else None  # noqa: E731 - color props take alpha
+    return _call("add_shape", comp=comp, layer=layer, layerName=layer_name, name=name, shape=shape,
+                 size=[float(v) for v in size], fill=rgba("fill", fill), stroke=rgba("stroke", stroke),
+                 strokeWidth=stroke_width, roundness=roundness or None, points=points, position=position)
+
+
+TEXT_PRESETS = ("fade_in", "typewriter", "slide_up", "scale_in", "blur_in")
+
+
+@_tool
+def animate_text(layer: int | str, preset: str = "fade_in", duration: float = 1.0, start: float | None = None,
+                 comp: int | str | None = None) -> dict:
+    """Reveal a text layer character by character with a text animator: fade_in, typewriter (each letter pops in),
+    slide_up, scale_in or blur_in, over `duration` seconds from `start` (default the layer's in point). Adds an
+    animator named "aemcp <preset>"; calling again stacks another."""
+    if preset not in TEXT_PRESETS:
+        raise ToolError(f"preset must be one of: {', '.join(TEXT_PRESETS)}")
+    if duration <= 0:
+        raise ToolError("duration must be above 0")
+    return _call("animate_text", comp=comp, layer=layer, preset=preset, duration=duration, start=start)
+
+
+# --- layer structure and switches ---
+
+
+@_tool
+def precompose(layers: list[int | str], name: str, move_attributes: bool = True,
+               comp: int | str | None = None) -> dict:
+    """Precompose layers (indexes or names) into a new comp `name`, replaced in this comp by one layer.
+    move_attributes=False keeps effects and transforms on the outer layer (one layer only)."""
+    if not layers:
+        raise ToolError("no layers")
+    if not move_attributes and len(layers) > 1:
+        raise ToolError("move_attributes=False works on one layer only")
+    return _call("precompose", comp=comp, layers=layers, name=name, moveAttributes=move_attributes)
+
+
+@_tool
+def duplicate_layer(layer: int | str, name: str | None = None, comp: int | str | None = None) -> dict:
+    """Duplicate a layer with its keyframes, effects and masks; the copy goes right above it."""
+    return _call("duplicate_layer", comp=comp, layer=layer, name=name)
+
+
+@_tool
+def move_layer(layer: int | str, to: str, other: int | str | None = None, comp: int | str | None = None) -> dict:
+    """Reorder a layer: to top, bottom, before (above) or after (below) the `other` layer."""
+    if to not in ("top", "bottom", "before", "after"):
+        raise ToolError("to must be top, bottom, before or after")
+    if to in ("before", "after") and other is None:
+        raise ToolError(f"to={to} needs the other layer")
+    return _call("move_layer", comp=comp, layer=layer, to=to, other=other)
+
+
+BLENDING = ("normal", "dissolve", "darken", "multiply", "color_burn", "linear_burn", "lighten", "screen",
+            "color_dodge", "linear_dodge", "add", "overlay", "soft_light", "hard_light", "difference", "exclusion",
+            "hue", "saturation", "color", "luminosity")
+MATTES = ("alpha", "alpha_inverted", "luma", "luma_inverted", "none")
+
+
+@_tool
+def set_switches(layer: int | str, blending: str | None = None, three_d: bool | None = None,
+                 motion_blur: bool | None = None, shy: bool | None = None, solo: bool | None = None,
+                 locked: bool | None = None, matte: str | None = None, matte_layer: int | str | None = None,
+                 comp: int | str | None = None) -> dict:
+    """Layer switches: blending mode (normal, screen, multiply, overlay, add, soft_light...), 3D, motion blur, shy,
+    solo, locked, and a track matte: matte alpha, alpha_inverted, luma or luma_inverted from matte_layer (After
+    Effects 2023+), or none to remove it. Locking is applied last."""
+    if blending is not None and blending not in BLENDING:
+        raise ToolError(f"blending must be one of: {', '.join(BLENDING)}")
+    if matte is not None and matte not in MATTES:
+        raise ToolError(f"matte must be one of: {', '.join(MATTES)}")
+    if matte not in (None, "none") and matte_layer is None:
+        raise ToolError("a track matte needs matte_layer")
+    return _call("set_switches", comp=comp, layer=layer, blending=blending, threeD=three_d, motionBlur=motion_blur,
+                 shy=shy, solo=solo, locked=locked, matte=matte, matteLayer=matte_layer)
+
+
+@_tool
+def add_marker(time: float, comment: str = "", duration: float = 0.0, layer: int | str | None = None,
+               comp: int | str | None = None) -> dict:
+    """Add a marker at `time` (seconds) with a comment and optional duration: on the comp, or on a layer."""
+    if time < 0 or duration < 0:
+        raise ToolError("time and duration must be 0 or more")
+    return _call("add_marker", comp=comp, layer=layer, time=time, comment=comment, duration=duration or None)
+
+
+@_tool
+def set_comp(comp: int | str | None = None, name: str | None = None, width: int | None = None,
+             height: int | None = None, duration: float | None = None, frame_rate: float | None = None,
+             bg_color: list[float] | None = None, work_area: list[float] | None = None) -> dict:
+    """Change a comp's name, size, duration, frame rate, background color, or work area [start, end] in seconds
+    (what renders when the render settings use the work area)."""
+    if width is not None and not 4 <= width <= 30000 or height is not None and not 4 <= height <= 30000:
+        raise ToolError("width and height must be 4-30000 pixels")
+    if duration is not None and not 0 < duration <= 10800:
+        raise ToolError("duration must be above 0 and at most 3 hours")
+    if frame_rate is not None and not 1 <= frame_rate <= 999:
+        raise ToolError("frame_rate must be 1-999")
+    if work_area is not None and len(work_area) != 2:
+        raise ToolError("work_area needs [start, end]")
+    return _call("set_comp", comp=comp, name=name, width=width, height=height, duration=duration,
+                 frameRate=frame_rate, bgColor=_color("bg_color", bg_color), workArea=work_area)
+
+
+@_tool
+def render_templates() -> dict:
+    """The output module and render settings template names installed in After Effects, for
+    add_to_render_queue(template=...). Needs at least one comp in the project."""
+    return _call("render_templates")
 
 
 @_tool
