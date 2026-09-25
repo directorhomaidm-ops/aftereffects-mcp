@@ -884,6 +884,131 @@ def export_mogrt(path: str, name: str | None = None, comp: int | str | None = No
     return _call("export_mogrt", comp=comp, path=path, name=name)
 
 
+# --- keyframe work, editing, variants, footage ---
+
+
+@_tool
+def bake_expression(layer: int | str, property: str | list[str], step: int = 1, start: float | None = None,
+                    end: float | None = None, comp: int | str | None = None) -> dict:
+    """Turn a property's expression into keyframes: its value is sampled every `step` frames from `start` to `end`
+    (default the layer's in and out points), written as keyframes, and the expression is switched off (kept, so it
+    can be switched back on). Use it to hand-edit a wiggle, or to speed up heavy expressions."""
+    if not 1 <= step <= 100:
+        raise ToolError("step must be 1-100 frames")
+    return _call("bake_expression", comp=comp, layer=layer, property=property, step=step, start=start, end=end)
+
+
+@_tool
+def ease_keyframes(layer: int | str, property: str | list[str], ease: str = "ease", influence: float = 33.33,
+                   comp: int | str | None = None) -> dict:
+    """Re-ease every keyframe of a property: ease, ease_in, ease_out, linear or hold, with `influence` 0.1-100 for
+    the easing strength (e.g. 75 for a strong ease)."""
+    if ease not in EASES:
+        raise ToolError(f"ease must be one of: {', '.join(EASES)}")
+    if not 0.1 <= influence <= 100:
+        raise ToolError("influence must be 0.1-100")
+    return _call("ease_keyframes", comp=comp, layer=layer, property=property, ease=ease, influence=influence)
+
+
+@_tool
+def copy_keyframes(layer: int | str, property: str | list[str], targets: list[int | str], offset: float = 0.0,
+                   comp: int | str | None = None) -> dict:
+    """Copy a property's keyframes, with their interpolation and easing, to other layers (replacing theirs). offset
+    cascades: the first target starts `offset` seconds later, the second 2 x offset, and so on."""
+    if not targets:
+        raise ToolError("no targets")
+    return _call("copy_keyframes", comp=comp, layer=layer, property=property, targets=targets, offset=offset)
+
+
+@_tool
+def stagger_layers(layers: list[int | str], offset: float = 0.1, start: float | None = None,
+                   comp: int | str | None = None) -> dict:
+    """Offset layers' start times by `offset` seconds each, in the given order (the classic stagger), starting at
+    `start` (default the first layer's in point). Keyframes move with their layers."""
+    if not layers:
+        raise ToolError("no layers")
+    return _call("stagger_layers", comp=comp, layers=layers, offset=offset, start=start)
+
+
+@_tool
+def split_layer(layer: int | str, time: float, name: str | None = None, comp: int | str | None = None) -> dict:
+    """Split a layer at `time` (seconds): the original ends there and a copy right above it starts there."""
+    return _call("split_layer", comp=comp, layer=layer, time=time, name=name)
+
+
+@_tool
+def trim_comp(to: str = "layers", comp: int | str | None = None) -> dict:
+    """Trim a comp to its layers (from the earliest in point to the latest out point) or to its work area; layers
+    move so the kept part starts at 0."""
+    if to not in ("layers", "work_area"):
+        raise ToolError("to must be layers or work_area")
+    return _call("trim_comp", comp=comp, to=to)
+
+
+@_tool
+def make_variants(rows: list[dict], comp: int | str | None = None, output_dir: str | None = None,
+                  template: str | None = None) -> dict:
+    """Versions of a template comp from data: each row {"name": "...", "texts": {"<text layer>": "<text>"}} gets a
+    duplicate of the comp named `name` with those texts. With output_dir each one is queued to render there (name
+    as the file name; template from render_templates); then call render or render_background."""
+    if not rows:
+        raise ToolError("no rows")
+    names = [r.get("name") for r in rows if isinstance(r, dict)]
+    if len(names) != len(rows) or not all(isinstance(n, str) and n.strip() for n in names):
+        raise ToolError('each row needs a "name" and "texts"')
+    if len(set(names)) != len(names):
+        raise ToolError("row names must be unique (they name the comps and the files)")
+    if any(any(c in n for c in '/\\:*?"<>|') for n in names):
+        raise ToolError("row names are file names: no / \\ : * ? \" < > |")
+    if any(not isinstance(r.get("texts", {}), dict) for r in rows):
+        raise ToolError('"texts" maps text layer names to their text')
+    rows = [{"name": r["name"], "texts": r.get("texts", {})} for r in rows]
+    if output_dir:
+        output_dir = _path(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+    return _call("make_variants", comp=comp, rows=rows, outputDir=output_dir, template=template)
+
+
+LAYERED_MODES = ("comp_cropped", "comp", "footage")
+
+
+@_tool
+def import_layered(path: str, mode: str = "comp_cropped") -> dict:
+    """Import a layered Photoshop or Illustrator file: as a comp with each layer cropped to its content
+    (comp_cropped, best for animating), as a comp with layers at document size (comp), or flattened (footage)."""
+    if mode not in LAYERED_MODES:
+        raise ToolError(f"mode must be one of: {', '.join(LAYERED_MODES)}")
+    return _call("import_layered", path=_path(path), mode=mode)
+
+
+@_tool
+def find_missing_footage(search: str | None = None, max_files: int = 200000) -> dict:
+    """Footage whose file is missing. With search (a folder), each missing file is looked for by name under it
+    (recursively, up to max_files files) and relinked when found."""
+    missing = _call("missing_footage")
+    out = {"missing": missing}
+    if not search or not missing:
+        return out
+    root = _path(search)
+    if not os.path.isdir(root):
+        raise ToolError(f"folder not found: {root}")
+    wanted = {os.path.basename(m["file"]).lower(): m for m in missing if m.get("file")}
+    found, seen = {}, 0
+    for dirpath, _, files in os.walk(root):
+        for fn in files:
+            seen += 1
+            if fn.lower() in wanted and fn.lower() not in found:
+                found[fn.lower()] = os.path.join(dirpath, fn)
+        if seen >= max_files or len(found) == len(wanted):
+            break
+    links = [{"id": wanted[k]["id"], "path": p} for k, p in found.items()]
+    out["relinked"] = _call("relink_footage", links=links) if links else []
+    out["still_missing"] = [m["name"] for m in missing if m.get("file") is None or
+                            os.path.basename(m["file"]).lower() not in found]
+    out["files_searched"] = seen
+    return out
+
+
 @_tool
 def run_jsx(code: str) -> Any:
     """Run ExtendScript in After Effects and return its value (numbers, strings, arrays; other objects as text).

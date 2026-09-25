@@ -77,6 +77,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `render_background_status` | `job` | `{job, state, exit_code, log_tail}` |
 | `mogrt_add_property` | `layer`, `property`, `name`, `comp` | `{comp, layer, property, name}` |
 | `export_mogrt` | `path` (.mogrt), `name`, `comp` | `{comp, template, path}` |
+| `bake_expression` | `layer`, `property`, `step = 1` (frames), `start`, `end`, `comp` | `{property, keys, from, to, expression}` |
+| `ease_keyframes` | `layer`, `property`, `ease = "ease"`, `influence = 33.33`, `comp` | `{property, keys, ease}` |
+| `copy_keyframes` | `layer`, `property`, `targets`, `offset = 0` (cascading), `comp` | `{property, from, to, keys}` |
+| `stagger_layers` | `layers`, `offset = 0.1`, `start`, `comp` | `{layers: [{layer, inPoint}]}` |
+| `split_layer` | `layer`, `time`, `name`, `comp` | `{first, second}` |
+| `trim_comp` | `to` (layers, work_area), `comp` | `{comp, duration, shiftedBy}` |
+| `make_variants` | `rows: [{name, texts: {layer: text}}]`, `comp`, `output_dir`, `template` | `{from, variants: [{comp, id, queued}]}` |
+| `import_layered` | `path` (.psd, .ai), `mode` (comp_cropped, comp, footage) | `{id, name, type, layers}` |
+| `find_missing_footage` | `search` (folder), `max_files = 200000` | `{missing, relinked, still_missing, files_searched}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -101,6 +110,10 @@ Notes:
 - `captions_from_srt` makes one centered text layer per cue; tags such as `<i>` are dropped, line breaks kept.
 - `render_background` saves the project, then runs `aerender -project` on it (next to the application, or `AE_RENDER`), so After Effects stays usable. The job lives as long as the server; aerender can exit 0 after an error, so its log decides the state.
 - `mogrt_add_property` uses `addToMotionGraphicsTemplateAs`; `export_mogrt` writes the comp's template for Premiere Pro.
+- `bake_expression` samples the expression's result and switches the expression off (it stays, to switch back on).
+- `copy_keyframes` keeps each key's interpolation and easing; its offset cascades (target 1: offset, target 2: 2 x offset...).
+- `make_variants` duplicates the template comp per row and replaces the named text layers' text; with `output_dir` each copy is queued with its name as the file name. Render them with `render` or `render_background`.
+- `find_missing_footage(search=...)` matches missing files by name (any case) under a folder and relinks them with `FootageItem.replace`.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration

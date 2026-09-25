@@ -22,6 +22,8 @@ def test_all_tools_registered():
         "time_remap", "fit_to_comp", "center_anchor", "null_control", "apply_preset", "replace_footage",
         "create_folder", "move_items", "clean_project", "camera_move", "set_light", "audio_fade", "audio_react",
         "captions_from_srt", "render_background", "render_background_status", "mogrt_add_property", "export_mogrt",
+        "bake_expression", "ease_keyframes", "copy_keyframes", "stagger_layers", "split_layer", "trim_comp",
+        "make_variants", "import_layered", "find_missing_footage",
     }
 
 
@@ -980,3 +982,175 @@ def test_mogrt(ae, tmp_path):
                ".addToMotionGraphicsTemplateAs, 1)")
     with pytest.raises(ToolError, match="needs After Effects 2018"):
         d.mogrt_add_property(1, "text")
+
+
+
+# --- keyframe work, editing, variants, footage ---
+
+
+def test_bake_expression(ae):
+    d.create_comp("Main", duration=2, frame_rate=10)
+    d.add_layer("null", name="Rig")
+    d.set_layer("Rig", in_point=0.5, out_point=1)
+    d.set_expression("Rig", "rotation", "wiggle(2, 30)")
+    out = d.bake_expression("Rig", "rotation", step=2)
+    assert out == {"property": "Rotation", "keys": 3, "from": 0.5, "to": 0.9, "expression": "disabled (kept, not deleted)"}
+    got = d.get_property("Rig", "rotation")
+    # the fake evaluates expressions as value + time: frames 0.5, 0.7, 0.9 of a 0 rotation
+    assert [(k["time"], k["value"]) for k in got["keys"]] == [(0.5, 0.5), (0.7, 0.7), (0.9, 0.9)]
+    assert got["expression"] is None  # switched off
+    with pytest.raises(ToolError, match="no expression to bake"):
+        d.bake_expression("Rig", "rotation")
+    d.set_expression("Rig", "opacity", "time")
+    with pytest.raises(ToolError, match="end must be after start"):
+        d.bake_expression("Rig", "opacity", start=1, end=1)
+    with pytest.raises(ToolError, match="step"):
+        d.bake_expression("Rig", "opacity", step=0)
+
+
+def test_ease_keyframes(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="Rig")
+    d.set_keyframes("Rig", "scale", [{"time": t, "value": [v, v], "ease": "linear"} for t, v in ((0, 0), (1, 100), (2, 80))])
+    assert d.ease_keyframes("Rig", "scale", "ease", influence=80) == {"property": "Scale", "keys": 3, "ease": "ease"}
+    keys = "ae.app.project.item(1).layer(1).groups[0].children.find(p => p.name === 'Scale').keys"
+    assert ae.inspect(f"{keys}.map(k => [k.outType, k.outEase.length, k.outEase[0].influence])") == [[6613, 3, 80]] * 3
+    d.ease_keyframes("Rig", "scale", "hold")
+    assert ae.inspect(f"{keys}.map(k => k.outType)") == [6614] * 3
+    with pytest.raises(ToolError, match="no keyframes"):
+        d.ease_keyframes("Rig", "opacity")
+    for kwargs, msg in [({"ease": "bounce"}, "ease must be"), ({"influence": 0}, "influence")]:
+        with pytest.raises(ToolError, match=msg):
+            d.ease_keyframes("Rig", "scale", **kwargs)
+
+
+def test_copy_keyframes(ae):
+    d.create_comp("Main")
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)
+    d.set_keyframes("A", "opacity", [{"time": 0, "value": 0, "ease": "linear"},
+                                      {"time": 1, "value": 100, "ease": "ease", "influence": 60}])
+    d.set_keyframes("C", "opacity", [{"time": 5, "value": 50}])  # replaced
+    out = d.copy_keyframes("A", "opacity", ["B", "C"], offset=0.25)
+    assert out == {"property": "Opacity", "from": "A", "to": ["B", "C"], "keys": 2}
+    assert [k["time"] for k in d.get_property("B", "opacity")["keys"]] == [0.25, 1.25]
+    assert [k["time"] for k in d.get_property("C", "opacity")["keys"]] == [0.5, 1.5]  # cascades
+    c = "ae.app.project.item(1).layer(1).groups[0].children.find(p => p.name === 'Opacity').keys"
+    assert ae.inspect(f"{c}.map(k => k.outType)") == [6612, 6613]
+    assert ae.inspect(f"{c}[1].inEase[0].influence") == 60
+    with pytest.raises(ToolError, match="own target"):
+        d.copy_keyframes("A", "opacity", ["A"])
+    with pytest.raises(ToolError, match="no keyframes to copy"):
+        d.copy_keyframes("B", "rotation", ["C"])
+    with pytest.raises(ToolError, match="no targets"):
+        d.copy_keyframes("A", "opacity", [])
+
+
+def test_stagger_layers(ae):
+    d.create_comp("Main", duration=10)
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)
+    d.set_layer("B", start_time=3)
+    d.set_keyframes("C", "opacity", [{"time": 0, "value": 0}, {"time": 1, "value": 100}])
+    out = d.stagger_layers(["A", "B", "C"], offset=0.2, start=1)
+    assert [(r["layer"], r["inPoint"]) for r in out["layers"]] == [("A", 1), ("B", 1.2), ("C", 1.4)]
+    assert d.stagger_layers(["C", "A"], offset=0.5)["layers"] == [{"layer": "C", "inPoint": 1.4},
+                                                                  {"layer": "A", "inPoint": 1.9}]
+    with pytest.raises(ToolError, match="no layers"):
+        d.stagger_layers([])
+    d.set_layer("B", in_point=4)  # trimmed: its in point is past its start time
+    assert d.stagger_layers(["A", "B"], offset=1, start=6)["layers"] == [{"layer": "A", "inPoint": 6},
+                                                                         {"layer": "B", "inPoint": 7}]
+
+
+def test_split_layer(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="Shot")
+    d.set_keyframes("Shot", "opacity", [{"time": 0, "value": 0}, {"time": 8, "value": 100}])
+    out = d.split_layer("Shot", 4, name="Shot B")
+    assert out == {"first": {"index": 2, "name": "Shot", "outPoint": 4}, "second": {"index": 1, "name": "Shot B",
+                                                                                    "inPoint": 4}}
+    assert d.get_property("Shot B", "opacity")["keys"] == d.get_property("Shot", "opacity")["keys"]
+    with pytest.raises(ToolError, match=r"inside the layer \(0-4 s\)"):
+        d.split_layer("Shot", 4)
+
+
+def test_trim_comp(ae):
+    d.create_comp("Main", duration=20)
+    d.add_layer("null", name="A")
+    d.add_layer("null", name="B")
+    d.set_layer("A", start_time=3)          # 3-23: out past the comp end
+    d.set_layer("B", start_time=2, out_point=8)
+    out = d.trim_comp()
+    assert out == {"comp": "Main", "duration": 18, "shiftedBy": 2}
+    assert [(l["name"], l["inPoint"]) for l in d.comp_info()["layers"]] == [("B", 0), ("A", 1)]
+    d.set_comp(work_area=[2, 5])
+    assert d.trim_comp(to="work_area") == {"comp": "Main", "duration": 3, "shiftedBy": 2}
+    d.create_comp("Empty")
+    with pytest.raises(ToolError, match="no layers to trim"):
+        d.trim_comp(comp="Empty")
+    with pytest.raises(ToolError, match="to must be"):
+        d.trim_comp(to="markers")
+
+
+def test_make_variants(ae, tmp_path):
+    d.create_comp("Card")
+    d.add_layer("text", text="NAME", name="Name")
+    d.add_layer("text", text="ROLE", name="Role")
+    d.add_layer("null", name="Rig")
+    d.set_layer("Name", parent="Rig")
+    out = d.make_variants([{"name": "Card Sara", "texts": {"Name": "سارة", "Role": "Editor"}},
+                           {"name": "Card Omar", "texts": {"Name": "Omar"}}], comp="Card",
+                          output_dir=str(tmp_path / "out"), template="High Quality")
+    assert out == {"from": "Card", "variants": [{"comp": "Card Sara", "id": 2, "queued": True},
+                                                {"comp": "Card Omar", "id": 3, "queued": True}]}
+    assert d.get_property("Name", "text", comp="Card Sara")["value"]["text"] == "سارة"
+    assert d.get_property("Role", "text", comp="Card Omar")["value"]["text"] == "ROLE"  # untouched
+    assert d.get_property("Name", "text", comp="Card")["value"]["text"] == "NAME"  # the template stays
+    assert d.comp_info("Card Sara")["layers"][2]["parent"] == 1  # Name (3) stays on the copy's Rig (1)
+    assert ae.inspect("ae.app.project.renderQueue._items.map(r => r._om.file.fsName)") == [
+        str(tmp_path / "out" / "Card Sara"), str(tmp_path / "out" / "Card Omar")]
+    assert d.make_variants([{"name": "No render"}], comp="Card")["variants"][0]["queued"] is False
+    with pytest.raises(ToolError, match="Rig in Card is not a text layer"):
+        d.make_variants([{"name": "X", "texts": {"Rig": "x"}}], comp="Card")
+    for rows, msg in [([], "no rows"), ([{"texts": {}}], "needs a"), ([{"name": "A"}, {"name": "A"}], "unique"),
+                      ([{"name": "a/b"}], "file names"), ([{"name": "A", "texts": ["x"]}], "maps text")]:
+        with pytest.raises(ToolError, match=msg):
+            d.make_variants(rows, comp="Card")
+
+
+def test_import_layered(ae, tmp_path):
+    psd = tmp_path / "Poster.psd"
+    psd.write_bytes(b"8BPS")
+    out = d.import_layered(str(psd))
+    assert out == {"id": 2, "name": "Poster", "type": "comp", "layers": 2}
+    assert ae.inspect("ae.app.project.item(1).name") == "Poster Layers"
+    mov = tmp_path / "clip.mov"
+    mov.write_bytes(b"x")
+    with pytest.raises(ToolError, match="cannot import clip.mov as comp"):
+        d.import_layered(str(mov), "comp")
+    assert d.import_layered(str(mov), "footage")["type"] == "footage"
+    with pytest.raises(ToolError, match="mode must be"):
+        d.import_layered(str(psd), "layers")
+    with pytest.raises(ToolError, match="file not found"):
+        d.import_layered(str(tmp_path / "gone.psd"))
+
+
+def test_find_missing_footage(ae, tmp_path):
+    card = tmp_path / "card"
+    card.mkdir()
+    for n in ("a.mov", "b.mov", "c.mov"):
+        (card / n).write_bytes(b"x")
+        d.import_file(str(card / n))
+    assert d.find_missing_footage() == {"missing": []}
+    assert "aemcp: missing_footage" not in ae.inspect("ae.undoLog")  # a lookup adds no undo step
+    for n in ("a.mov", "b.mov"):
+        (card / n).unlink()
+    (tmp_path / "backup" / "day1").mkdir(parents=True)
+    (tmp_path / "backup" / "day1" / "A.MOV").write_bytes(b"x")  # found by name, any case
+    assert [m["name"] for m in d.find_missing_footage()["missing"]] == ["a.mov", "b.mov"]
+    out = d.find_missing_footage(search=str(tmp_path / "backup"))
+    assert out["relinked"] == [{"id": 1, "name": "A.MOV", "missing": False}]
+    assert (out["still_missing"], out["files_searched"]) == (["b.mov"], 1)
+    with pytest.raises(ToolError, match="folder not found"):
+        d.find_missing_footage(search=str(tmp_path / "nowhere"))

@@ -17,6 +17,7 @@ const MaskMode = {NONE: 6812, ADD: 6813, SUBTRACT: 6814, INTERSECT: 6815, LIGHTE
 const BlendingMode = {NORMAL: 5212, DISSOLVE: 5213, DARKEN: 5214, MULTIPLY: 5215, COLOR_BURN: 5216, LINEAR_BURN: 5217,
     LIGHTEN: 5218, SCREEN: 5219, COLOR_DODGE: 5220, LINEAR_DODGE: 5221, ADD: 5222, OVERLAY: 5223, SOFT_LIGHT: 5224,
     HARD_LIGHT: 5225, DIFFERENCE: 5226, EXCLUSION: 5227, HUE: 5228, SATURATION: 5229, COLOR: 5230, LUMINOSITY: 5231};
+const ImportAsType = {COMP_CROPPED_LAYERS: 3812, FOOTAGE: 3813, COMP: 3814, PROJECT: 3815};
 const LightType = {PARALLEL: 4412, SPOT: 4413, POINT: 4414, AMBIENT: 4415};
 const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
 // PNG signature + an empty IEND chunk: export_frame waits for IEND.
@@ -161,13 +162,36 @@ function makeAE(CtxArray) {
         get numKeys() {
             return this.keys.length;
         }
-        valueAtTime(t) {
+        valueAtTime(t, preExpression) {
+            let v;
             if (!this.keys.length) {
-                return this.value;
+                v = this.value;
+            } else {
+                const before = this.keys.filter((k) => k.time <= t + 1e-9);
+                v = clone((before.length ? before[before.length - 1] : this.keys[0]).value);
             }
-            const before = this.keys.filter((k) => k.time <= t + 1e-9);
-            return clone((before.length ? before[before.length - 1] : this.keys[0]).value);
+            if (this.expressionEnabled && this.expression && preExpression === false) {
+                // the fake evaluates every expression as "value + time"
+                v = Array.isArray(v) ? arr(Array.prototype.map.call(v, (x) => x + t)) : v + t;
+            }
+            return v;
         }
+        setValuesAtTimes(times, values) {
+            if (times.length !== values.length) {
+                throw new Error("After Effects error: times and values differ in length");
+            }
+            for (let i = 0; i < times.length; i++) {
+                this.setValueAtTime(times[i], values[i]);
+            }
+        }
+        keyInInterpolationType(i) { return this.keys[i - 1].inType; }
+        keyOutInterpolationType(i) { return this.keys[i - 1].outType; }
+        _eases(i, side) {
+            const dims = (Array.isArray(this._value) && !this.isSpatial) ? this._value.length : 1;
+            return this.keys[i - 1][side] || arr(Array.from({length: dims}, () => new KeyframeEase(0, 16.67)));
+        }
+        keyInTemporalEase(i) { return this._eases(i, "inEase"); }
+        keyOutTemporalEase(i) { return this._eases(i, "outEase"); }
         addToMotionGraphicsTemplateAs(comp, name) {
             if (this.propertyValueType === PropertyValueType.NO_VALUE) {
                 return false;
@@ -399,6 +423,9 @@ function makeAE(CtxArray) {
             this.duration = opts.duration || 0;
             this.frameRate = opts.frameRate || 0;
             this.hasAudio = !!file && /\.(wav|mp3|aif|aiff|m4a|mov|mp4)$/i.test(file.fsName);
+        }
+        get footageMissing() {
+            return !!this.file && !fs.existsSync(this.file.fsName);
         }
         replace(file) {
             needUndo();
@@ -717,6 +744,22 @@ function makeAE(CtxArray) {
         get numLayers() {
             return this._layers.length;
         }
+        get frameDuration() {
+            return 1 / this.frameRate;
+        }
+        duplicate() {
+            needUndo();
+            const d = project.items.addComp(this.name + " 2", this.width, this.height, this.pixelAspect, this.duration,
+                this.frameRate);
+            d._layers = this._layers.map((l) => Object.assign(Object.create(Object.getPrototypeOf(l)), l,
+                {groups: l.groups.map((g) => g.copy()), containingComp: d}));
+            d._layers.forEach((l) => {
+                if (l._parent) {
+                    l._parent = d._layers[this._layers.indexOf(l._parent)];
+                }
+            });
+            return d;
+        }
         layer(i) {
             return this._layers[i - 1];
         }
@@ -755,6 +798,10 @@ function makeAE(CtxArray) {
         constructor(file) {
             this.file = file;
             this.sequence = false;
+            this.importAs = ImportAsType.FOOTAGE;
+        }
+        canImportAs(t) {
+            return t === ImportAsType.FOOTAGE || /\.(psd|ai)$/i.test(this.file.fsName);
         }
     }
 
@@ -822,6 +869,19 @@ function makeAE(CtxArray) {
         },
         importFile(opts) {
             const base = path.basename(opts.file.fsName);
+            if (opts.importAs === ImportAsType.COMP || opts.importAs === ImportAsType.COMP_CROPPED_LAYERS) {
+                // a layered file: a folder of layer footage and a comp holding them
+                const stem = base.replace(/\.\w+$/, "");
+                const folder = project.items.addFolder(stem + " Layers");
+                const comp = project.items.addComp(stem, 1920, 1080, 1, 5, 25);
+                ["Background", "Logo"].forEach((n) => {
+                    const layerItem = new FootageItem(n + "/" + base, opts.file, {duration: 0});
+                    layerItem.parentFolder = folder;
+                    project._items.push(layerItem);
+                    comp._layers.push(new AVLayer(comp, n, layerItem));
+                });
+                return comp;
+            }
             const name = opts.sequence ? base.replace(/\d+(\.\w+)$/, "[####]$1") : base;
             const it = new FootageItem(name, opts.file, {duration: opts.sequence ? 2 : 5, frameRate: 25});
             it.parentFolder = root;
@@ -913,7 +973,7 @@ function makeAE(CtxArray) {
         globals: {app, CompItem, FolderItem, FootageItem, SolidSource, TextLayer, ShapeLayer, CameraLayer, LightLayer,
             PropertyType, PropertyValueType, KeyframeInterpolationType, KeyframeEase, RQItemStatus,
             ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue,
-            LightType},
+            LightType, ImportAsType},
     };
 }
 
