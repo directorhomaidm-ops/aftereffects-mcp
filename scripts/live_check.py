@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aftereffects_mcp as d  # noqa: E402
 
 RESULTS = []
+WORK = [None]  # the work folder, for helpers that write frames
 
 
 def step(name, fn, *, needs=True, note=""):
@@ -110,6 +111,7 @@ def write_moving_square(folder, frames=31, w=640, h=360):
 
 def main():
     work = Path(tempfile.mkdtemp(prefix="aemcp_live_"))
+    WORK[0] = work
     print(f"Work folder (kept): {work}\n")
 
     print("Transport")
@@ -309,6 +311,22 @@ def main():
          note="the comp switches to the Advanced 3D renderer (ADBE Calder); a frame renders")
     step("depth_stack three layers + camera push", lambda: _stack(work), needs=have)
 
+
+    print("\nUnderstanding, organizing, layout, counters")
+    step("describe_comp aemcp check", lambda: _describe(), needs=have,
+         note="animated properties and expressions found by walking every layer")
+    step("find_layers: text layers with an expression", lambda: d.find_layers(type="text", expression=True),
+         needs=have)
+    step("rename_layers: captions to 'Sub {n}'", lambda: d.rename_layers(
+        pattern="Sub {n}", layers=["Caption 1", "Caption 2"], comp="aemcp check"), needs=have)
+    step("set_label: subtitles green", lambda: d.set_label(["Sub 1", "Sub 2"], "green", comp="aemcp check"),
+         needs=have, note="label index 9")
+    step("grid_layout: four shapes in a 2 x 2 grid", lambda: _grid(), needs=have,
+         note="sourceRectAtTime boxes; check frame_grid.png")
+    step("comp_from_footage: the swatch", lambda: d.comp_from_footage("swatch_v2.png", name="swatch comp"),
+         needs=have, note="a still: 5 s at 30 fps")
+    step("number_counter 0 to 1,250,000 with $ and commas", lambda: _counter(work), needs=have,
+         note="the Source Text expression must evaluate: check frame_counter.png")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -451,6 +469,31 @@ def _paragraph():
     out = d.text_style("Paragraph", tracking=40, leading=80, stroke_color=[0, 0, 0], stroke_width=3,
                        comp="aemcp check")
     expect(out["value"].get("strokeWidth") == 3, f"stroke not applied: {out}")
+    return out
+
+
+def _describe():
+    out = d.describe_comp("aemcp check")
+    animated = sum(len(l["animated"]) for l in out["layers"])
+    expressions = sum(len(l["expressions"]) for l in out["layers"])
+    expect(animated and expressions, f"nothing animated found: {out['layers'][:2]}")
+    return {"layers": len(out["layers"]), "animated": animated, "expressions": expressions}
+
+
+def _grid():
+    d.create_comp("grid check", 1080, 1080, 2, 30)
+    for i, color in enumerate(([1, 0.3, 0.3], [0.3, 1, 0.3], [0.3, 0.3, 1], [1, 1, 0.3])):
+        d.add_shape("rect", size=[300, 200], fill=color, layer_name=f"Tile {i + 1}", comp="grid check")
+    out = d.grid_layout([f"Tile {i}" for i in range(1, 5)], columns=2, comp="grid check")
+    d.export_frame(str(WORK[0] / "frame_grid.png"), time=0, comp="grid check")
+    return out
+
+
+def _counter(work):
+    d.create_comp("counter check", 1080, 1080, 3, 30)
+    out = d.number_counter(0, 1250000, duration=2, prefix="$", separator=",", name="Counter", comp="counter check")
+    expect(out["error"] is None, f"expression error: {out['error']}")
+    d.export_frame(str(work / "frame_counter.png"), time=1.5, comp="counter check")
     return out
 
 

@@ -77,6 +77,8 @@ const EFFECTS = [
     {displayName: "Glow", matchName: "ADBE Glo2", category: "Stylize",
         params: {"Glow Threshold": 60, "Glow Radius": 10, "Glow Intensity": 1}},
     {displayName: "Fill", matchName: "ADBE Fill", category: "Generate", params: {"Color": [1, 0, 0, 1]}},
+    {displayName: "Slider Control", matchName: "ADBE Slider Control", category: "Expression Controls",
+        params: {"Slider": 0}},
 ];
 
 function makeAE(CtxArray) {
@@ -541,6 +543,7 @@ function makeAE(CtxArray) {
             this.height = opts.height || 1080;
             this.duration = opts.duration || 0;
             this.frameRate = opts.frameRate || 0;
+            this.pixelAspect = 1;
             this.hasAudio = !!file && /\.(wav|mp3|aif|aiff|m4a|mov|mp4)$/i.test(file.fsName);
         }
         get footageMissing() {
@@ -573,7 +576,9 @@ function makeAE(CtxArray) {
             const w = comp.width, h = comp.height;
             this.groups = [
                 new PropertyGroup("Transform", "ADBE Transform Group", [
-                    new Property("Anchor Point", "ADBE Anchor Point", [w / 2, h / 2, 0], PropertyValueType.ThreeD_SPATIAL, true),
+                // footage and solids anchor at their source's center; text and shapes at their own 0, 0 (below)
+                    new Property("Anchor Point", "ADBE Anchor Point", source && source.width ?
+                        [source.width / 2, source.height / 2, 0] : [w / 2, h / 2, 0], PropertyValueType.ThreeD_SPATIAL, true),
                     new Property("Position", "ADBE Position", [w / 2, h / 2, 0], PropertyValueType.ThreeD_SPATIAL, true),
                     new Property("Scale", "ADBE Scale", [100, 100, 100], PropertyValueType.ThreeD),
                     new Property("X Rotation", "ADBE Rotate X", 0, PropertyValueType.OneD),
@@ -595,6 +600,7 @@ function makeAE(CtxArray) {
             this.selected = false;
             this.autoOrient = AutoOrientType.NO_AUTO_ORIENT;
             this.stretch = 100;
+            this.label = 0;
             Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
                 solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
         }
@@ -720,6 +726,7 @@ function makeAE(CtxArray) {
         constructor(comp, text) {
             super(comp, text);
             this.rect = {left: -150, top: -60, width: 300, height: 80};  // text grows up and right from its anchor
+            this.groups[0].children[0]._value = [0, 0, 0];
             this.groups.unshift(new PropertyGroup("Text", "ADBE Text Properties", [
                 new Property("Source Text", "ADBE Text Document", new TextDocument(text), PropertyValueType.TEXT_DOCUMENT),
                 textAnimators(),
@@ -732,6 +739,7 @@ function makeAE(CtxArray) {
     class ShapeLayer extends AVLayer {
         constructor(comp, name) {
             super(comp, name);
+            this.groups[0].children[0]._value = [0, 0, 0];
             this.groups.unshift(shapeRoot());
         }
         sourceRectAtTime() {
@@ -1058,7 +1066,9 @@ function makeAE(CtxArray) {
                 return comp;
             }
             const name = opts.sequence ? base.replace(/\d+(\.\w+)$/, "[####]$1") : base;
-            const it = new FootageItem(name, opts.file, {duration: opts.sequence ? 2 : 5, frameRate: 25});
+            const still = !opts.sequence && /\.(png|jpe?g|tiff?|psd)$/i.test(base);  // stills have no duration
+            const it = new FootageItem(name, opts.file, {duration: still ? 0 : (opts.sequence ? 2 : 5),
+                frameRate: still ? 0 : 25});
             it.parentFolder = root;
             project._items.push(it);
             return it;
