@@ -1220,7 +1220,7 @@ var aemcp = (function () {
                 put("ADBE Light Cone Feather 2", a.coneFeather, "coneFeather");
             }
             if (a.shadows !== undefined) {
-                put("ADBE Light Shadow Casting", a.shadows ? 1 : 0, "shadows");
+                put("ADBE Casts Shadows", a.shadows ? 1 : 0, "shadows");
             }
             return {light: l.name, set: set};
         },
@@ -1253,7 +1253,7 @@ var aemcp = (function () {
 
         audio_react: function (a) {
             var c = findComp(a.comp), src = findLayer(c, a.audio), target = findLayer(c, a.layer),
-                p = findProperty(target, a.property), cmd, i, amp, dims, parts = [], expr, before = c.numLayers;
+                p = findProperty(target, a.property), cmd, i, amp, dims, expr, before = c.numLayers;
             if (!src.hasAudio) {
                 fail(src.name + " has no audio");
             }
@@ -1273,15 +1273,9 @@ var aemcp = (function () {
             amp = c.layer(1);
             amp.name = a.name;
             dims = p.value instanceof Array ? p.value.length : 1;
-            expr = 'var a = thisComp.layer("' + amp.name + '").effect("Both Channels")("Slider") * ' + a.amount + ';\n';
-            if (dims === 1) {
-                expr += "value + a";
-            } else {
-                for (i = 0; i < dims; i++) {
-                    parts.push(i < 2 ? "value[" + i + "] + a" : "value[" + i + "]");
-                }
-                expr += "[" + parts.join(", ") + "]";
-            }
+            expr = "var a = thisComp.layer(" + quote(amp.name) + ').effect("Both Channels")("Slider") * ' + a.amount + ";\n";
+            // x and y move, the rest stays; in expressions a 2D layer's scale and position have 2 values, not 3
+            expr += dims === 1 ? "value + a" : "var v = value;\nv[0] += a;\nv[1] += a;\nv";
             p.expression = expr;
             p.expressionEnabled = true;
             return {amplitude: amp.name, target: target.name, property: p.name, expression: expr,
@@ -1507,7 +1501,9 @@ var aemcp = (function () {
         missing_footage: function () {
             var items = allItems(), out = [], i;
             for (i = 0; i < items.length; i++) {
-                if (items[i] instanceof FootageItem && items[i].footageMissing) {
+                // footageMissing can lag behind a file that was just moved: check the file too
+                if (items[i] instanceof FootageItem && (items[i].footageMissing ||
+                        (items[i].file && !items[i].file.exists))) {
                     out.push({id: items[i].id, name: items[i].name, file: items[i].file ? items[i].file.fsName : null});
                 }
             }

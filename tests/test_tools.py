@@ -866,7 +866,7 @@ def test_audio_react(ae, tmp_path):
     out = d.audio_react("song.wav", "Logo", "scale", amount=2, name="Beat")
     assert out["amplitude"] == "Beat" and out["error"] is None
     assert out["expression"] == ('var a = thisComp.layer("Beat").effect("Both Channels")("Slider") * 2;\n'
-                                 "[value[0] + a, value[1] + a, value[2]]")  # z scale untouched
+                                 "var v = value;\nv[0] += a;\nv[1] += a;\nv")  # x and y only, however many values
     assert [l["name"] for l in d.comp_info()["layers"]] == ["Beat", "Logo", "song.wav"]
     assert ae.inspect("ae.app.project.item(2).layer(3).selected") is True  # the command ran on the audio layer
     rot = d.audio_react("song.wav", "Logo", "rotation", amount=5, name="Beat 2")
@@ -1591,3 +1591,15 @@ def test_depth_stack(ae):
     for kwargs, msg in [({"layers": ["Tree"]}, "at least 2"), ({"spacing": 0}, "spacing")]:
         with pytest.raises(ToolError, match=msg):
             d.depth_stack(**{"layers": ["Tree", "Hills"], **kwargs})
+
+
+def test_script_that_did_not_run(monkeypatch):
+    # with a dialog open, DoScript prints "0" and writes no result file
+    monkeypatch.setattr(d, "RUNNER", lambda script, timeout: "0")
+    with pytest.raises(ToolError, match="close any open dialog"):
+        d.status()
+
+
+def test_find_missing_footage_nothing_missing(ae, tmp_path):
+    out = d.find_missing_footage(search=str(tmp_path))
+    assert out == {"missing": [], "relinked": [], "still_missing": [], "files_searched": 0}
