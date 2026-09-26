@@ -87,7 +87,21 @@ var aemcp = (function () {
             return out;
         }
         if (v.text !== undefined && v.fontSize !== undefined) {
-            return {text: v.text, font: v.font, fontSize: v.fontSize, fillColor: plain(v.fillColor)};
+            out = {text: v.text, font: v.font, fontSize: v.fontSize, fillColor: plain(v.fillColor)};
+            if (v.applyStroke) {
+                out.strokeColor = plain(v.strokeColor);
+                out.strokeWidth = v.strokeWidth;
+            }
+            if (v.tracking) {
+                out.tracking = v.tracking;
+            }
+            if (v.autoLeading === false) {
+                out.leading = v.leading;
+            }
+            if (v.allCaps) {
+                out.allCaps = true;
+            }
+            return out;
         }
         return String(v);
     }
@@ -219,6 +233,23 @@ var aemcp = (function () {
             doc.applyFill = true;
             doc.fillColor = v.fillColor;
         }
+        if (v.tracking !== undefined) {
+            doc.tracking = v.tracking;
+        }
+        if (v.leading !== undefined) {
+            doc.autoLeading = false;
+            doc.leading = v.leading;
+        }
+        if (v.strokeColor !== undefined) {
+            doc.applyStroke = true;
+            doc.strokeColor = v.strokeColor;
+        }
+        if (v.strokeWidth !== undefined) {
+            doc.strokeWidth = v.strokeWidth;
+        }
+        if (v.allCaps !== undefined) {
+            doc.allCaps = v.allCaps;
+        }
         if (v.justification !== undefined) {
             doc.justification = {left: ParagraphJustification.LEFT_JUSTIFY, center: ParagraphJustification.CENTER_JUSTIFY,
                 right: ParagraphJustification.RIGHT_JUSTIFY}[v.justification];
@@ -309,6 +340,16 @@ var aemcp = (function () {
             // ease_in slows into the key (incoming side), ease_out slows out of it (outgoing side)
             p.setTemporalEaseAtKey(idx, kind === "ease_out" ? low : eases, kind === "ease_in" ? low : eases);
         }
+    }
+
+    function contains(list, v) {
+        var i;
+        for (i = 0; i < list.length; i++) {
+            if (list[i] === v) {
+                return true;
+            }
+        }
+        return false;
     }
 
     function findItemOfType(ref, type, what) {
@@ -1483,6 +1524,143 @@ var aemcp = (function () {
             return done;
         },
 
+        trim_paths: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), root = l.property("ADBE Root Vectors Group"), trim,
+                prop, t0 = a.start !== undefined ? a.start : l.inPoint, kind = a.ease ? "ease" : "linear";
+            if (!root) {
+                fail(l.name + " is not a shape layer");
+            }
+            trim = root.addProperty("ADBE Vector Filter - Trim");
+            // draw on: the end runs 0 to 100; erase: the start runs 0 to 100
+            prop = trim.property(a.erase ? "ADBE Vector Trim Start" : "ADBE Vector Trim End");
+            keyAt(prop, t0, 0, kind);
+            keyAt(prop, t0 + a.duration, 100, kind);
+            if (a.offset) {
+                trim.property("ADBE Vector Trim Offset").setValue(a.offset);
+            }
+            return {layer: l.name, trim: trim.name, animated: prop.name, from: round(t0), to: round(t0 + a.duration)};
+        },
+
+        shape_repeater: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), root = l.property("ADBE Root Vectors Group"), rep, tr;
+            if (!root) {
+                fail(l.name + " is not a shape layer");
+            }
+            rep = root.addProperty("ADBE Vector Filter - Repeater");
+            rep.property("ADBE Vector Repeater Copies").setValue(a.copies);
+            tr = rep.property("ADBE Vector Repeater Transform");
+            tr.property("ADBE Vector Repeater Position").setValue(a.offset);
+            tr.property("ADBE Vector Repeater Scale").setValue([a.scale, a.scale]);
+            tr.property("ADBE Vector Repeater Rotation").setValue(a.rotation);
+            tr.property("ADBE Vector Repeater Opacity 2").setValue(a.endOpacity);
+            return {layer: l.name, repeater: rep.name, copies: a.copies};
+        },
+
+        add_paragraph: function (a) {
+            var c = findComp(a.comp), l = c.layers.addBoxText([a.box[0], a.box[1]], a.text);
+            if (a.name) {
+                l.name = a.name;
+            }
+            return layerInfo(l);
+        },
+
+        set_motion_blur: function (a) {
+            var c = findComp(a.comp), i, l, n = 0;
+            c.motionBlur = a.on;
+            if (a.shutterAngle !== undefined) {
+                c.shutterAngle = a.shutterAngle;
+            }
+            if (a.shutterPhase !== undefined) {
+                c.shutterPhase = a.shutterPhase;
+            }
+            if (a.layers !== undefined) {
+                for (i = 1; i <= c.numLayers; i++) {
+                    l = c.layer(i);
+                    if (l instanceof CameraLayer || l instanceof LightLayer) {
+                        continue;
+                    }
+                    if (a.layers === "all" || contains(a.layers, l.name) || contains(a.layers, l.index)) {
+                        l.motionBlur = a.on;
+                        n += 1;
+                    }
+                }
+            }
+            return {comp: c.name, motionBlur: c.motionBlur, shutterAngle: c.shutterAngle, shutterPhase: c.shutterPhase,
+                layers: n};
+        },
+
+        audio_source: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer);
+            if (!l.hasAudio || !l.source || !l.source.file) {
+                fail(l.name + " is not a layer with an audio file");
+            }
+            return {file: l.source.file.fsName, startTime: l.startTime, inPoint: l.inPoint, outPoint: l.outPoint};
+        },
+
+        add_markers: function (a) {
+            var c = findComp(a.comp), prop = c.markerProperty, i, mv;
+            for (i = 0; i < a.times.length; i++) {
+                mv = new MarkerValue(a.comment);
+                prop.setValueAtTime(a.times[i], mv);
+            }
+            return {comp: c.name, added: a.times.length, markers: prop.numKeys};
+        },
+
+        sequence_to_markers: function (a) {
+            var c = findComp(a.comp), prop = c.markerProperty, times = [], i, l, out = [], end;
+            for (i = 1; i <= prop.numKeys; i++) {
+                times.push(prop.keyTime(i));
+            }
+            if (times.length < a.layers.length) {
+                fail(c.name + " has " + times.length + " markers for " + a.layers.length + " layers");
+            }
+            for (i = 0; i < a.layers.length; i++) {
+                l = findLayer(c, a.layers[i]);
+                l.startTime += times[i] - l.inPoint;
+                if (a.trim && i + 1 < times.length && l.outPoint > times[i + 1]) {
+                    l.outPoint = times[i + 1];  // cut on the next beat
+                }
+                end = l.outPoint;
+                out.push({layer: l.name, inPoint: round(l.inPoint), outPoint: round(end)});
+            }
+            return {layers: out};
+        },
+
+        reduce_project: function (a) {
+            var keep = [], i, before = app.project.numItems, removed;
+            for (i = 0; i < a.comps.length; i++) {
+                keep.push(findComp(a.comps[i]));
+            }
+            removed = app.project.reduceProject(keep);
+            return {kept: a.comps, removed: removed, items: [before, app.project.numItems]};
+        },
+
+        render_queue_list: function () {
+            var rq = app.project.renderQueue, out = [], i, it, om;
+            for (i = 1; i <= rq.numItems; i++) {
+                it = rq.item(i);
+                om = it.outputModule(1);
+                out.push({index: i, comp: it.comp.name, status: statusName(it.status),
+                    output: om && om.file ? om.file.fsName : null});
+            }
+            return out;
+        },
+
+        clear_render_queue: function (a) {
+            var rq = app.project.renderQueue, i, it, removed = [];
+            for (i = rq.numItems; i >= 1; i--) {
+                it = rq.item(i);
+                if (it.status === RQItemStatus.RENDERING) {
+                    continue;
+                }
+                if (a.all || it.status === RQItemStatus.DONE) {
+                    removed.push(it.comp.name);
+                    it.remove();
+                }
+            }
+            return {removed: removed.length, left: rq.numItems};
+        },
+
         motion_path: function (a) {
             var l = findLayer(findComp(a.comp), a.layer), p = transform(l, "ADBE Position"), i, idx, n = a.points.length,
                 pt, z, flat, end;
@@ -1796,7 +1974,7 @@ var aemcp = (function () {
     };
 
     var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1,
-        missing_footage: 1};
+        missing_footage: 1, audio_source: 1, render_queue_list: 1};
 
     function run(name, args) {
         var result, cmd = commands[name];

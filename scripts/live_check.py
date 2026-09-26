@@ -276,6 +276,21 @@ def main():
     step("trim_comp to its layers", lambda: d.trim_comp(comp="variants source"), needs=have)
     step("find_missing_footage after deleting a file, then relink", lambda: _missing(work), needs=have)
 
+    print("\nShape animation, typography, rhythm, render queue")
+    step("trim_paths: draw a stroked ring on over 1 s", lambda: _ring(), needs=have,
+         note="Trim Paths match names on the shape root")
+    step("shape_repeater: 6 dots, 80 px apart, fading", lambda: _dots(), needs=have,
+         note="Repeater match names and its transform group")
+    step("add_paragraph (Arabic, 700x300 box) + text_style", lambda: _paragraph(), needs=have,
+         note="addBoxText, tracking, leading, stroke, allCaps on TextDocument")
+    step("set_motion_blur on, shutter 270", lambda: d.set_motion_blur(shutter_angle=270, comp="aemcp check"),
+         needs=have)
+    step("markers_from_audio on the beat WAV (clicks every 0.5 s: expect about 120 bpm)", lambda: d.markers_from_audio(
+        "beat.wav", comp="aemcp check"), needs=have)
+    step("sequence_to_markers: the two captions on the first beats", lambda: d.sequence_to_markers(
+        ["Caption 1", "Caption 2"], comp="aemcp check"), needs=have)
+    step("render_queue_list + clear finished items", lambda: (d.render_queue_list(), d.clear_render_queue())[1],
+         needs=have, note="RQItemStatus names and RenderQueueItem.remove")
     print("\nMotion, tracking, 3D")
     step("motion_path: curved, even speed, auto-orient", lambda: _path(), needs=have,
          note="spatial auto Bezier, roving inner keys, AutoOrientType.ALONG_PATH")
@@ -297,6 +312,8 @@ def main():
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
+    step("reduce_project to the check comp (last: it deletes items)", lambda: d.reduce_project(["aemcp check"]),
+         needs=have, note="Project.reduceProject; the project was saved just before")
     step("run_jsx", lambda: d.run_jsx("[app.project.numItems, app.version]"))
     step("list_items", d.list_items)
     return write_report(info, work)
@@ -414,6 +431,26 @@ def _missing(work):
     gone.rename(moved / "to_move.png")
     out = d.find_missing_footage(search=str(moved))
     expect(out["relinked"] and not out["still_missing"], f"relink failed: {out}")
+    return out
+
+
+def _ring():
+    d.add_shape("ellipse", size=[400, 400], stroke=[1, 1, 1], stroke_width=12, layer_name="Ring",
+                comp="aemcp check")
+    return d.trim_paths("Ring", duration=1, start=0, comp="aemcp check")
+
+
+def _dots():
+    d.add_shape("ellipse", size=[30, 30], fill=[1, 0.5, 0], layer_name="Dots", comp="aemcp check")
+    return d.shape_repeater("Dots", copies=6, offset=[80, 0], end_opacity=10, comp="aemcp check")
+
+
+def _paragraph():
+    d.add_paragraph("نص طويل يلتف داخل صندوق الفقرة في أفتر إفكتس", box=[700, 300], name="Paragraph",
+                    comp="aemcp check")
+    out = d.text_style("Paragraph", tracking=40, leading=80, stroke_color=[0, 0, 0], stroke_width=3,
+                       comp="aemcp check")
+    expect(out["value"].get("strokeWidth") == 3, f"stroke not applied: {out}")
     return out
 
 

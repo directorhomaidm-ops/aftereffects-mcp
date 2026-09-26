@@ -86,6 +86,16 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `make_variants` | `rows: [{name, texts: {layer: text}}]`, `comp`, `output_dir`, `template` | `{from, variants: [{comp, id, queued}]}` |
 | `import_layered` | `path` (.psd, .ai), `mode` (comp_cropped, comp, footage) | `{id, name, type, layers}` |
 | `find_missing_footage` | `search` (folder), `max_files = 200000` | `{missing, relinked, still_missing, files_searched}` |
+| `trim_paths` | `layer`, `duration = 1`, `start`, `erase = False`, `offset`, `ease = True`, `comp` | `{layer, trim, animated, from, to}` |
+| `shape_repeater` | `layer`, `copies = 5`, `offset = [100, 0]`, `scale = 100`, `rotation`, `end_opacity = 100`, `comp` | `{layer, repeater, copies}` |
+| `text_style` | `layer`, `tracking`, `leading`, `stroke_color`, `stroke_width`, `all_caps`, `comp` | `{property, value}` |
+| `add_paragraph` | `text`, `box = [800, 400]`, `name`, `comp` | layer info |
+| `set_motion_blur` | `on = True`, `layers = "all"` (or a list, or None), `shutter_angle`, `shutter_phase`, `comp` | `{comp, motionBlur, shutterAngle, shutterPhase, layers}` |
+| `markers_from_audio` | `layer` (WAV audio), `sensitivity = 1.5`, `min_gap = 0.25`, `max_markers = 300`, `comment = "beat"`, `comp` | `{comp, added, markers, bpm_estimate, first}` |
+| `sequence_to_markers` | `layers`, `trim = True`, `comp` | `{layers: [{layer, inPoint, outPoint}]}` |
+| `reduce_project` | `comps` | `{kept, removed, items: [before, after]}` |
+| `render_queue_list` | — | `[{index, comp, status, output}]` |
+| `clear_render_queue` | `all_items = False` | `{removed, left}` |
 | `motion_path` | `layer`, `points: [[x, y(, z)], ...]`, `duration = 2`, `start = 0`, `times`, `smooth = True`, `ease = True`, `constant_speed = False`, `auto_orient = False`, `comp` | `{layer, keys, from, to, smooth, constantSpeed, autoOrient}` |
 | `bezier_ease` | `layer`, `property`, `curve` (a named easing or `[x1, y1, x2, y2]`), `keys: [first, last]`, `comp` | `{property, segments, keys, curve}` |
 | `track_point` | `layer`, `point: [x, y]` (layer pixels), `start`, `end`, `feature = 31`, `search = 40`, `tracker = "aemcp track"`, `name = "Track Point 1"`, `comp` | `{layer, tracker, point, keys, from, to, start, end, min_confidence, lost_frames, first_lost}` |
@@ -121,6 +131,9 @@ Notes:
 - `copy_keyframes` keeps each key's interpolation and easing; its offset cascades (target 1: offset, target 2: 2 x offset...).
 - `make_variants` duplicates the template comp per row and replaces the named text layers' text; with `output_dir` each copy is queued with its name as the file name. Render them with `render` or `render_background`.
 - `find_missing_footage(search=...)` matches missing files by name (any case) under a folder and relinks them with `FootageItem.replace`.
+- `trim_paths` and `shape_repeater` add the operator at the top of the shape layer's contents, so they act on every group in it.
+- `markers_from_audio` reads the layer's WAV file here (sharp rises in loudness in 10 ms steps), keeps the beats inside the layer's trim and converts them to comp time; `sequence_to_markers` then lays layers on those markers and, with `trim`, cuts each at the next one.
+- `reduce_project` is After Effects' File > Dependencies > Reduce Project: everything the named comps do not use is removed.
 - `motion_path` replaces the position keyframes. Inner points keep their speed (continuous Bezier); with `constant_speed` they rove, so After Effects spreads their timing for an even speed. `auto_orient` sets Auto-Orient Along Path.
 - `bezier_ease` turns a CSS `cubic-bezier(x1, y1, x2, y2)` into temporal ease on every segment: the outgoing handle gets influence `x1` and speed `y1 / x1` x the segment's average speed, the incoming one influence `1 - x2` and speed `(1 - y2) / (1 - x2)` x average (signed per dimension; spatial properties use the speed along the path). The live check samples the result against the curve. Named curves: `ease`, `ease_in`, `ease_out`, `ease_in_out` (CSS) and `ease_in` / `ease_out` / `ease_in_out` + `_sine`, `_quad`, `_cubic`, `_quart`, `_quint`, `_expo`, `_circ`, `_back` (easings.net). Overshoot (`_back`) does not work on position: spatial motion stays on its path.
 - `track_point` does its own tracking, since After Effects' Tracker analysis cannot be scripted: each frame it renders a window of the layer's source around where the feature should be (a temporary comp, removed afterwards), and matches the first frame's feature there (normalized cross-correlation, coarse to fine, sub-pixel). It follows position only, with a fixed template: a feature that turns or grows a lot is lost (low confidence). The result is written as a regular tracker on the layer, editable in the Tracker panel. About 0.2 s a frame; time-remapped layers need precomposing first.

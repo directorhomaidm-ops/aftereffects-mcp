@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import subprocess
@@ -23,6 +24,9 @@ def test_all_tools_registered():
         "create_folder", "move_items", "clean_project", "camera_move", "set_light", "audio_fade", "audio_react",
         "captions_from_srt", "render_background", "render_background_status", "mogrt_add_property", "export_mogrt",
         "bake_expression", "ease_keyframes", "copy_keyframes", "stagger_layers", "split_layer", "trim_comp",
+        "make_variants", "import_layered", "find_missing_footage", "trim_paths", "shape_repeater", "text_style",
+        "add_paragraph", "set_motion_blur", "markers_from_audio", "sequence_to_markers", "reduce_project",
+        "render_queue_list", "clear_render_queue",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -1158,6 +1162,167 @@ def test_find_missing_footage(ae, tmp_path):
     assert (out["still_missing"], out["files_searched"]) == (["b.mov"], 1)
     with pytest.raises(ToolError, match="folder not found"):
         d.find_missing_footage(search=str(tmp_path / "nowhere"))
+
+
+
+# --- shape animation, text, rhythm, project ---
+
+SHAPE_ROOT = "ae.app.project.item(1).layer(1).groups[0]"
+
+
+def test_trim_paths(ae):
+    d.create_comp("Main", duration=5)
+    d.add_shape("ellipse", stroke=[1, 1, 1], layer_name="Ring")
+    d.set_layer("Ring", in_point=1)
+    out = d.trim_paths("Ring", duration=2, offset=90)
+    assert out == {"layer": "Ring", "trim": "Trim Paths 1", "animated": "End", "from": 1, "to": 3}
+    trim = f"{SHAPE_ROOT}.children.find(c => c.matchName === 'ADBE Vector Filter - Trim')"
+    assert ae.inspect(f"{trim}.children[1].keys.map(k => [k.time, k.value, k.outType])") == [[1, 0, 6613],
+                                                                                            [3, 100, 6613]]
+    assert ae.inspect(f"{trim}.children[2]._value") == 90
+    erase = d.trim_paths("Ring", duration=1, start=4, erase=True, ease=False)
+    assert erase["animated"] == "Start"
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a shape layer"):
+        d.trim_paths("Rig")
+    with pytest.raises(ToolError, match="duration"):
+        d.trim_paths("Ring", duration=0)
+
+
+def test_shape_repeater(ae):
+    d.create_comp("Main")
+    d.add_shape("rect", size=[40, 40], layer_name="Dots")
+    out = d.shape_repeater("Dots", copies=8, offset=[60, 0], scale=90, rotation=15, end_opacity=0)
+    assert out == {"layer": "Dots", "repeater": "Repeater 1", "copies": 8}
+    rep = f"{SHAPE_ROOT}.children.find(c => c.matchName === 'ADBE Vector Filter - Repeater')"
+    assert ae.inspect(f"[{rep}.children[0]._value, {rep}.children[2].children.map(p => p._value)]") == \
+        [8, [[60, 0], [90, 90], 15, 100, 0]]
+    for kwargs, msg in [({"copies": 0}, "copies"), ({"offset": [1]}, "offset"), ({"end_opacity": 150}, "end_opacity")]:
+        with pytest.raises(ToolError, match=msg):
+            d.shape_repeater("Dots", **kwargs)
+
+
+def test_text_style_and_paragraph(ae):
+    d.create_comp("Main")
+    out = d.add_paragraph("سطر طويل يلتف داخل الصندوق", box=[600, 300], name="Body")
+    assert (out["name"], out["type"]) == ("Body", "text")
+    assert ae.inspect("ae.app.project.item(1).layer(1).groups[0].children[0]._value.boxTextSize") == [600, 300]
+    styled = d.text_style("Body", tracking=50, leading=90, stroke_color=[0, 0, 0], stroke_width=4, all_caps=True)
+    assert styled["value"] == {"text": "سطر طويل يلتف داخل الصندوق", "font": "ArialMT", "fontSize": 72,
+                               "fillColor": [1, 1, 1], "strokeColor": [0, 0, 0], "strokeWidth": 4, "tracking": 50,
+                               "leading": 90, "allCaps": True}
+    assert ae.inspect("ae.app.project.item(1).layer(1).groups[0].children[0]._value.autoLeading") is False
+    for kwargs, msg in [({}, "nothing to change"), ({"stroke_width": -1}, "stroke_width"), ({"leading": 0}, "leading")]:
+        with pytest.raises(ToolError, match=msg):
+            d.text_style("Body", **kwargs)
+    with pytest.raises(ToolError, match="box"):
+        d.add_paragraph("x", box=[0, 10])
+
+
+def test_set_motion_blur(ae):
+    d.create_comp("Main")
+    for n in ("A", "B"):
+        d.add_layer("null", name=n)
+    d.add_layer("camera")
+    out = d.set_motion_blur(shutter_angle=270, shutter_phase=-135)
+    assert out == {"comp": "Main", "motionBlur": True, "shutterAngle": 270, "shutterPhase": -135, "layers": 2}
+    assert d.set_motion_blur(False, layers=["A"])["layers"] == 1
+    assert ae.inspect("ae.app.project.item(1)._layers.map(l => l.motionBlur)") == [False, True, False]
+    assert d.set_motion_blur(layers=None)["layers"] == 0
+    for kwargs, msg in [({"shutter_angle": 800}, "shutter_angle"), ({"shutter_phase": 400}, "shutter_phase"),
+                        ({"layers": "some"}, "layers must be")]:
+        with pytest.raises(ToolError, match=msg):
+            d.set_motion_blur(**kwargs)
+
+
+def _clicks(path, times, seconds=4.0, rate=44100):
+    import wave as _wave
+    frames = bytearray()
+    for i in range(int(seconds * rate)):
+        t = i / rate
+        v = 0.02 * math.sin(2 * math.pi * 100 * t)
+        for c in times:
+            if 0 <= t - c < 0.05:
+                v += 0.9 * math.exp(-(t - c) * 60) * math.sin(2 * math.pi * 1000 * (t - c))
+        frames += int(max(-1, min(1, v)) * 32767).to_bytes(2, "little", signed=True)
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def test_markers_from_audio_and_sequence(ae, tmp_path):
+    wav = tmp_path / "beat.wav"
+    _clicks(wav, [0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+    d.import_file(str(wav))
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item="beat.wav")
+    d.set_layer("beat.wav", start_time=1, in_point=1.8, out_point=4.2)  # plays 0.8-3.2 of the file
+    out = d.markers_from_audio("beat.wav")
+    got = ae.inspect("ae.app.project.item(2).markerProperty.keys.map(k => k.time)")
+    assert got == pytest.approx([2.0, 2.5, 3.0, 3.5, 4.0], abs=0.006)  # beats inside the trim, in comp time
+    assert out["added"] == 5 and out["bpm_estimate"] == pytest.approx(120, abs=3)
+    assert ae.inspect("ae.app.project.item(2).markerProperty.keys[0].value.comment") == "beat"
+    for n in ("A", "B", "C"):
+        d.add_layer("null", name=n)
+    d.set_layer("B", in_point=0.7)  # trimmed: placed by its in point, not its start
+    seq = d.sequence_to_markers(["A", "B", "C"])
+    assert [(r["layer"], r["inPoint"]) for r in seq["layers"]] == [("A", pytest.approx(2.0, abs=0.03)),
+                                                                   ("B", pytest.approx(2.5, abs=0.03)),
+                                                                   ("C", pytest.approx(3.0, abs=0.03))]
+    assert seq["layers"][0]["outPoint"] == pytest.approx(2.5, abs=0.03)  # cut on the next beat
+    with pytest.raises(ToolError, match="5 markers for 6 layers"):
+        d.sequence_to_markers(["A", "B", "C", "A", "B", "C"])
+    with pytest.raises(ToolError, match="no beats found"):
+        d.markers_from_audio("beat.wav", sensitivity=1000)
+    # beats 0.5 s apart with min_gap 0.6: every other one
+    assert d._onsets(str(wav), 1.5, 0.6) == pytest.approx([0.5, 1.5, 2.5], abs=0.006)
+
+
+def test_markers_from_audio_needs_wav(ae, tmp_path):
+    mp3 = tmp_path / "song.mp3"
+    mp3.write_bytes(b"ID3 not a wav")
+    d.import_file(str(mp3))
+    d.create_comp("Main")
+    d.add_layer("item", item="song.mp3")
+    with pytest.raises(ToolError, match="not a PCM WAV"):
+        d.markers_from_audio("song.mp3")
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="not a layer with an audio file"):
+        d.markers_from_audio("Rig")
+
+
+def test_reduce_project(ae, tmp_path):
+    for n in ("used.mov", "spare.mov"):
+        (tmp_path / n).write_bytes(b"x")
+        d.import_file(str(tmp_path / n))
+    d.create_comp("Inner")
+    d.add_layer("item", item="used.mov")
+    d.create_comp("Final")
+    d.add_layer("item", item="Inner")
+    d.create_comp("Old draft")
+    out = d.reduce_project(["Final"])
+    assert (out["removed"], out["items"]) == (2, [5, 3])
+    assert sorted(r["name"] for r in d.list_items()) == ["Final", "Inner", "used.mov"]  # precomps and footage stay
+    with pytest.raises(ToolError, match="name the comps"):
+        d.reduce_project([])
+
+
+def test_render_queue_list_and_clear(ae, tmp_path):
+    d.create_comp("A")
+    d.create_comp("B")
+    d.add_to_render_queue(str(tmp_path / "a"), comp="A")
+    d.render()
+    d.add_to_render_queue(str(tmp_path / "b"), comp="B")
+    assert d.render_queue_list() == [{"index": 1, "comp": "A", "status": "done", "output": str(tmp_path / "a")},
+                                     {"index": 2, "comp": "B", "status": "queued", "output": str(tmp_path / "b")}]
+    assert d.clear_render_queue() == {"removed": 1, "left": 1}
+    ae.inspect("(ae.app.project.renderQueue._items[0].status = 3016, 1)")  # rendering right now
+    assert d.clear_render_queue(all_items=True) == {"removed": 0, "left": 1}
+    ae.inspect("(ae.app.project.renderQueue._items[0].status = 3015, 1)")
+    assert d.clear_render_queue(all_items=True) == {"removed": 1, "left": 0}
+    assert "aemcp: render_queue_list" not in ae.inspect("ae.undoLog")
 
 
 # --- motion ---
