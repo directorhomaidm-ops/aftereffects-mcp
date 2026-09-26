@@ -789,7 +789,7 @@ function makeAE(CtxArray) {
                     new Property("Cone Feather", "ADBE Light Cone Feather 2", 50, PropertyValueType.OneD));
             }
             if (this._type !== LightType.AMBIENT) {
-                opts.push(new Property("Casts Shadows", "ADBE Light Shadow Casting", 0, PropertyValueType.OneD));
+                opts.push(new Property("Casts Shadows", "ADBE Casts Shadows", 0, PropertyValueType.OneD));
             }
             this.groups = this.groups.filter((g) => g.matchName !== "ADBE Light Options Group");
             this.groups.push(new PropertyGroup("Light Options", "ADBE Light Options Group", opts));
