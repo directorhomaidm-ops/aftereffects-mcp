@@ -431,6 +431,55 @@ var aemcp = (function () {
         fail(l.name + " has no size to measure (cameras, lights and nulls)");
     }
 
+    function bounds(l) {
+        // the layer's box in comp pixels from its content, anchor, position and scale; rotation and parents are
+        // refused, since the box would not be a plain rectangle in comp space
+        var r = contentRect(l), a = transform(l, "ADBE Anchor Point").value, p = transform(l, "ADBE Position"),
+            s = transform(l, "ADBE Scale").value, pv = p.value, x0, y0;
+        if (l.parent) {
+            fail(l.name + " is parented: unparent it, or lay out its parent");
+        }
+        if (transform(l, "ADBE Rotate Z").value !== 0) {
+            fail(l.name + " is rotated: layout works on unrotated layers");
+        }
+        if (p.numKeys) {
+            fail(l.name + "'s position is animated: layout sets a static position");
+        }
+        x0 = pv[0] + (r.left - a[0]) * s[0] / 100;
+        y0 = pv[1] + (r.top - a[1]) * s[1] / 100;
+        return {left: x0, top: y0, right: x0 + r.width * s[0] / 100, bottom: y0 + r.height * s[1] / 100};
+    }
+
+    function nudge(l, dx, dy) {
+        var p = transform(l, "ADBE Position"), v = p.value;
+        v[0] += dx;
+        v[1] += dy;
+        p.setValue(v);
+    }
+
+    function describe(group, path, out, depth) {
+        var i, q, name;
+        for (i = 1; i <= group.numProperties; i++) {
+            q = group.property(i);
+            name = path ? path + " > " + q.name : q.name;
+            if (q.propertyType === PropertyType.PROPERTY) {
+                if (q.numKeys > 0) {
+                    out.animated.push({property: name, keys: q.numKeys, from: round(q.keyTime(1)),
+                        to: round(q.keyTime(q.numKeys))});
+                }
+                if (q.canSetExpression && q.expressionEnabled && q.expression) {
+                    out.expressions.push({property: name, expression: q.expression.length > 160 ?
+                        q.expression.substring(0, 160) + "..." : q.expression});
+                }
+            } else if (depth < 8) {
+                describe(q, name, out, depth + 1);
+            }
+        }
+    }
+
+    var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
+        "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
+
     // text reveal presets: [animator property match name, value that hides a character]
     var TEXT_PRESETS = {
         fade_in: [["ADBE Text Opacity", 0]],
@@ -1968,13 +2017,247 @@ var aemcp = (function () {
             return {camera: cam.name, layers: out};
         },
 
+        describe_comp: function (a) {
+            var c = findComp(a.comp), layers = [], i, l, row, masks;
+            for (i = 1; i <= c.numLayers; i++) {
+                l = c.layer(i);
+                row = layerInfo(l);
+                row.animated = [];
+                row.expressions = [];
+                describe(l, "", row, 0);
+                masks = l.property("ADBE Mask Parade");
+                row.masks = masks ? masks.numProperties : 0;
+                row.label = LABELS[l.label] || l.label;
+                if (l.threeDLayer) {
+                    row.threeD = true;
+                }
+                layers.push(row);
+            }
+            return {comp: c.name, width: c.width, height: c.height, duration: round(c.duration),
+                frameRate: round(c.frameRate), layers: layers};
+        },
+
+        find_layers: function (a) {
+            var items = allItems(), out = [], i, j, c, l, row, fx, k, names, info;
+            for (i = 0; i < items.length; i++) {
+                c = items[i];
+                if (!(c instanceof CompItem) || (a.comp !== undefined && c.name !== a.comp && c.id !== a.comp)) {
+                    continue;
+                }
+                for (j = 1; j <= c.numLayers; j++) {
+                    l = c.layer(j);
+                    if (a.name && l.name.toLowerCase().indexOf(a.name.toLowerCase()) < 0) {
+                        continue;
+                    }
+                    if (a.type && layerType(l) !== a.type) {
+                        continue;
+                    }
+                    if (a.effect) {
+                        fx = l.property("ADBE Effect Parade");
+                        names = "";
+                        for (k = 1; fx && k <= fx.numProperties; k++) {
+                            names += "|" + fx.property(k).name + "|" + fx.property(k).matchName;
+                        }
+                        if (names.toLowerCase().indexOf(a.effect.toLowerCase()) < 0) {
+                            continue;
+                        }
+                    }
+                    if (a.animated !== undefined || a.expression !== undefined) {
+                        info = {animated: [], expressions: []};
+                        describe(l, "", info, 0);
+                        if (a.animated !== undefined && (info.animated.length > 0) !== a.animated) {
+                            continue;
+                        }
+                        if (a.expression !== undefined && (info.expressions.length > 0) !== a.expression) {
+                            continue;
+                        }
+                    }
+                    row = {comp: c.name, index: l.index, name: l.name, type: layerType(l)};
+                    out.push(row);
+                }
+            }
+            return out;
+        },
+
+        rename_layers: function (a) {
+            var c = findComp(a.comp), i, l, n = 0, out = [], before, targets = [];
+            if (a.layers) {
+                for (i = 0; i < a.layers.length; i++) {
+                    targets.push(findLayer(c, a.layers[i]));
+                }
+            } else {
+                for (i = 1; i <= c.numLayers; i++) {
+                    targets.push(c.layer(i));
+                }
+            }
+            for (i = 0; i < targets.length; i++) {
+                l = targets[i];
+                before = l.name;
+                if (a.pattern) {
+                    n += 1;
+                    l.name = a.pattern.split("{name}").join(before).split("{n}").join(String(a.startAt + n - 1));
+                } else {
+                    l.name = before.replace(new RegExp(a.find, a.ignoreCase ? "gi" : "g"), a.replace);
+                }
+                if (l.name !== before) {
+                    out.push([before, l.name]);
+                }
+            }
+            return {comp: c.name, renamed: out};
+        },
+
+        set_label: function (a) {
+            var c = findComp(a.comp), i, idx = -1, names = [];
+            for (i = 0; i < LABELS.length; i++) {
+                if (LABELS[i] === a.color) {
+                    idx = i;
+                }
+            }
+            if (idx < 0) {
+                fail("unknown label color: " + a.color);
+            }
+            for (i = 0; i < a.layers.length; i++) {
+                findLayer(c, a.layers[i]).label = idx;
+                names.push(findLayer(c, a.layers[i]).name);
+            }
+            return {label: a.color, layers: names};
+        },
+
+        align_layers: function (a) {
+            var c = findComp(a.comp), layers = [], boxes = [], i, b, target, out = [], dx, dy;
+            for (i = 0; i < a.layers.length; i++) {
+                layers.push(findLayer(c, a.layers[i]));
+                boxes.push(bounds(layers[i]));
+            }
+            if (a.to === "comp") {
+                target = {left: 0, top: 0, right: c.width, bottom: c.height};
+            } else {
+                target = {left: boxes[0].left, top: boxes[0].top, right: boxes[0].right, bottom: boxes[0].bottom};
+                for (i = 1; i < boxes.length; i++) {
+                    target.left = Math.min(target.left, boxes[i].left);
+                    target.top = Math.min(target.top, boxes[i].top);
+                    target.right = Math.max(target.right, boxes[i].right);
+                    target.bottom = Math.max(target.bottom, boxes[i].bottom);
+                }
+            }
+            for (i = 0; i < layers.length; i++) {
+                b = boxes[i];
+                dx = 0;
+                dy = 0;
+                if (a.align === "left") {
+                    dx = target.left - b.left;
+                } else if (a.align === "right") {
+                    dx = target.right - b.right;
+                } else if (a.align === "center") {
+                    dx = (target.left + target.right) / 2 - (b.left + b.right) / 2;
+                } else if (a.align === "top") {
+                    dy = target.top - b.top;
+                } else if (a.align === "bottom") {
+                    dy = target.bottom - b.bottom;
+                } else {
+                    dy = (target.top + target.bottom) / 2 - (b.top + b.bottom) / 2;
+                }
+                nudge(layers[i], dx, dy);
+                out.push({layer: layers[i].name, moved: [round(dx, 2), round(dy, 2)]});
+            }
+            return {align: a.align, to: a.to, layers: out};
+        },
+
+        distribute_layers: function (a) {
+            var c = findComp(a.comp), rows = [], i, j, tmp, first, last, step, out = [], k = a.axis === "x" ? 0 : 1, b, ctr;
+            for (i = 0; i < a.layers.length; i++) {
+                b = bounds(findLayer(c, a.layers[i]));
+                rows.push({layer: findLayer(c, a.layers[i]), center: k === 0 ? (b.left + b.right) / 2 : (b.top + b.bottom) / 2});
+            }
+            for (i = 1; i < rows.length; i++) {  // insertion sort by center: ES3 has sort, but keep it stable
+                tmp = rows[i];
+                for (j = i - 1; j >= 0 && rows[j].center > tmp.center; j--) {
+                    rows[j + 1] = rows[j];
+                }
+                rows[j + 1] = tmp;
+            }
+            first = rows[0].center;
+            last = rows[rows.length - 1].center;
+            step = (last - first) / (rows.length - 1);
+            for (i = 0; i < rows.length; i++) {
+                ctr = first + step * i;
+                nudge(rows[i].layer, k === 0 ? ctr - rows[i].center : 0, k === 1 ? ctr - rows[i].center : 0);
+                out.push({layer: rows[i].layer.name, center: round(ctr, 2)});
+            }
+            return {axis: a.axis, layers: out};
+        },
+
+        grid_layout: function (a) {
+            var c = findComp(a.comp), n = a.layers.length, cols = a.columns, rows = Math.ceil(n / cols),
+                cw = (c.width - 2 * a.margin - (cols - 1) * a.gap) / cols,
+                ch = (c.height - 2 * a.margin - (rows - 1) * a.gap) / rows, i, l, b, f, sc, cx, cy, out = [];
+            if (cw <= 0 || ch <= 0) {
+                fail("no room: the margin and gaps leave no space for " + rows + " x " + cols + " cells");
+            }
+            for (i = 0; i < n; i++) {
+                l = findLayer(c, a.layers[i]);
+                if (a.fit) {
+                    b = bounds(l);
+                    f = Math.min(cw / (b.right - b.left), ch / (b.bottom - b.top));
+                    sc = transform(l, "ADBE Scale");
+                    sc.setValue([sc.value[0] * f, sc.value[1] * f]);
+                }
+                b = bounds(l);
+                cx = a.margin + (i % cols) * (cw + a.gap) + cw / 2;
+                cy = a.margin + Math.floor(i / cols) * (ch + a.gap) + ch / 2;
+                nudge(l, cx - (b.left + b.right) / 2, cy - (b.top + b.bottom) / 2);
+                out.push({layer: l.name, cell: [Math.floor(i / cols) + 1, i % cols + 1], center: [round(cx, 2), round(cy, 2)]});
+            }
+            return {rows: rows, columns: cols, cell: [round(cw, 2), round(ch, 2)], layers: out};
+        },
+
+        comp_from_footage: function (a) {
+            var it = findItemOfType(a.item, FootageItem, "footage"), still = !it.duration, c,
+                name = a.name || it.name.replace(/\.[^.]*$/, "");
+            if (!it.width || !it.height) {
+                fail(it.name + " has no picture (audio only)");
+            }
+            c = app.project.items.addComp(name, it.width, it.height, it.pixelAspect || 1,
+                still ? a.stillDuration : it.duration, it.frameRate || a.frameRate);
+            c.layers.add(it);
+            c.openInViewer();
+            return compInfo(c);
+        },
+
+        number_counter: function (a) {
+            var c = findComp(a.comp), l, fx, slider, expr, text;
+            l = a.layer !== undefined ? findLayer(c, a.layer) : c.layers.addText(a.prefix + a.from + a.suffix);
+            text = l.property("ADBE Text Properties");
+            if (!text) {
+                fail(l.name + " is not a text layer");
+            }
+            if (a.layer === undefined && a.name) {
+                l.name = a.name;
+            }
+            fx = l.property("ADBE Effect Parade").addProperty("ADBE Slider Control");
+            fx.name = "Counter";
+            slider = fx.property(1);
+            keyAt(slider, a.start, a.from, a.ease ? "ease" : "linear");
+            keyAt(slider, a.start + a.duration, a.to, a.ease ? "ease" : "linear");
+            expr = 'var v = effect("' + fx.name + '")("Slider").value;\n' +
+                "var s = v.toFixed(" + a.decimals + ");\n" +
+                (a.separator ? 'var p = s.split("."); p[0] = p[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ' +
+                    quote(a.separator) + '); s = p.join(".");\n' : "") +
+                quote(a.prefix) + " + s + " + quote(a.suffix);
+            text = text.property("ADBE Text Document");
+            text.expression = expr;
+            text.expressionEnabled = true;
+            return {layer: l.name, index: l.index, from: a.from, to: a.to, expression: expr,
+                error: text.expressionError || null};
+        },
+
         run_jsx: function (a) {
             return plain(eval(a.code));
         }
     };
 
     var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1,
-        missing_footage: 1, audio_source: 1, render_queue_list: 1};
+        missing_footage: 1, audio_source: 1, render_queue_list: 1, describe_comp: 1, find_layers: 1};
 
     function run(name, args) {
         var result, cmd = commands[name];

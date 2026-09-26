@@ -1487,6 +1487,140 @@ def clear_render_queue(all_items: bool = False) -> dict:
     return _call("clear_render_queue", all=all_items or None)
 
 
+# --- understanding and organizing comps, layout, counters ---
+
+
+@_tool
+def describe_comp(comp: int | str | None = None) -> dict:
+    """What a comp does, layer by layer: type, timing, parent, effects, masks, label, 3D, every animated property
+    (path, keyframe count, first and last key time) and every expression. Read-only: start here to understand an
+    existing comp before changing it."""
+    return _call("describe_comp", comp=comp)
+
+
+LAYER_TYPES = ("text", "shape", "solid", "null", "adjustment", "camera", "light", "footage", "precomp")
+
+
+@_tool
+def find_layers(name: str | None = None, type: str | None = None, effect: str | None = None,
+                animated: bool | None = None, expression: bool | None = None,
+                comp: int | str | None = None) -> list[dict]:
+    """Find layers across every comp (or one): by name fragment, type (text, shape, solid, null, adjustment,
+    camera, light, footage, precomp), an effect's name fragment, whether they have keyframes, and whether they
+    have expressions. Filters combine."""
+    if type is not None and type not in LAYER_TYPES:
+        raise ToolError(f"type must be one of: {', '.join(LAYER_TYPES)}")
+    if all(v is None for v in (name, type, effect, animated, expression)):
+        raise ToolError("give at least one filter")
+    return _call("find_layers", comp=comp, name=name, type=type, effect=effect, animated=animated,
+                 expression=expression)
+
+
+@_tool
+def rename_layers(find: str | None = None, replace: str = "", pattern: str | None = None, start_at: int = 1,
+                  ignore_case: bool = False, layers: list[int | str] | None = None,
+                  comp: int | str | None = None) -> dict:
+    """Rename layers (all of a comp, or `layers` in the given order): find/replace with a regular expression, or a
+    pattern where {n} is a running number from start_at and {name} the old name, e.g. "Shot {n}" or "BG - {name}".
+    Returns the old and new names."""
+    if (find is None) == (pattern is None):
+        raise ToolError("give find (and replace) or pattern")
+    if find is not None:
+        if not find:
+            raise ToolError("find must not be empty")
+        try:
+            re.compile(find)
+        except re.error as e:
+            raise ToolError(f"find is not a valid regular expression: {e}") from None
+    if pattern is not None and "{n}" not in pattern and "{name}" not in pattern:
+        raise ToolError("pattern needs {n} and/or {name}, or every layer would get the same name")
+    return _call("rename_layers", comp=comp, find=find, replace=replace, pattern=pattern, startAt=start_at,
+                 ignoreCase=ignore_case or None, layers=layers)
+
+
+LABEL_COLORS = ("none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
+                "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green")
+
+
+@_tool
+def set_label(layers: list[int | str], color: str, comp: int | str | None = None) -> dict:
+    """Set layers' label color: none, red, yellow, aqua, pink, lavender, peach, sea_foam, blue, green, purple,
+    orange, brown, fuchsia, cyan, sandstone or dark_green (After Effects' default label names)."""
+    if color not in LABEL_COLORS:
+        raise ToolError(f"color must be one of: {', '.join(LABEL_COLORS)}")
+    if not layers:
+        raise ToolError("no layers")
+    return _call("set_label", comp=comp, layers=layers, color=color)
+
+
+ALIGNS = ("left", "center", "right", "top", "middle", "bottom")
+
+
+@_tool
+def align_layers(layers: list[int | str], align: str, to: str = "comp", comp: int | str | None = None) -> dict:
+    """Align layers' boxes (what they draw, scaled): left, center, right, top, middle or bottom, to the comp or to
+    the selection (the box around all the given layers). Unrotated, unparented layers with a static position."""
+    if align not in ALIGNS:
+        raise ToolError(f"align must be one of: {', '.join(ALIGNS)}")
+    if to not in ("comp", "selection"):
+        raise ToolError("to must be comp or selection")
+    if not layers or (to == "selection" and len(layers) < 2):
+        raise ToolError("give the layers (at least 2 to align to the selection)")
+    return _call("align_layers", comp=comp, layers=layers, align=align, to=to)
+
+
+@_tool
+def distribute_layers(layers: list[int | str], axis: str = "x", comp: int | str | None = None) -> dict:
+    """Space layers evenly along x or y: the outermost two stay, the others' centers are spread between them."""
+    if axis not in ("x", "y"):
+        raise ToolError("axis must be x or y")
+    if len(layers) < 3:
+        raise ToolError("distributing needs at least 3 layers")
+    return _call("distribute_layers", comp=comp, layers=layers, axis=axis)
+
+
+@_tool
+def grid_layout(layers: list[int | str], columns: int = 3, gap: float = 20, margin: float = 40, fit: bool = True,
+                comp: int | str | None = None) -> dict:
+    """Arrange layers in a grid filling the comp, row by row in the given order: `columns` columns, `gap` px
+    between cells, `margin` px around; fit=True scales each layer to fit its cell (keeping its proportions)."""
+    if not layers:
+        raise ToolError("no layers")
+    if not 1 <= columns <= 50:
+        raise ToolError("columns must be 1-50")
+    if gap < 0 or margin < 0:
+        raise ToolError("gap and margin must be 0 or more")
+    return _call("grid_layout", comp=comp, layers=layers, columns=columns, gap=gap, margin=margin, fit=fit)
+
+
+@_tool
+def comp_from_footage(item: int | str, name: str | None = None, still_duration: float = 5.0,
+                      frame_rate: float = 30.0) -> dict:
+    """Make a comp that matches a footage item (size, pixel aspect, frame rate, duration) with the footage in it,
+    and open it. Stills get still_duration seconds at frame_rate."""
+    if still_duration <= 0 or frame_rate <= 0:
+        raise ToolError("still_duration and frame_rate must be above 0")
+    return _call("comp_from_footage", item=item, name=name, stillDuration=still_duration, frameRate=frame_rate)
+
+
+@_tool
+def number_counter(from_value: float = 0, to_value: float = 100, duration: float = 2.0, start: float = 0.0,
+                   decimals: int = 0, prefix: str = "", suffix: str = "", separator: str = "", ease: bool = True,
+                   layer: int | str | None = None, name: str | None = None, comp: int | str | None = None) -> dict:
+    """An animated number: a Slider Control named Counter keyframed from from_value to to_value over `duration`
+    seconds, shown by an expression on a text layer's Source Text (a new text layer unless `layer` names one) with
+    `decimals`, a prefix and suffix (e.g. "$", " %") and a thousands separator (e.g. ","). Style it with set_text."""
+    if not 0 <= decimals <= 6:
+        raise ToolError("decimals must be 0-6")
+    if duration <= 0 or start < 0:
+        raise ToolError("duration must be above 0 and start 0 or more")
+    if len(separator) > 1:
+        raise ToolError("separator is one character, e.g. ',' or ' '")
+    return _call("number_counter", comp=comp, layer=layer, name=name, **{"from": from_value, "to": to_value},
+                 duration=duration, start=start, decimals=decimals, prefix=prefix, suffix=suffix,
+                 separator=separator, ease=ease)
+
+
 @_tool
 def run_jsx(code: str) -> Any:
     """Run ExtendScript in After Effects and return its value (numbers, strings, arrays; other objects as text).

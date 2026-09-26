@@ -103,6 +103,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `set_camera` | `layer`, `focal_length` (mm), `depth_of_field`, `focus_distance`, `focus_on` (layer: autofocus), `f_stop`, `blur_level`, `comp` | `{camera, set, error}` |
 | `set_3d_layer` | `layer`, `extrusion`, `bevel`, `bevel_style` (angular, concave, convex, none), `casts_shadows`, `accepts_shadows`, `accepts_lights`, `specular`, `shininess`, `metal`, `reflection`, `comp` | `{layer, threeD, renderer, set}` |
 | `depth_stack` | `layers` (nearest first), `spacing = 500`, `compensate = True`, `camera`, `comp` | `{camera, layers: [{layer, z, scale}]}` |
+| `describe_comp` | `comp` | `{comp, width, height, duration, frameRate, layers: [layer info + animated, expressions, masks, label, threeD]}` |
+| `find_layers` | `name`, `type`, `effect`, `animated`, `expression`, `comp` | `[{comp, index, name, type}]` |
+| `rename_layers` | `find` + `replace` (regex), or `pattern` with `{n}` / `{name}`, `start_at = 1`, `ignore_case`, `layers`, `comp` | `{comp, renamed: [[old, new]]}` |
+| `set_label` | `layers`, `color`, `comp` | `{label, layers}` |
+| `align_layers` | `layers`, `align` (left, center, right, top, middle, bottom), `to` (comp, selection), `comp` | `{align, to, layers: [{layer, moved}]}` |
+| `distribute_layers` | `layers` (3 or more), `axis` (x, y), `comp` | `{axis, layers: [{layer, center}]}` |
+| `grid_layout` | `layers`, `columns = 3`, `gap = 20`, `margin = 40`, `fit = True`, `comp` | `{rows, columns, cell, layers: [{layer, cell, center}]}` |
+| `comp_from_footage` | `item`, `name`, `still_duration = 5`, `frame_rate = 30` | comp info |
+| `number_counter` | `from_value`, `to_value`, `duration = 2`, `start`, `decimals`, `prefix`, `suffix`, `separator`, `ease`, `layer`, `name`, `comp` | `{layer, index, from, to, expression, error}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -143,6 +152,9 @@ Notes:
 - New cameras (`add_layer`, `camera_move`, `depth_stack`) are placed in front of the comp center facing it: After Effects 26 itself puts them at x = y = 0.
 - `set_3d_layer` switches the comp to the Advanced 3D renderer when extruding or beveling (Classic 3D cannot extrude).
 - `depth_stack` sets z = 0, spacing, 2 x spacing... and multiplies each layer's scale by (d + z) / d, d being the camera's distance to z = 0, so every layer looks as it did; a background meant to be panned across should be larger than the frame.
+- `describe_comp` and `find_layers` are read-only: they walk every property of every layer (animated means at least one keyframe; long expressions are cut at 160 characters).
+- The layout tools (`align_layers`, `distribute_layers`, `grid_layout`) work on each layer's box in the comp, measured from what it draws (`sourceRectAtTime` for text and shapes, the source size for footage), its anchor, position and scale. Rotated or parented layers and animated positions are refused.
+- `number_counter` keys a Slider Control named Counter and shows it through an expression on Source Text (`toFixed`, then the thousands separator); change the slider's keyframes to retime it.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration

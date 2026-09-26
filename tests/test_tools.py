@@ -26,7 +26,8 @@ def test_all_tools_registered():
         "bake_expression", "ease_keyframes", "copy_keyframes", "stagger_layers", "split_layer", "trim_comp",
         "make_variants", "import_layered", "find_missing_footage", "trim_paths", "shape_repeater", "text_style",
         "add_paragraph", "set_motion_blur", "markers_from_audio", "sequence_to_markers", "reduce_project",
-        "render_queue_list", "clear_render_queue",
+        "render_queue_list", "clear_render_queue", "describe_comp", "find_layers", "rename_layers", "set_label",
+        "align_layers", "distribute_layers", "grid_layout", "comp_from_footage", "number_counter",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -35,7 +36,8 @@ def test_all_tools_registered():
 def test_library_is_es3():
     """ExtendScript is ES3: no ES6 syntax (the host also strips ES5 built-ins at run time)."""
     src = (ROOT / "jsx" / "aemcp.jsx").read_text()
-    code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*', '""', src)  # ignore strings and comments
+    # ignore strings (both quotes) and comments
+    code = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*', '""', src)
     for pattern, what in [(r"=>", "arrow function"), (r"\blet\b", "let"), (r"\bconst\b", "const"), (r"`", "template"),
                           (r"\bclass\b", "class"), (r"\.\.\.", "spread"), (r"\bJSON\.", "JSON")]:
         assert not re.search(pattern, code), what
@@ -238,7 +240,7 @@ def test_effects(ae):
 
 
 def test_list_effects(ae):
-    assert [e["name"] for e in d.list_effects()] == ["Gaussian Blur", "Glow", "Fill"]
+    assert [e["name"] for e in d.list_effects()] == ["Gaussian Blur", "Glow", "Fill", "Slider Control"]
     assert d.list_effects("blur & sharpen") == [{"name": "Gaussian Blur", "matchName": "ADBE Gaussian Blur 2",
                                                  "category": "Blur & Sharpen"}]
 
@@ -676,8 +678,9 @@ def test_center_anchor(ae):
     d.add_layer("text", text="Title")
     d.set_property(1, "scale", [200, 200])
     out = d.center_anchor(1)
-    # anchor from (960, 540) to (0, -20): the position moves by the shift times the scale, so nothing moves on screen
-    assert out["anchor"] == [0, -20] and out["position"][:2] == [960 - 1920, 540 - 1120]
+    # a text layer's anchor goes from its own (0, 0) to (0, -20): the position moves by the shift times the 200 %
+    # scale, so nothing moves on screen
+    assert out["anchor"] == [0, -20] and out["position"][:2] == [960, 540 - 40]
     d.set_keyframes(1, "position", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [10, 10]}])
     with pytest.raises(ToolError, match="animated"):
         d.center_anchor(1)
@@ -1591,3 +1594,201 @@ def test_depth_stack(ae):
     for kwargs, msg in [({"layers": ["Tree"]}, "at least 2"), ({"spacing": 0}, "spacing")]:
         with pytest.raises(ToolError, match=msg):
             d.depth_stack(**{"layers": ["Tree", "Hills"], **kwargs})
+
+
+
+# --- understanding and organizing comps, layout, counters ---
+
+
+def test_describe_comp(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="BG")
+    d.add_layer("text", text="Title")
+    d.set_keyframes("Title", "opacity", [{"time": 0, "value": 0}, {"time": 1.5, "value": 100}])
+    d.set_expression("Title", "position", "wiggle(1, 5)")
+    d.add_effect("BG", "Gaussian Blur")
+    d.set_keyframes("BG", ["Effects", "Gaussian Blur", "Blurriness"], [{"time": 1, "value": 0}, {"time": 2, "value": 9},
+                                                                      {"time": 3, "value": 0}])
+    d.add_mask("BG", "rect", rect=[0, 0, 10, 10])
+    d.set_label(["BG"], "blue")
+    out = d.describe_comp()
+    title, bg = out["layers"]
+    assert title["animated"] == [{"property": "Transform > Opacity", "keys": 2, "from": 0, "to": 1.5}]
+    assert title["expressions"] == [{"property": "Transform > Position", "expression": "wiggle(1, 5)"}]
+    assert bg["animated"] == [{"property": "Effects > Gaussian Blur > Blurriness", "keys": 3, "from": 1, "to": 3}]
+    assert (bg["effects"], bg["masks"], bg["label"], title["masks"]) == (["Gaussian Blur"], 1, "blue", 0)
+    long = "value + " + " + ".join(["1"] * 80)
+    d.set_expression("Title", "rotation", long)
+    assert d.describe_comp()["layers"][0]["expressions"][1]["expression"].endswith("...")  # long ones are cut
+    assert "aemcp: describe_comp" not in ae.inspect("ae.undoLog")
+
+
+def test_find_layers(ae):
+    d.create_comp("Intro")
+    d.add_layer("text", text="Hello")
+    d.add_layer("solid", name="BG Intro")
+    d.add_effect("BG Intro", "Glow")
+    d.create_comp("Outro")
+    d.add_layer("solid", name="BG Outro")
+    d.set_expression("BG Outro", "rotation", "time * 10")
+    assert d.find_layers(name="bg") == [{"comp": "Intro", "index": 1, "name": "BG Intro", "type": "solid"},
+                                        {"comp": "Outro", "index": 1, "name": "BG Outro", "type": "solid"}]
+    assert [r["name"] for r in d.find_layers(effect="glo")] == ["BG Intro"]
+    assert [r["name"] for r in d.find_layers(expression=True)] == ["BG Outro"]
+    assert [r["name"] for r in d.find_layers(expression=False, type="solid")] == ["BG Intro"]
+    assert [r["name"] for r in d.find_layers(type="text", comp="Intro")] == ["Hello"]
+    assert d.find_layers(animated=True) == []
+    with pytest.raises(ToolError, match="at least one filter"):
+        d.find_layers()
+    with pytest.raises(ToolError, match="type must be"):
+        d.find_layers(type="video")
+
+
+def test_rename_layers(ae):
+    d.create_comp("Main")
+    for n in ("clip_a", "clip_b", "Logo"):
+        d.add_layer("null", name=n)
+    out = d.rename_layers(find="^clip_", replace="Shot ")
+    assert out["renamed"] == [["clip_b", "Shot b"], ["clip_a", "Shot a"]]  # Logo untouched
+    out = d.rename_layers(pattern="{n} - {name}", start_at=10, layers=["Shot a", "Shot b"])
+    assert out["renamed"] == [["Shot a", "10 - Shot a"], ["Shot b", "11 - Shot b"]]
+    assert d.rename_layers(find="LOGO", replace="Brand", ignore_case=True)["renamed"] == [["Logo", "Brand"]]
+    for kwargs, msg in [({}, "find .* or pattern"), ({"find": "(", "replace": ""}, "regular expression"),
+                        ({"pattern": "Same"}, r"\{n\}"), ({"find": ""}, "empty")]:
+        with pytest.raises(ToolError, match=msg):
+            d.rename_layers(**kwargs)
+
+
+def test_set_label(ae):
+    d.create_comp("Main")
+    d.add_layer("null", name="A")
+    assert d.set_label(["A"], "sea_foam") == {"label": "sea_foam", "layers": ["A"]}
+    assert ae.inspect("ae.app.project.item(1).layer(1).label") == 7
+    with pytest.raises(ToolError, match="color must be"):
+        d.set_label(["A"], "gold")
+
+
+def _boxes(ae, names):
+    return {n: d.get_property(n, "position")["value"][:2] for n in names}
+
+
+def test_align_to_comp_and_selection(ae):
+    d.create_comp("Main", 1000, 500)
+    d.add_shape("rect", size=[200, 100], layer_name="A")   # 200 wide shape: box in the fake is 200 x 200 around 0
+    d.add_layer("text", text="B", name="B")                # text box 300 x 80 from (-150, -60)
+    d.set_property("A", "position", [300, 250])
+    d.set_property("B", "position", [700, 300])
+    d.set_property("B", "scale", [50, 50])
+    out = d.align_layers(["A", "B"], "left")
+    assert out["layers"] == [{"layer": "A", "moved": [-200, 0]}, {"layer": "B", "moved": [-625, 0]}]
+    assert _boxes(ae, ["A", "B"]) == {"A": [100, 250], "B": [75, 300]}
+    d.align_layers(["A", "B"], "middle", to="selection")
+    # A spans 150-350, B 270-310 (80 x 50 %): the union's middle is 250
+    assert _boxes(ae, ["A", "B"])["B"] == [75, 260]
+    # to the selection's left edge, whichever layer is listed first: A's box starts at 0
+    d.set_property("B", "position", [900, 260])
+    d.align_layers(["B", "A"], "left", to="selection")
+    assert _boxes(ae, ["A", "B"])["B"] == [75, 260]  # B's box (825-975) moved to A's left edge, 0
+    d.align_layers(["B"], "right")
+    assert _boxes(ae, ["B"])["B"] == [925, 260]  # right edge 925 - 150 x 0.5 + 150 = 1000
+    for kwargs, msg in [({"align": "diagonal"}, "align must be"), ({"align": "left", "to": "page"}, "to must be"),
+                        ({"layers": ["A"], "align": "left", "to": "selection"}, "at least 2")]:
+        with pytest.raises(ToolError, match=msg):
+            d.align_layers(**{"layers": ["A", "B"], **kwargs})
+
+
+def test_layout_refuses_what_it_cannot_measure(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="T")
+    d.add_layer("null", name="N")
+    with pytest.raises(ToolError, match="no size to measure"):
+        d.align_layers(["N"], "left")
+    d.set_property("T", "rotation", 10)
+    with pytest.raises(ToolError, match="rotated"):
+        d.align_layers(["T"], "left")
+    d.set_property("T", "rotation", 0)
+    d.set_layer("T", parent="N")
+    with pytest.raises(ToolError, match="parented"):
+        d.align_layers(["T"], "left")
+    d.set_layer("T", unparent=True)
+    d.set_keyframes("T", "position", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [5, 5]}])
+    with pytest.raises(ToolError, match="animated"):
+        d.align_layers(["T"], "left")
+
+
+def test_distribute_layers(ae):
+    d.create_comp("Main", 1000, 500)
+    for n, x in (("A", 100), ("B", 800), ("C", 300), ("D", 900)):
+        d.add_layer("text", text=n, name=n)
+        d.set_property(n, "position", [x, 250])
+    out = d.distribute_layers(["A", "B", "C", "D"])
+    # centers (text box center is x + 0): 100 ... 900 in 3 steps of 266.67, in order of position
+    assert [(r["layer"], r["center"]) for r in out["layers"]] == [("A", 100), ("C", 366.67), ("B", 633.33), ("D", 900)]
+    assert d.get_property("C", "position")["value"][0] == pytest.approx(366.67, abs=0.01)
+    with pytest.raises(ToolError, match="at least 3"):
+        d.distribute_layers(["A", "B"])
+    with pytest.raises(ToolError, match="axis"):
+        d.distribute_layers(["A", "B", "C"], axis="z")
+
+
+def test_grid_layout(ae):
+    d.create_comp("Main", 1000, 600)
+    for n in ("A", "B", "C", "D", "E"):
+        d.add_shape("rect", layer_name=n)  # 200 x 200 boxes around the anchor
+    out = d.grid_layout(["A", "B", "C", "D", "E"], columns=3, gap=20, margin=40)
+    # cells: (1000 - 80 - 40) / 3 = 293.33 wide, (600 - 80 - 20) / 2 = 250 high; fit scales 200 -> 250
+    assert (out["rows"], out["columns"], out["cell"]) == (2, 3, [293.33, 250])
+    assert [r["cell"] for r in out["layers"]] == [[1, 1], [1, 2], [1, 3], [2, 1], [2, 2]]
+    assert d.get_property("A", "scale")["value"][:2] == [125, 125]
+    assert d.get_property("A", "position")["value"][:2] == pytest.approx([186.67, 165], abs=0.01)
+    assert d.get_property("E", "position")["value"][:2] == pytest.approx([500, 435], abs=0.01)
+    assert d.get_property("B", "position")["value"][:2] == pytest.approx([500, 165], abs=0.01)  # row 1, column 2
+    unfit = d.grid_layout(["A"], columns=1, fit=False)
+    assert d.get_property("A", "scale")["value"][:2] == [125, 125] and unfit["cell"] == [920, 520]
+    with pytest.raises(ToolError, match="no room"):
+        d.grid_layout(["A", "B"], columns=2, margin=600)
+    for kwargs, msg in [({"columns": 0}, "columns"), ({"gap": -1}, "gap"), ({"layers": []}, "no layers")]:
+        with pytest.raises(ToolError, match=msg):
+            d.grid_layout(**{"layers": ["A"], **kwargs})
+
+
+def test_comp_from_footage(ae, tmp_path):
+    clip, still, wav = tmp_path / "shot.mov", tmp_path / "logo.png", tmp_path / "vo.wav"
+    for f in (clip, still, wav):
+        f.write_bytes(b"x")
+        d.import_file(str(f))
+    out = d.comp_from_footage("shot.mov")
+    assert (out["name"], out["width"], out["height"], out["duration"], out["frameRate"]) == ("shot", 1920, 1080, 5, 25)
+    assert out["layers"][0]["source"] == "shot.mov" and d.status()["activeComp"] == "shot"
+    logo = d.comp_from_footage("logo.png", name="Logo card", still_duration=3, frame_rate=24)
+    assert (logo["name"], logo["duration"], logo["frameRate"]) == ("Logo card", 3, 24)
+    ae.inspect("(ae.app.project.item(3).width = 0, 1)")  # the WAV has no picture
+    with pytest.raises(ToolError, match="no picture"):
+        d.comp_from_footage("vo.wav")
+    with pytest.raises(ToolError, match="shot is not footage"):
+        d.comp_from_footage("shot")
+
+
+def test_number_counter(ae):
+    d.create_comp("Main", duration=5)
+    out = d.number_counter(0, 1250000, duration=2, start=0.5, decimals=1, prefix="$", suffix=" USD", separator=",",
+                           name="Revenue")
+    assert (out["layer"], out["error"]) == ("Revenue", None)
+    assert out["expression"] == ('var v = effect("Counter")("Slider").value;\nvar s = v.toFixed(1);\n'
+                                 'var p = s.split("."); p[0] = p[0].replace(/\\B(?=(\\d{3})+(?!\\d))/g, ","); '
+                                 's = p.join(".");\n"$" + s + " USD"')
+    slider = "ae.app.project.item(1).layer(1).groups.find(g => g.matchName === 'ADBE Effect Parade').children[0]"
+    assert ae.inspect(f"{slider}.name") == "Counter"
+    assert ae.inspect(f"{slider}.children[0].keys.map(k => [k.time, k.value])") == [[0.5, 0], [2.5, 1250000]]
+    # the separator code, run as After Effects would: 1234567.5 -> "$1,234,567.5 USD"
+    js = out["expression"].replace('effect("Counter")("Slider").value', "1234567.5")
+    assert ae.inspect(f"(function () {{ {js.replace(chr(10), ' ')}; return eval({json.dumps(js)}); }})()") == \
+        "$1,234,567.5 USD"
+    plain_counter = d.number_counter(10, 0, layer="Revenue")
+    assert "split" not in plain_counter["expression"]  # no separator, no grouping code
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a text layer"):
+        d.number_counter(layer="Rig")
+    for kwargs, msg in [({"decimals": 9}, "decimals"), ({"duration": 0}, "duration"), ({"separator": ",,"}, "one character")]:
+        with pytest.raises(ToolError, match=msg):
+            d.number_counter(**kwargs)
