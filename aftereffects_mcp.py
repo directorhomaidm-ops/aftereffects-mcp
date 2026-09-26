@@ -168,6 +168,9 @@ def _call(command, timeout=DEFAULT_TIMEOUT, keep_null=(), **args):
         reply = json.loads(raw)
     except json.JSONDecodeError:
         raise ToolError(f"unexpected reply from After Effects: {raw[:300]}") from None
+    if not isinstance(reply, dict):
+        # DoScript's own "0" with no result file: the script never ran, usually because a dialog is open
+        raise ToolError("After Effects did not run the script: close any open dialog in After Effects, then retry")
     if "error" in reply:
         raise ToolError(reply["error"])
     return reply["ok"]
@@ -1300,7 +1303,7 @@ def find_missing_footage(search: str | None = None, max_files: int = 200000) -> 
     (recursively, up to max_files files) and relinked when found."""
     missing = _call("missing_footage")
     out = {"missing": missing}
-    if not search or not missing:
+    if not search:
         return out
     root = _path(search)
     if not os.path.isdir(root):
@@ -1314,7 +1317,7 @@ def find_missing_footage(search: str | None = None, max_files: int = 200000) -> 
                 found[fn.lower()] = os.path.join(dirpath, fn)
         if seen >= max_files or len(found) == len(wanted):
             break
-    links = [{"id": wanted[k]["id"], "path": p} for k, p in found.items()]
+    links = [{"id": wanted[k]["id"], "path": p} for k, p in found.items()]  # empty when nothing is missing
     out["relinked"] = _call("relink_footage", links=links) if links else []
     out["still_missing"] = [m["name"] for m in missing if m.get("file") is None or
                             os.path.basename(m["file"]).lower() not in found]
