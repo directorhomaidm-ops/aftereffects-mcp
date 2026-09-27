@@ -327,11 +327,31 @@ def main():
          needs=have, note="a still: 5 s at 30 fps")
     step("number_counter 0 to 1,250,000 with $ and commas", lambda: _counter(work), needs=have,
          note="the Source Text expression must evaluate: check frame_counter.png")
+    print("\nRetiming, interpreting, recoloring, text and fonts")
+    step("retime_keyframes: twice as slow, then reversed", lambda: _retime(), needs=have,
+         note="values, interpolation and ease kept; reversed, in and out trade places")
+    step("interpret_footage: conform the tracked sequence to 24 fps", lambda: _interpret(), needs=True if track else
+         "no tracked sequence", note="FootageSource.conformFrameRate: the item's duration stretches")
+    step("replace_color: the red tile to white", lambda: d.replace_color([1, 0.3, 0.3], "#FFFFFF", comp="grid check"),
+         needs=have, note="one shape fill")
+    step("fit_text: the counter to 900 px wide", lambda: _fit(), needs=have,
+         note="sourceRectAtTime after each size change")
+    step("sort_layers: grid tiles by name, reversed", lambda: _sort(), needs=have)
+    step("replace_text: 'Sub' to 'Line'", lambda: d.replace_text("Sub", "Line", comp="aemcp check"), needs=have,
+         note="text layers named after their text follow it")
+    fonts = step("list_fonts", d.list_fonts, needs=have, note="installed comes from app.fonts (After Effects 24+)")
+    step("replace_font: the counter's font to Helvetica", lambda: d.replace_font(
+        d.list_fonts()[0]["font"], "Helvetica", comp="counter check"), needs=True if fonts else "no fonts listed",
+         note="check frame_font.png: Helvetica, not a substitute")
+    step("export the font frame", lambda: d.export_frame(str(work / "frame_font.png"), time=1.5, comp="counter check"),
+         needs=True if fonts else "no fonts listed")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
     step("reduce_project to the check comp (last: it deletes items)", lambda: d.reduce_project(["aemcp check"]),
          needs=have, note="Project.reduceProject; the project was saved just before")
+    step("collect_files into collected/ (the open project moves there)", lambda: _collect(work), needs=have,
+         note="footage copied and relinked, the project saved in the folder")
     step("run_jsx", lambda: d.run_jsx("[app.project.numItems, app.version]"))
     step("list_items", d.list_items)
     return write_report(info, work)
@@ -494,6 +514,45 @@ def _counter(work):
     out = d.number_counter(0, 1250000, duration=2, prefix="$", separator=",", name="Counter", comp="counter check")
     expect(out["error"] is None, f"expression error: {out['error']}")
     d.export_frame(str(work / "frame_counter.png"), time=1.5, comp="counter check")
+    return out
+
+
+def _retime():
+    d.create_comp("retime check", 1080, 1080, 4, 30)
+    d.add_layer("solid", name="Box", color=[0.2, 0.6, 1], comp="retime check")
+    d.set_keyframes("Box", "opacity", [{"time": 0, "value": 0, "ease": "ease_out"}, {"time": 1, "value": 100}],
+                    comp="retime check")
+    d.retime_keyframes("Box", "opacity", scale=2, comp="retime check")
+    d.retime_keyframes("Box", "opacity", reverse=True, comp="retime check")
+    keys = d.get_property("Box", "opacity", comp="retime check")["keys"]
+    expect([(k["time"], k["value"]) for k in keys] == [(0, 100), (2, 0)], f"keys: {keys}")
+    return keys
+
+
+def _interpret():
+    seq = next(i for i in d.list_items() if i["name"].startswith("square_"))
+    before = d.interpret_footage(seq["id"], frame_rate=24)
+    after = d.interpret_footage(seq["id"], frame_rate=0)
+    expect(before["duration"] > after["duration"], f"conformed {before}, own rate {after}")
+    return {"conformed": before, "own": after}
+
+
+def _fit():
+    out = d.fit_text("Counter", width=900, comp="counter check")
+    expect(abs(out["size"][0] - 900) < 20 or out["clamped"], f"width {out['size'][0]}")
+    return out
+
+
+def _sort():
+    d.sort_layers("name", reverse=True, comp="grid check")
+    names = [l["name"] for l in d.comp_info("grid check")["layers"]]
+    expect(names == ["Tile 4", "Tile 3", "Tile 2", "Tile 1"], f"order: {names}")
+    return names
+
+
+def _collect(work):
+    out = d.collect_files(str(work / "collected"), name="aemcp_collected")
+    expect(Path(out["project"]).exists(), f"no project at {out['project']}")
     return out
 
 

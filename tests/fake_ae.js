@@ -23,6 +23,7 @@ const LightType = {PARALLEL: 4412, SPOT: 4413, POINT: 4414, AMBIENT: 4415};
 const TrackMatteType = {NO_TRACK_MATTE: 5012, ALPHA: 5013, ALPHA_INVERTED: 5014, LUMA: 5015, LUMA_INVERTED: 5016};
 const AutoOrientType = {NO_AUTO_ORIENT: 4212, ALONG_PATH: 4213, CAMERA_OR_POINT_OF_INTEREST: 4214,
     CHARACTERS_TOWARD_CAMERA: 4215};
+const AlphaMode = {IGNORE: 5412, STRAIGHT: 5413, PREMULTIPLIED: 5414};
 const RENDERERS = ["ADBE Advanced 3d", "ADBE Calder", "ADBE Ernst"];
 
 // Footage whose file name starts with "moving" shows a checkered 30 px square on gray, its center at
@@ -287,6 +288,10 @@ function makeAE(CtxArray) {
             const v = this.keys[i - 1].value;
             return v instanceof TextDocument ? v.copy() : clone(v);
         }
+        setValueAtKey(i, v) {
+            this._check();
+            this.keys[i - 1].value = this._v(v);
+        }
         removeKey(i) {
             this._check();
             this.keys.splice(i - 1, 1);
@@ -534,17 +539,35 @@ function makeAE(CtxArray) {
             this.color = color;
         }
     }
+    class FileSource {
+        constructor(file, still) {
+            this.isStill = still;
+            this.hasAlpha = !!file && /\.(png|mov|psd|tiff?|exr)$/i.test(file.fsName);
+            this.alphaMode = this.hasAlpha ? AlphaMode.STRAIGHT : AlphaMode.IGNORE;
+            this.invertAlpha = false;
+            this.conformFrameRate = 0;
+            this.loop = 1;
+        }
+    }
     class FootageItem extends Item {
         constructor(name, file, opts) {
             super(name);
             this.file = file;
-            this.mainSource = opts.solid ? new SolidSource(opts.solid) : {};
+            this.mainSource = opts.solid ? new SolidSource(opts.solid) : new FileSource(file, !opts.duration);
             this.width = opts.width || 1920;
             this.height = opts.height || 1080;
-            this.duration = opts.duration || 0;
-            this.frameRate = opts.frameRate || 0;
+            this._duration = opts.duration || 0;
+            this._frameRate = opts.frameRate || 0;
             this.pixelAspect = 1;
             this.hasAudio = !!file && /\.(wav|mp3|aif|aiff|m4a|mov|mp4)$/i.test(file.fsName);
+        }
+        // conforming the frame rate stretches the duration, as in After Effects
+        get frameRate() {
+            return (this.mainSource.conformFrameRate || this._frameRate);
+        }
+        get duration() {
+            return this.mainSource.conformFrameRate ? this._duration * this._frameRate / this.mainSource.conformFrameRate :
+                this._duration;
         }
         get footageMissing() {
             return !!this.file && !fs.existsSync(this.file.fsName);
@@ -734,7 +757,9 @@ function makeAE(CtxArray) {
         }
     }
     TextLayer.prototype.sourceRectAtTime = function () {
-        return this.rect;
+        // the box grows with the font size (the rect is the box at 72 px)
+        const k = this.property("ADBE Text Properties").property("ADBE Text Document").value.fontSize / 72;
+        return {left: this.rect.left * k, top: this.rect.top * k, width: this.rect.width * k, height: this.rect.height * k};
     };
     class ShapeLayer extends AVLayer {
         constructor(comp, name) {
@@ -1141,6 +1166,11 @@ function makeAE(CtxArray) {
         version: "26.0x10",
         project,
         effects: arr(EFFECTS.map((e) => ({displayName: e.displayName, matchName: e.matchName, category: e.category}))),
+        fonts: {
+            getFontsByPostScriptName(name) {
+                return arr(["ArialMT", "Montserrat-Bold", "Helvetica"].includes(name) ? [{postScriptName: name}] : []);
+            },
+        },
         findMenuCommandId(name) {
             return name === "Convert Audio to Keyframes" ? 5015 : 0;
         },
@@ -1176,7 +1206,7 @@ function makeAE(CtxArray) {
         globals: {app, CompItem, FolderItem, FootageItem, SolidSource, TextLayer, ShapeLayer, CameraLayer, LightLayer,
             PropertyType, PropertyValueType, KeyframeInterpolationType, KeyframeEase, RQItemStatus,
             ParagraphJustification, File, ImportOptions, MaskMode, BlendingMode, TrackMatteType, Shape, MarkerValue,
-            LightType, ImportAsType, AutoOrientType},
+            LightType, ImportAsType, AutoOrientType, AlphaMode},
     };
 }
 
