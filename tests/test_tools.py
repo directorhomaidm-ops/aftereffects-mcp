@@ -28,6 +28,8 @@ def test_all_tools_registered():
         "add_paragraph", "set_motion_blur", "markers_from_audio", "sequence_to_markers", "reduce_project",
         "render_queue_list", "clear_render_queue", "describe_comp", "find_layers", "rename_layers", "set_label",
         "align_layers", "distribute_layers", "grid_layout", "comp_from_footage", "number_counter",
+        "retime_keyframes", "interpret_footage", "replace_color", "fit_text", "sort_layers", "collect_files",
+        "replace_text", "list_fonts", "replace_font",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -1804,3 +1806,323 @@ def test_script_that_did_not_run(monkeypatch):
 def test_find_missing_footage_nothing_missing(ae, tmp_path):
     out = d.find_missing_footage(search=str(tmp_path))
     assert out == {"missing": [], "relinked": [], "still_missing": [], "files_searched": 0}
+
+
+# --- keyframe timing, footage, colors, text, fonts, collecting ---
+
+
+def _keys(ae, prop, layer=1):
+    return ae.inspect(f"ae.app.project.item(1).layer({layer}).property('ADBE Transform Group')"
+                      f".property('{prop}').keys.map(k => [k.time, k.value, k.inType, k.outType])")
+
+
+def test_retime_keyframes(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="Box")
+    d.set_keyframes("Box", "opacity", [{"time": 1, "value": 0, "ease": "linear"}, {"time": 2, "value": 50},
+                                       {"time": 3, "value": 100, "ease": "hold"}])
+    d.set_keyframes("Box", "rotation", [{"time": 2, "value": 0}, {"time": 5, "value": 90}])
+    out = d.retime_keyframes("Box", "opacity", offset=1, scale=2)
+    assert out["properties"] == [{"property": "Opacity", "keys": 3, "from": 2, "to": 6}]
+    assert [k[:2] for k in _keys(ae, "ADBE Opacity")] == [[2, 0], [4, 50], [6, 100]]
+    # the ease types stay with their keys
+    assert [k[2:] for k in _keys(ae, "ADBE Opacity")] == [[6612, 6612], [6613, 6613], [6614, 6614]]
+    assert _keys(ae, "ADBE Rotate Z")[0][0] == 2  # the other property did not move
+    # reversed: the values run backwards over the same time and in/out types swap
+    d.retime_keyframes("Box", "opacity", reverse=True)
+    assert [k[:2] for k in _keys(ae, "ADBE Opacity")] == [[2, 100], [4, 50], [6, 0]]
+    assert [k[2:] for k in _keys(ae, "ADBE Opacity")] == [[6614, 6614], [6613, 6613], [6612, 6612]]
+    # no property: everything on the layer moves together (markers stay)
+    d.add_marker(4, "beat", layer="Box")
+    out = d.retime_keyframes("Box", scale=0.5, anchor=0)
+    assert {p["property"]: (p["from"], p["to"]) for p in out["properties"]} == {"Opacity": (1, 3), "Rotation": (1, 2.5)}
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Marker').keys.map(k => k.time)") == [4]
+    # reversed together over the whole range, 1-3, even though rotation (listed first) starts later
+    d.retime_keyframes("Box", "rotation", offset=0.5)
+    out = d.retime_keyframes("Box", reverse=True)
+    assert {p["property"]: (p["from"], p["to"]) for p in out["properties"]} == {"Opacity": (1, 3), "Rotation": (1, 2.5)}
+    # a key whose in and out types differ: reversed, they trade places
+    d.run_jsx("app.project.item(1).layer(1).property('ADBE Transform Group').property('ADBE Opacity')"
+              ".setInterpolationTypeAtKey(1, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.HOLD)")
+    d.retime_keyframes("Box", "opacity", reverse=True)
+    assert _keys(ae, "ADBE Opacity")[-1][2:] == [6614, 6612]
+    with pytest.raises(ToolError, match="nothing to do"):
+        d.retime_keyframes("Box")
+    with pytest.raises(ToolError, match="scale must be above 0"):
+        d.retime_keyframes("Box", scale=0)
+    with pytest.raises(ToolError, match="Scale on Box has no keyframes"):
+        d.retime_keyframes("Box", "scale", offset=1)
+    d.add_layer("null", name="Still")
+    with pytest.raises(ToolError, match="Still has no keyframes"):
+        d.retime_keyframes("Still", offset=1)
+
+
+def test_retime_keyframes_reverse_eases(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="Box")
+    d.set_keyframes("Box", "opacity", [{"time": 0, "value": 0, "ease": "ease_out"}, {"time": 1, "value": 100,
+                                                                                    "ease": "ease_in"}])
+    eases = ("ae.app.project.item(1).layer(1).property('ADBE Transform Group').property('ADBE Opacity')"
+             ".keys.map(k => [k.inEase[0].influence, k.outEase[0].influence])")
+    assert ae.inspect(eases) == [[0.1, 33.33], [33.33, 0.1]]
+    d.retime_keyframes("Box", "opacity", reverse=True)
+    # the last key eased in; reversed, it comes first and eases out (and the first key now eases in)
+    assert ae.inspect(eases) == [[0.1, 33.33], [33.33, 0.1]]
+    assert [k[:2] for k in _keys(ae, "ADBE Opacity")] == [[0, 100], [1, 0]]
+
+
+def test_interpret_footage(ae, tmp_path):
+    for n in ("clip.mov", "logo.png", "take.mp4"):
+        (tmp_path / n).write_bytes(b"x")
+        d.import_file(str(tmp_path / n))
+    out = d.interpret_footage("clip.mov", frame_rate=50, alpha="premultiplied", loop=3)
+    assert out == {"name": "clip.mov", "frameRate": 50, "duration": 2.5, "conformFrameRate": 50,
+                   "alpha": "premultiplied", "invertAlpha": False, "loop": 3, "pixelAspect": 1}
+    assert d.interpret_footage("clip.mov", frame_rate=0)["duration"] == 5  # back to the file's own rate
+    out = d.interpret_footage("logo.png", invert_alpha=True, pixel_aspect=2)
+    assert (out["invertAlpha"], out["pixelAspect"], out["conformFrameRate"], out["loop"]) == (True, 2, None, None)
+    with pytest.raises(ToolError, match="logo.png is a still: it has no frame rate"):
+        d.interpret_footage("logo.png", frame_rate=24)
+    with pytest.raises(ToolError, match="logo.png is a still: it cannot loop"):
+        d.interpret_footage("logo.png", loop=2)
+    with pytest.raises(ToolError, match="take.mp4 has no alpha channel"):
+        d.interpret_footage("take.mp4", alpha="straight")
+    d.create_comp("Main")
+    d.add_layer("solid", name="BG", color=[0, 0, 0])
+    with pytest.raises(ToolError, match="is a solid"):
+        d.interpret_footage(ae.inspect("ae.app.project.item(5).name"), pixel_aspect=1)
+    for kwargs, msg in [({"alpha": "none"}, "alpha must be"), ({"loop": 0}, "loop must be"),
+                        ({"frame_rate": -1}, "frame_rate"), ({"pixel_aspect": 0}, "pixel_aspect")]:
+        with pytest.raises(ToolError, match=msg):
+            d.interpret_footage("clip.mov", **kwargs)
+
+
+def test_replace_color(ae):
+    d.create_comp("Main")
+    d.add_shape("rect", fill=[1, 0, 0], stroke=[1, 1, 1], layer_name="Card")
+    d.add_layer("solid", name="BG", color=[1, 0, 0])
+    d.add_layer("text", text="Hi")
+    d.set_text("Hi", color=[0.995, 0, 0])
+    d.add_effect("BG", "Fill")  # red, keyframed below
+    d.set_keyframes("BG", ["Effects", "Fill", "Color"], [{"time": 0, "value": [1, 0, 0, 1]},
+                                                         {"time": 1, "value": [0, 0, 1, 1]}])
+    out = d.replace_color("#FF0000", [0, 0.5, 1])
+    assert sorted((r["layer"], r["property"], r["changed"]) for r in out["changed"]) == [
+        ("BG", "Effects > Fill > Color", 1), ("BG", "Solid Color", 1), ("Card", "Contents > Group 1 > Contents > Fill 1 > Color", 1),
+        ("Hi", "Source Text", 1)]
+    fill = ("ae.app.project.item(1).layer(3).property('ADBE Root Vectors Group').property(1).property(1)"
+            ".property('ADBE Vector Graphic - Fill').property(1)")
+    d.set_property("Card", ["Contents", "Group 1", "Contents", "Fill 1", "Color"], [1, 0, 0, 0.5])
+    assert d.replace_color("#FF0000", [0, 0.5, 1], layers=["Card"])["changed"][0]["changed"] == 1
+    assert ae.inspect(fill + ".value") == [0, 0.5, 1, 0.5]  # alpha kept
+    fx = "ae.app.project.item(1).layer(2).property('ADBE Effect Parade').property(1).property(1)"
+    assert ae.inspect(fx + ".keys.map(k => k.value)") == [[0, 0.5, 1, 1], [0, 0, 1, 1]]
+    assert ae.inspect("ae.app.project.item(1).layer(2).source.mainSource.color") == [0, 0.5, 1]
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.fillColor") == [0, 0.5, 1]
+    # nothing close enough is left: tolerance 0 misses the 0.995 red, the default caught it
+    assert d.replace_color([1, 0, 0], "#000000")["changed"] == []
+    assert d.replace_color("00ff00", "#000000", tolerance=0)["changed"] == []
+    # limited to a layer; text strokes count, only when the stroke is on
+    out = d.replace_color("#FFFFFF", "#222222", layers=["Hi"])
+    assert out["changed"] == []
+    assert d.replace_color("#000000", "#333333", layers=["Hi"])["changed"] == []  # the stroke is off (black)
+    d.text_style("Hi", stroke_color=[1, 1, 1], stroke_width=2)
+    assert d.replace_color("#FFFFFF", "#222222", layers=["Hi"])["changed"] == [
+        {"comp": "Main", "layer": "Hi", "property": "Source Text", "changed": 1}]
+    assert [r["layer"] for r in d.replace_color("#FFFFFF", "#222222", layers=["Card"])["changed"]] == ["Card"]
+    for kwargs, msg in [({"find": "red"}, "hex color"), ({"tolerance": 2}, "tolerance"),
+                        ({"find": [2, 0, 0]}, "0-1"), ({"all_comps": True, "comp": "Main"}, "all_comps")]:
+        with pytest.raises(ToolError, match=msg):
+            d.replace_color(**{"find": "#FF0000", "replace": "#000000", **kwargs})
+
+
+def test_replace_color_all_comps_and_shared_solid(ae):
+    d.create_comp("A")
+    d.add_layer("solid", name="Red", color=[1, 0, 0])
+    d.duplicate_layer("Red")
+    d.create_comp("B")
+    d.add_shape("ellipse", fill=[1, 0, 0], layer_name="Dot", comp="B")
+    out = d.replace_color("#FF0000", "#00FF00", all_comps=True)
+    # the solid's color is shared by both layers: changed once
+    assert sorted((r["comp"], r["property"]) for r in out["changed"]) == [
+        ("A", "Solid Color"), ("B", "Contents > Group 1 > Contents > Fill 1 > Color")]
+    # a small shift still matches after the change: the shared solid is still changed once
+    out = d.replace_color("#00FF00", "#00FE00", comp="A")
+    assert [r["property"] for r in out["changed"]] == ["Solid Color"]
+
+
+def test_fit_text(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="Headline")
+    out = d.fit_text("Headline", width=600)
+    assert out == {"layer": "Headline", "fontSize": {"before": 72, "after": 144}, "size": [600, 160], "clamped": False}
+    assert d.fit_text("Headline", width=600, height=80)["fontSize"]["after"] == 72  # the height is the limit
+    d.set_property("Headline", "scale", [50, 50])
+    assert d.fit_text("Headline", width=600)["size"] == [600, 160]  # scale counts
+    assert d.fit_text("Headline", width=5000, max_size=200) == {
+        "layer": "Headline", "fontSize": {"before": 288, "after": 200}, "size": [416.7, 111.1], "clamped": True}
+    d.set_keyframes("Headline", "text", [{"time": 0, "value": "A"}, {"time": 1, "value": "B"}])
+    with pytest.raises(ToolError, match="Source Text has keyframes"):
+        d.fit_text("Headline", width=100)
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a text layer"):
+        d.fit_text("Rig", width=100)
+    for kwargs, msg in [({"width": 0}, "above 0"), ({"height": -1}, "above 0"), ({"min_size": 50, "max_size": 10},
+                                                                                     "min_size")]:
+        with pytest.raises(ToolError, match=msg):
+            d.fit_text("Headline", **{"width": 100, **kwargs})
+
+
+def _order(ae):
+    return ae.inspect("ae.app.project.item(1)._layers.map(l => l.name)")
+
+
+def test_sort_layers(ae):
+    d.create_comp("Main", duration=10)
+    for n, t in (("delta", 3), ("Alpha", 1), ("charlie", 0), ("bravo", 2)):
+        d.add_layer("solid", name=n)
+        d.set_layer(n, start_time=t)
+    assert _order(ae) == ["bravo", "charlie", "Alpha", "delta"]
+    assert d.sort_layers()["layers"][0] == {"index": 1, "name": "Alpha"}  # names ignore case
+    assert _order(ae) == ["Alpha", "bravo", "charlie", "delta"]
+    d.sort_layers("in_point", reverse=True)
+    assert _order(ae) == ["delta", "bravo", "Alpha", "charlie"]
+    # a subset keeps its slots (1 and 3 here); the others stay where they are
+    d.sort_layers("name", layers=["Alpha", "delta"])
+    assert _order(ae) == ["Alpha", "bravo", "delta", "charlie"]
+    d.sort_layers("name", layers=["charlie", "Alpha", "bravo"], reverse=True)
+    assert _order(ae) == ["charlie", "bravo", "delta", "Alpha"]
+    d.set_label(["bravo"], "red")
+    d.sort_layers("label", reverse=True)
+    assert _order(ae)[0] == "bravo"
+    d.add_layer("text", text="T")
+    d.sort_layers("type")
+    assert _order(ae)[-1] == "T"
+    with pytest.raises(ToolError, match="listed twice"):
+        d.sort_layers(layers=["T", "T"])
+    with pytest.raises(ToolError, match="by must be"):
+        d.sort_layers("size")
+    with pytest.raises(ToolError, match="at least 2"):
+        d.sort_layers(layers=["T"])
+
+
+def test_sort_layers_swap_keeps_others(ae):
+    d.create_comp("Main")
+    for n in ("e", "x2", "c", "x1", "a"):
+        d.add_layer("solid", name=n)
+    assert _order(ae) == ["a", "x1", "c", "x2", "e"]
+    d.sort_layers(layers=["e", "c", "a"], reverse=True)
+    assert _order(ae) == ["e", "x1", "c", "x2", "a"]  # x1 and x2 did not move
+
+
+def test_collect_files(ae, tmp_path):
+    src = tmp_path / "src"
+    (src / "shots").mkdir(parents=True)
+    for n in ("clip.mov", "logo.png"):
+        (src / n).write_bytes(b"data")
+    (src / "other").mkdir()
+    (src / "other" / "logo.png").write_bytes(b"other")  # same name, a different file
+    for i in range(1, 4):
+        (src / "shots" / f"shot_{i:04d}.png").write_bytes(b"f")
+    (src / "shots" / "notes.txt").write_text("x")
+    (src / "gone.mov").write_bytes(b"x")
+    for n in ("clip.mov", "logo.png", "other/logo.png", "gone.mov"):
+        d.import_file(str(src / n))
+    d.import_file(str(src / "shots" / "shot_0001.png"), sequence=True)
+    d.import_file(str(src / "clip.mov"))  # a second item, same file: copied once
+    (src / "gone.mov").unlink()
+    d.create_comp("Main")
+    out = d.collect_files(str(tmp_path / "out"), name="job")
+    dest = tmp_path / "out"
+    assert out == {"project": str(dest / "job.aep"), "files": 4, "bytes": 4 + 4 + 5 + 3, "relinked": 5,
+                   "missing": ["gone.mov"]}
+    assert sorted(os.listdir(dest / "Footage")) == ["clip.mov", "logo.png", "logo_2.png", "shot"]
+    assert sorted(os.listdir(dest / "Footage" / "shot")) == ["shot_0001.png", "shot_0002.png", "shot_0003.png"]
+    files = ae.inspect("ae.app.project._items.filter(i => i.file).map(i => [i.name, i.file.fsName])")
+    assert dict(files)["shot_[####].png"] == str(dest / "Footage" / "shot" / "shot_0001.png")
+    assert dict(files)["logo_2.png"] == str(dest / "Footage" / "logo_2.png")
+    assert (dest / "job.aep").exists()
+    # collected again into the same folder: nothing is overwritten
+    out = d.collect_files(str(dest))
+    assert out["project"] == str(dest / "job.aep")  # named after the open project
+    # the items now point at the first copies, so logo_2.png is copied as logo_2_2.png
+    assert sorted(os.listdir(dest / "Footage")) == ["clip.mov", "clip_2.mov", "logo.png", "logo_2.png", "logo_2_2.png",
+                                                    "logo_3.png", "shot", "shot_2"]
+    (tmp_path / "file").write_text("x")
+    with pytest.raises(ToolError, match="not a folder"):
+        d.collect_files(str(tmp_path / "file"))
+    with pytest.raises(ToolError, match="file name without folders"):
+        d.collect_files(str(dest), name="a/b")
+
+
+def test_collect_files_unsaved_project(ae, tmp_path):
+    out = d.collect_files(str(tmp_path / "c"))
+    assert out == {"project": str(tmp_path / "c" / "project.aep"), "files": 0, "bytes": 0, "relinked": 0, "missing": []}
+
+
+def _text(ae, comp, layer):
+    return ae.inspect(f"ae.app.project.item({comp}).layer({layer}).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.text")
+
+
+def test_replace_text(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="Sale 2025", name="Title")
+    d.add_layer("text", text="SALE ends 2025", name="Promo")
+    d.set_text(1, size=40)
+    out = d.replace_text("2025", "2026")
+    assert out == {"changed": [{"comp": "Main", "layer": "Promo", "changed": 1, "text": "SALE ends 2026"},
+                               {"comp": "Main", "layer": "Title", "changed": 1, "text": "Sale 2026"}],
+                   "skipped": []}
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.fontSize") == 40  # styling kept
+    assert len(d.replace_text("sale", "Offer", ignore_case=True)["changed"]) == 2
+    assert _text(ae, 1, 1) == "Offer ends 2026"
+    assert d.replace_text("sale", "x")["changed"] == []  # case matters by default
+    d.replace_text(r"(\d{2})(\d{2})", "$2/$1", regex=True)
+    assert _text(ae, 1, 2) == "Offer 26/20"
+    assert d.replace_text(".", "!", ignore_case=True)["changed"] == []  # a literal find, even with ignore_case
+    d.set_keyframes(1, "text", [{"time": 0, "value": "one a"}, {"time": 1, "value": "two a"}])
+    assert d.replace_text("a", "b")["changed"][0] == {"comp": "Main", "layer": "Promo", "changed": 2, "text": None}
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').keys.map(k => k.value.text)") == ["one b", "two b"]
+    d.set_expression(2, "text", '"live"')
+    assert d.replace_text("Offer", "Deal")["skipped"] == [{"comp": "Main", "layer": "Title",
+                                                           "reason": "driven by an expression"}]
+    d.create_comp("Other")
+    d.add_layer("text", text="Offer", comp="Other")
+    assert [r["comp"] for r in d.replace_text("Offer", "Deal", all_comps=True)["changed"]] == ["Other"]
+    with pytest.raises(ToolError, match="bad regex"):
+        d.replace_text("(", "x", regex=True)
+    with pytest.raises(ToolError, match="find is empty"):
+        d.replace_text("", "x")
+    with pytest.raises(ToolError, match="all_comps"):
+        d.replace_text("a", "b", comp="Main", all_comps=True)
+
+
+def test_fonts(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="A")
+    d.add_layer("text", text="B")
+    d.set_text("B", font="Futura-Bold")
+    d.create_comp("End")
+    d.add_layer("text", text="C", comp="End")
+    d.set_keyframes("C", "text", [{"time": 0, "value": {"text": "C", "font": "Futura-Bold"}},
+                                  {"time": 1, "value": {"text": "D", "font": "Helvetica"}}], comp="End")
+    assert d.list_fonts() == [{"font": "Futura-Bold", "layers": ["Main > B", "End > C"], "installed": False},
+                              {"font": "ArialMT", "layers": ["Main > A"], "installed": True},
+                              {"font": "Helvetica", "layers": ["End > C"], "installed": True}]
+    assert "aemcp: list_fonts" not in ae.inspect("ae.undoLog")
+    out = d.replace_font("Futura-Bold", "Montserrat-Bold")
+    assert out == {"font": "Montserrat-Bold", "layers": [{"comp": "Main", "layer": "B", "changed": 1},
+                                                          {"comp": "End", "layer": "C", "changed": 1}]}
+    assert [f["font"] for f in d.list_fonts()] == ["Montserrat-Bold", "ArialMT", "Helvetica"]
+    with pytest.raises(ToolError, match="no text uses ArialMT"):
+        d.replace_font("ArialMT", "Helvetica", comp="End")
+    assert d.replace_font("ArialMT", "Helvetica", comp="Main")["layers"] == [{"comp": "Main", "layer": "A",
+                                                                              "changed": 1}]
+    with pytest.raises(ToolError, match="font not installed: Comic"):
+        d.replace_font("Helvetica", "Comic")
+    with pytest.raises(ToolError, match="PostScript"):
+        d.replace_font(" ", "Helvetica")

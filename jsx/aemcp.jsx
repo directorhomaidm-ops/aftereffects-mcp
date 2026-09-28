@@ -477,6 +477,83 @@ var aemcp = (function () {
         }
     }
 
+    function walk(group, fn, path, depth) {
+        // fn(property, path) for every property under a layer or group
+        var i, q, name;
+        for (i = 1; i <= group.numProperties; i++) {
+            q = group.property(i);
+            name = path ? path + " > " + q.name : q.name;
+            if (q.propertyType === PropertyType.PROPERTY) {
+                fn(q, name);
+            } else if (depth < 8) {
+                walk(q, fn, name, depth + 1);
+            }
+        }
+    }
+
+    function targetComps(a) {
+        var out = [], items, i;
+        if (!a.allComps) {
+            return [findComp(a.comp)];
+        }
+        items = allItems();
+        for (i = 0; i < items.length; i++) {
+            if (items[i] instanceof CompItem) {
+                out.push(items[i]);
+            }
+        }
+        return out;
+    }
+
+    function textLayers(a) {
+        // [{comp, layer, prop}] for the Source Text of every text layer in the target comps
+        var comps = targetComps(a), out = [], i, j, l;
+        for (i = 0; i < comps.length; i++) {
+            for (j = 1; j <= comps[i].numLayers; j++) {
+                l = comps[i].layer(j);
+                if (l instanceof TextLayer) {
+                    out.push({comp: comps[i], layer: l, prop: l.property("ADBE Text Properties").property("ADBE Text Document")});
+                }
+            }
+        }
+        return out;
+    }
+
+    function editText(prop, fn) {
+        // run fn(doc) on the static value or on each keyframe's value; fn returns true when it changed the doc.
+        // Returns the number of values changed.
+        var n = 0, i, doc;
+        if (prop.numKeys === 0) {
+            doc = prop.value;
+            if (fn(doc)) {
+                prop.setValue(doc);
+                n += 1;
+            }
+            return n;
+        }
+        for (i = 1; i <= prop.numKeys; i++) {
+            doc = prop.keyValue(i);
+            if (fn(doc)) {
+                prop.setValueAtKey(i, doc);
+                n += 1;
+            }
+        }
+        return n;
+    }
+
+    function near(c, target, tol) {
+        return Math.abs(c[0] - target[0]) <= tol && Math.abs(c[1] - target[1]) <= tol && Math.abs(c[2] - target[2]) <= tol;
+    }
+
+    function recolor(c, to) {
+        // keep alpha (4th value) when there is one
+        var out = [to[0], to[1], to[2]];
+        if (c.length > 3) {
+            out.push(c[3]);
+        }
+        return out;
+    }
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -1563,7 +1640,11 @@ var aemcp = (function () {
             var done = [], i, it;
             for (i = 0; i < a.links.length; i++) {
                 it = findItemOfType(a.links[i].id, FootageItem, "footage");
-                it.replace(new File(a.links[i].path));
+                if (a.links[i].sequence) {
+                    it.replaceWithSequence(new File(a.links[i].path), false);
+                } else {
+                    it.replace(new File(a.links[i].path));
+                }
                 done.push({id: it.id, name: it.name, missing: it.footageMissing});
             }
             return done;
@@ -2247,13 +2328,381 @@ var aemcp = (function () {
                 error: text.expressionError || null};
         },
 
+        retime_keyframes: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), props = [], out = [], i, j, p, keys, k, t, idx, first,
+                last, anchor;
+            if (a.property !== undefined) {
+                props.push(findProperty(l, a.property));
+                if (!props[0].numKeys) {
+                    fail(props[0].name + " on " + l.name + " has no keyframes");
+                }
+            } else {
+                walk(l, function (q) {
+                    // markers are not animation: they stay where they are
+                    if (q.numKeys > 0 && q.propertyValueType !== PropertyValueType.MARKER) {
+                        props.push(q);
+                    }
+                }, "", 0);
+                if (!props.length) {
+                    fail(l.name + " has no keyframes");
+                }
+            }
+            // one time range for all the properties, so they stay in sync
+            first = Infinity;
+            last = -Infinity;
+            for (i = 0; i < props.length; i++) {
+                first = Math.min(first, props[i].keyTime(1));
+                last = Math.max(last, props[i].keyTime(props[i].numKeys));
+            }
+            anchor = a.anchor !== undefined ? a.anchor : first;
+            for (i = 0; i < props.length; i++) {
+                p = props[i];
+                keys = [];
+                for (j = 1; j <= p.numKeys; j++) {
+                    k = {time: p.keyTime(j), value: p.keyValue(j), inType: p.keyInInterpolationType(j),
+                        outType: p.keyOutInterpolationType(j)};
+                    if (p.propertyValueType !== PropertyValueType.TEXT_DOCUMENT) {
+                        k.inEase = p.keyInTemporalEase(j);
+                        k.outEase = p.keyOutTemporalEase(j);
+                    }
+                    keys.push(k);
+                }
+                while (p.numKeys > 0) {
+                    p.removeKey(p.numKeys);
+                }
+                for (j = 0; j < keys.length; j++) {
+                    k = keys[j];
+                    t = a.reverse ? first + last - k.time : k.time;
+                    t = anchor + (t - anchor) * a.scale + a.offset;
+                    p.setValueAtTime(t, k.value);
+                    idx = p.nearestKeyIndex(t);
+                    // reversed, what came into a key now leaves it
+                    p.setInterpolationTypeAtKey(idx, a.reverse ? k.outType : k.inType, a.reverse ? k.inType : k.outType);
+                    if (k.inEase && (k.inType === KeyframeInterpolationType.BEZIER ||
+                            k.outType === KeyframeInterpolationType.BEZIER)) {
+                        p.setTemporalEaseAtKey(idx, a.reverse ? k.outEase : k.inEase, a.reverse ? k.inEase : k.outEase);
+                    }
+                }
+                out.push({property: p.name, keys: p.numKeys, from: round(p.keyTime(1)), to: round(p.keyTime(p.numKeys))});
+            }
+            return {layer: l.name, properties: out};
+        },
+
+        interpret_footage: function (a) {
+            var it = findItemOfType(a.item, FootageItem, "footage"), src = it.mainSource, modes = {
+                straight: AlphaMode.STRAIGHT, premultiplied: AlphaMode.PREMULTIPLIED, ignore: AlphaMode.IGNORE}, k, alpha;
+            if (src instanceof SolidSource) {
+                fail(it.name + " is a solid: nothing to interpret");
+            }
+            if (a.frameRate !== undefined) {
+                if (src.isStill) {
+                    fail(it.name + " is a still: it has no frame rate to conform");
+                }
+                src.conformFrameRate = a.frameRate;  // 0 goes back to the file's own rate
+            }
+            if (a.alpha !== undefined || a.invertAlpha !== undefined) {
+                if (!src.hasAlpha) {
+                    fail(it.name + " has no alpha channel");
+                }
+                if (a.alpha !== undefined) {
+                    src.alphaMode = modes[a.alpha];
+                }
+                if (a.invertAlpha !== undefined) {
+                    src.invertAlpha = a.invertAlpha;
+                }
+            }
+            if (a.loop !== undefined) {
+                if (src.isStill) {
+                    fail(it.name + " is a still: it cannot loop");
+                }
+                src.loop = a.loop;
+            }
+            if (a.pixelAspect !== undefined) {
+                it.pixelAspect = a.pixelAspect;
+            }
+            for (k in modes) {
+                if (modes.hasOwnProperty(k) && src.hasAlpha && src.alphaMode === modes[k]) {
+                    alpha = k;
+                }
+            }
+            return {name: it.name, frameRate: round(it.frameRate), duration: round(it.duration),
+                conformFrameRate: src.isStill ? null : round(src.conformFrameRate), alpha: alpha || null,
+                invertAlpha: src.hasAlpha ? !!src.invertAlpha : null, loop: src.isStill ? null : src.loop,
+                pixelAspect: it.pixelAspect};
+        },
+
+        replace_color: function (a) {
+            var comps = targetComps(a), out = [], solids = [], i, j, l, name, n;
+            function take(p, path) {
+                var hits = 0, k;
+                if (p.propertyValueType !== PropertyValueType.COLOR) {
+                    return;
+                }
+                if (p.numKeys === 0) {
+                    if (near(p.value, a.find, a.tolerance)) {
+                        p.setValue(recolor(p.value, a.replace));
+                        hits = 1;
+                    }
+                } else {
+                    for (k = 1; k <= p.numKeys; k++) {
+                        if (near(p.keyValue(k), a.find, a.tolerance)) {
+                            p.setValueAtKey(k, recolor(p.keyValue(k), a.replace));
+                            hits += 1;
+                        }
+                    }
+                }
+                if (hits) {
+                    out.push({comp: comps[i].name, layer: name, property: path, changed: hits});
+                }
+            }
+            for (i = 0; i < comps.length; i++) {
+                for (j = 1; j <= comps[i].numLayers; j++) {
+                    l = comps[i].layer(j);
+                    name = l.name;
+                    if (a.layers && !contains(a.layers, l.name) && !contains(a.layers, l.index)) {
+                        continue;
+                    }
+                    walk(l, take, "", 0);
+                    if (l instanceof TextLayer) {
+                        n = editText(l.property("ADBE Text Properties").property("ADBE Text Document"), function (doc) {
+                            var hit = false;
+                            if (doc.applyFill && near(doc.fillColor, a.find, a.tolerance)) {
+                                doc.fillColor = [a.replace[0], a.replace[1], a.replace[2]];
+                                hit = true;
+                            }
+                            if (doc.applyStroke && near(doc.strokeColor, a.find, a.tolerance)) {
+                                doc.strokeColor = [a.replace[0], a.replace[1], a.replace[2]];
+                                hit = true;
+                            }
+                            return hit;
+                        });
+                        if (n) {
+                            out.push({comp: comps[i].name, layer: name, property: "Source Text", changed: n});
+                        }
+                    }
+                    // a solid's color lives on its source, shared by every layer that uses it: change it once
+                    if (l.source && l.source.mainSource instanceof SolidSource && !contains(solids, l.source) &&
+                            near(l.source.mainSource.color, a.find, a.tolerance)) {
+                        l.source.mainSource.color = [a.replace[0], a.replace[1], a.replace[2]];
+                        solids.push(l.source);
+                        out.push({comp: comps[i].name, layer: name, property: "Solid Color", changed: 1});
+                    }
+                }
+            }
+            return {changed: out};
+        },
+
+        fit_text: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), p, doc, before, r, s, w, h, f, i;
+            if (!(l instanceof TextLayer)) {
+                fail(l.name + " is not a text layer");
+            }
+            p = l.property("ADBE Text Properties").property("ADBE Text Document");
+            if (p.numKeys) {
+                fail(l.name + "'s Source Text has keyframes: fit_text sets one font size");
+            }
+            s = transform(l, "ADBE Scale").value;
+            before = p.value.fontSize;
+            // text does not scale exactly with its size (kerning, leading): measure and correct a few times
+            for (i = 0; i < 4; i++) {
+                r = l.sourceRectAtTime(a.time !== undefined ? a.time : l.inPoint, false);
+                w = r.width * Math.abs(s[0]) / 100;
+                h = r.height * Math.abs(s[1]) / 100;
+                if (!w || !h) {
+                    fail(l.name + " draws nothing to measure (empty text?)");
+                }
+                f = a.width / w;
+                if (a.height !== undefined) {
+                    f = Math.min(f, a.height / h);
+                }
+                doc = p.value;
+                if (Math.abs(f - 1) < 0.005) {
+                    break;
+                }
+                doc.fontSize = Math.max(a.minSize, Math.min(a.maxSize, doc.fontSize * f));
+                p.setValue(doc);
+                if (doc.fontSize === a.minSize || doc.fontSize === a.maxSize) {
+                    break;
+                }
+            }
+            r = l.sourceRectAtTime(a.time !== undefined ? a.time : l.inPoint, false);
+            return {layer: l.name, fontSize: {before: before, after: round(p.value.fontSize, 2)},
+                size: [round(r.width * Math.abs(s[0]) / 100, 1), round(r.height * Math.abs(s[1]) / 100, 1)],
+                clamped: p.value.fontSize === a.minSize || p.value.fontSize === a.maxSize};
+        },
+
+        sort_layers: function (a) {
+            var c = findComp(a.comp), rows = [], slots = [], i, j, tmp, l, x, key, pos;
+            function keyOf(l) {
+                if (a.by === "name") {
+                    return l.name.toLowerCase();
+                }
+                if (a.by === "in_point") {
+                    return l.inPoint;
+                }
+                if (a.by === "duration") {
+                    return l.outPoint - l.inPoint;
+                }
+                if (a.by === "label") {
+                    return l.label;
+                }
+                return layerType(l);
+            }
+            if (a.layers) {
+                for (i = 0; i < a.layers.length; i++) {
+                    l = findLayer(c, a.layers[i]);
+                    if (contains(slots, l.index)) {
+                        fail(l.name + " is listed twice");
+                    }
+                    slots.push(l.index);
+                    rows.push({layer: l, key: keyOf(l)});
+                }
+            } else {
+                for (i = 1; i <= c.numLayers; i++) {
+                    slots.push(i);
+                    rows.push({layer: c.layer(i), key: keyOf(c.layer(i))});
+                }
+            }
+            // stable insertion sorts: the slots ascending, the layers by key
+            for (i = 1; i < slots.length; i++) {
+                tmp = slots[i];
+                for (j = i - 1; j >= 0 && slots[j] > tmp; j--) {
+                    slots[j + 1] = slots[j];
+                }
+                slots[j + 1] = tmp;
+            }
+            for (i = 1; i < rows.length; i++) {
+                tmp = rows[i];
+                for (j = i - 1; j >= 0 && (a.reverse ? rows[j].key < tmp.key : rows[j].key > tmp.key); j--) {
+                    rows[j + 1] = rows[j];
+                }
+                rows[j + 1] = tmp;
+            }
+            // fill the slots in order; a swap (two moves) leaves the layers between the two slots where they were
+            for (i = 0; i < rows.length; i++) {
+                l = rows[i].layer;
+                if (l.index === slots[i]) {
+                    continue;
+                }
+                x = c.layer(slots[i]);
+                pos = l.index;
+                l.moveBefore(x);
+                if (c.layer(pos) !== x) {
+                    x.moveAfter(c.layer(pos));
+                }
+            }
+            key = [];
+            for (i = 0; i < slots.length; i++) {
+                key.push({index: slots[i], name: c.layer(slots[i]).name});
+            }
+            return {by: a.by, layers: key};
+        },
+
+        footage_files: function () {
+            var items = allItems(), out = [], i, it;
+            for (i = 0; i < items.length; i++) {
+                it = items[i];
+                if (it instanceof FootageItem && it.file) {
+                    out.push({id: it.id, name: it.name, file: it.file.fsName, missing: !it.file.exists,
+                        sequence: !it.mainSource.isStill && /\[[#\d-]+\]/.test(it.name)});
+                }
+            }
+            return out;
+        },
+
+        replace_text: function (a) {
+            var rows = textLayers(a), out = [], skipped = [], i, re, n, before;
+            re = a.regex ? new RegExp(a.find, a.ignoreCase ? "gi" : "g") : null;
+            for (i = 0; i < rows.length; i++) {
+                if (rows[i].prop.expressionEnabled && rows[i].prop.expression) {
+                    skipped.push({comp: rows[i].comp.name, layer: rows[i].layer.name, reason: "driven by an expression"});
+                    continue;
+                }
+                before = rows[i].layer.name;
+                n = editText(rows[i].prop, function (doc) {
+                    var old = doc.text, now;
+                    if (re) {
+                        now = old.replace(re, a.replace);
+                    } else if (a.ignoreCase) {
+                        now = old.replace(new RegExp(a.find.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&"), "gi"), function () {
+                            return a.replace;
+                        });
+                    } else {
+                        now = old.split(a.find).join(a.replace);
+                    }
+                    if (now === old) {
+                        return false;
+                    }
+                    doc.text = now;
+                    return true;
+                });
+                if (n) {
+                    out.push({comp: rows[i].comp.name, layer: before, changed: n,
+                        text: rows[i].prop.numKeys ? null : rows[i].prop.value.text});
+                }
+            }
+            return {changed: out, skipped: skipped};
+        },
+
+        list_fonts: function () {
+            var rows = textLayers({allComps: true}), fonts = {}, out = [], i, k, f, seen;
+            function add(font, row) {
+                if (!fonts[font]) {
+                    fonts[font] = {font: font, layers: []};
+                    out.push(fonts[font]);
+                }
+                seen = fonts[font].layers;
+                if (!contains(seen, row)) {
+                    seen.push(row);
+                }
+            }
+            for (i = 0; i < rows.length; i++) {
+                f = rows[i].comp.name + " > " + rows[i].layer.name;
+                if (rows[i].prop.numKeys === 0) {
+                    add(rows[i].prop.value.font, f);
+                }
+                for (k = 1; k <= rows[i].prop.numKeys; k++) {
+                    add(rows[i].prop.keyValue(k).font, f);
+                }
+            }
+            for (i = 0; i < out.length; i++) {
+                // app.fonts came in After Effects 24; older versions cannot tell what is installed
+                out[i].installed = app.fonts ? app.fonts.getFontsByPostScriptName(out[i].font).length > 0 : null;
+            }
+            return out;
+        },
+
+        replace_font: function (a) {
+            var rows = textLayers(a), out = [], i, n;
+            if (app.fonts && app.fonts.getFontsByPostScriptName(a.replace).length === 0) {
+                fail("font not installed: " + a.replace + " (use the PostScript name, e.g. Montserrat-Bold; see list_fonts)");
+            }
+            for (i = 0; i < rows.length; i++) {
+                n = editText(rows[i].prop, function (doc) {
+                    if (doc.font !== a.find) {
+                        return false;
+                    }
+                    doc.font = a.replace;
+                    return true;
+                });
+                if (n) {
+                    out.push({comp: rows[i].comp.name, layer: rows[i].layer.name, changed: n});
+                }
+            }
+            if (!out.length) {
+                fail("no text uses " + a.find + " (see list_fonts)");
+            }
+            return {font: a.replace, layers: out};
+        },
+
         run_jsx: function (a) {
             return plain(eval(a.code));
         }
     };
 
     var READ_ONLY = {status: 1, list_items: 1, comp_info: 1, get_property: 1, list_effects: 1, property_tree: 1,
-        missing_footage: 1, audio_source: 1, render_queue_list: 1, describe_comp: 1, find_layers: 1};
+        missing_footage: 1, audio_source: 1, render_queue_list: 1, describe_comp: 1, find_layers: 1,
+        footage_files: 1, list_fonts: 1};
 
     function run(name, args) {
         var result, cmd = commands[name];

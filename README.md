@@ -112,6 +112,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `grid_layout` | `layers`, `columns = 3`, `gap = 20`, `margin = 40`, `fit = True`, `comp` | `{rows, columns, cell, layers: [{layer, cell, center}]}` |
 | `comp_from_footage` | `item`, `name`, `still_duration = 5`, `frame_rate = 30` | comp info |
 | `number_counter` | `from_value`, `to_value`, `duration = 2`, `start`, `decimals`, `prefix`, `suffix`, `separator`, `ease`, `layer`, `name`, `comp` | `{layer, index, from, to, expression, error}` |
+| `retime_keyframes` | `layer`, `property` (none: every animated property), `offset`, `scale`, `reverse`, `anchor`, `comp` | `{layer, properties: [{property, keys, from, to}]}` |
+| `interpret_footage` | `item`, `frame_rate` (0: the file's own), `alpha` (straight, premultiplied, ignore), `invert_alpha`, `loop`, `pixel_aspect` | `{name, frameRate, duration, conformFrameRate, alpha, invertAlpha, loop, pixelAspect}` |
+| `replace_color` | `find`, `replace` (hex or [r, g, b]), `tolerance = 0.02`, `layers`, `comp`, `all_comps` | `{changed: [{comp, layer, property, changed}]}` |
+| `fit_text` | `layer`, `width`, `height`, `min_size = 6`, `max_size = 1296`, `comp` | `{layer, fontSize: {before, after}, size, clamped}` |
+| `sort_layers` | `by` (name, in_point, duration, label, type), `reverse`, `layers`, `comp` | `{by, layers: [{index, name}]}` |
+| `collect_files` | `folder`, `name` | `{project, files, bytes, relinked, missing}` |
+| `replace_text` | `find`, `replace`, `regex`, `ignore_case`, `comp`, `all_comps` | `{changed: [{comp, layer, changed, text}], skipped}` |
+| `list_fonts` | | `[{font, layers, installed}]` |
+| `replace_font` | `find`, `replace` (PostScript names), `comp`, `all_comps = True` | `{font, layers: [{comp, layer, changed}]}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -155,6 +164,10 @@ Notes:
 - `describe_comp` and `find_layers` are read-only: they walk every property of every layer (animated means at least one keyframe; long expressions are cut at 160 characters).
 - The layout tools (`align_layers`, `distribute_layers`, `grid_layout`) work on each layer's box in the comp, measured from what it draws (`sourceRectAtTime` for text and shapes, the source size for footage), its anchor, position and scale. Rotated or parented layers and animated positions are refused.
 - `number_counter` keys a Slider Control named Counter and shows it through an expression on Source Text (`toFixed`, then the thousands separator); change the slider's keyframes to retime it.
+- `retime_keyframes` rebuilds the keys at their new times with the same values, interpolation and temporal ease; custom motion path handles go back to auto.
+- `replace_color` changes every color property (shape fills and strokes, effects, keyframes), text fill and stroke, and solid colors. A solid's color is shared by every layer using that solid.
+- `collect_files` relinks the open project to the copies and saves it in the folder, so the open project becomes the collected one; the original files and project are left as they were.
+- `list_fonts` reports whether a font is installed through `app.fonts` (After Effects 24 and later); `replace_font` refuses a font that is not installed.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Configuration

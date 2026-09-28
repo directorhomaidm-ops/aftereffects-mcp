@@ -1624,6 +1624,203 @@ def number_counter(from_value: float = 0, to_value: float = 100, duration: float
                  separator=separator, ease=ease)
 
 
+# --- keyframe timing, footage, colors, text, fonts, collecting ---
+
+
+@_tool
+def retime_keyframes(layer: int | str, property: str | list[str] | None = None, offset: float = 0.0,
+                     scale: float = 1.0, reverse: bool = False, anchor: float | None = None,
+                     comp: int | str | None = None) -> dict:
+    """Move, stretch or reverse a layer's keyframes, keeping values and easing: each key goes to
+    anchor + (time - anchor) * scale + offset (anchor defaults to the first key; scale 2 is twice as slow, 0.5 twice
+    as fast); reverse plays the animation backwards over the same time. With no property, every animated property
+    on the layer moves together (markers stay). Custom spatial (motion path) handles go back to auto."""
+    if scale <= 0:
+        raise ToolError("scale must be above 0")
+    if not offset and scale == 1 and not reverse:
+        raise ToolError("nothing to do: pass offset, scale or reverse")
+    return _call("retime_keyframes", comp=comp, layer=layer, property=property, offset=offset, scale=scale,
+                 reverse=reverse or None, anchor=anchor)
+
+
+ALPHA_MODES = ("straight", "premultiplied", "ignore")
+
+
+@_tool
+def interpret_footage(item: int | str, frame_rate: float | None = None, alpha: str | None = None,
+                      invert_alpha: bool | None = None, loop: int | None = None,
+                      pixel_aspect: float | None = None) -> dict:
+    """Interpret Footage: conform the frame rate (0 = the file's own), alpha (straight, premultiplied, ignore),
+    invert alpha, loop count, pixel aspect. Every layer using the item follows. Returns the item's settings."""
+    if frame_rate is not None and not 0 <= frame_rate <= 999:
+        raise ToolError("frame_rate must be 0-999 (0 = the file's own rate)")
+    if alpha is not None and alpha not in ALPHA_MODES:
+        raise ToolError(f"alpha must be one of: {', '.join(ALPHA_MODES)}")
+    if loop is not None and not 1 <= loop <= 9999:
+        raise ToolError("loop must be 1-9999")
+    if pixel_aspect is not None and not 0.01 <= pixel_aspect <= 100:
+        raise ToolError("pixel_aspect must be 0.01-100")
+    return _call("interpret_footage", item=item, frameRate=frame_rate, alpha=alpha, invertAlpha=invert_alpha,
+                 loop=loop, pixelAspect=pixel_aspect)
+
+
+def _rgb(name, v):
+    if isinstance(v, str):
+        m = re.fullmatch(r"#?([0-9a-fA-F]{6})", v.strip())
+        if not m:
+            raise ToolError(f"{name} needs a hex color like #FF8800, or [r, g, b] 0-1")
+        return [round(int(m.group(1)[i:i + 2], 16) / 255, 6) for i in (0, 2, 4)]
+    return _color(name, v)
+
+
+@_tool
+def replace_color(find: str | list[float], replace: str | list[float], tolerance: float = 0.02,
+                  layers: list[int | str] | None = None, comp: int | str | None = None,
+                  all_comps: bool = False) -> dict:
+    """Swap one color for another everywhere it is used: shape fills and strokes, effect colors, text fill and
+    stroke, solid colors, including keyframed values. Colors are hex (#FF8800) or [r, g, b] 0-1; tolerance (0-1)
+    also catches near matches. Limit it to some layers, or run over every comp with all_comps. A solid's color is
+    shared by all layers using that solid."""
+    if not 0 <= tolerance <= 1:
+        raise ToolError("tolerance must be 0-1")
+    if all_comps and (comp is not None or layers):
+        raise ToolError("all_comps covers every comp: leave out comp and layers")
+    return _call("replace_color", comp=comp, allComps=all_comps or None, layers=layers,
+                 find=_rgb("find", find), replace=_rgb("replace", replace), tolerance=tolerance)
+
+
+@_tool
+def fit_text(layer: int | str, width: float, height: float | None = None, min_size: float = 6,
+             max_size: float = 1296, comp: int | str | None = None) -> dict:
+    """Set a text layer's font size so the text fills `width` (and fits `height`, when given) in comp pixels,
+    counting the layer's scale. The size stays within min_size-max_size."""
+    if width <= 0 or (height is not None and height <= 0):
+        raise ToolError("width and height must be above 0")
+    if not 0 < min_size <= max_size <= 1296:
+        raise ToolError("need 0 < min_size <= max_size <= 1296")
+    return _call("fit_text", comp=comp, layer=layer, width=width, height=height, minSize=min_size, maxSize=max_size)
+
+
+SORT_KEYS = ("name", "in_point", "duration", "label", "type")
+
+
+@_tool
+def sort_layers(by: str = "name", reverse: bool = False, layers: list[int | str] | None = None,
+                comp: int | str | None = None) -> dict:
+    """Reorder layers in the stack by name, in_point, duration, label or type (first on top; reverse flips it).
+    With `layers`, only those are sorted, into the positions they already hold; the others stay put."""
+    if by not in SORT_KEYS:
+        raise ToolError(f"by must be one of: {', '.join(SORT_KEYS)}")
+    if layers is not None and len(layers) < 2:
+        raise ToolError("sorting needs at least 2 layers")
+    return _call("sort_layers", comp=comp, by=by, reverse=reverse or None, layers=layers)
+
+
+def _copy_new(src, folder):
+    # copy without overwriting: name.ext, name_2.ext, ...
+    stem, ext = os.path.splitext(os.path.basename(src))
+    dst, n = os.path.join(folder, stem + ext), 1
+    while os.path.exists(dst):
+        n += 1
+        dst = os.path.join(folder, f"{stem}_{n}{ext}")
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _sequence_files(first):
+    # the frames of an image sequence: same prefix and extension, a frame number in place of the digits
+    folder, base = os.path.split(first)
+    m = re.fullmatch(r"(.*?)(\d+)(\.\w+)", base)
+    if not m:
+        return [first]
+    pat = re.compile(re.escape(m.group(1)) + r"\d+" + re.escape(m.group(3)) + "$")
+    return sorted(os.path.join(folder, f) for f in os.listdir(folder) if pat.match(f))
+
+
+@_tool
+def collect_files(folder: str, name: str | None = None) -> dict:
+    """Collect the project into `folder`: copy every footage file it uses into folder/Footage (image sequences
+    into a subfolder each; files are never overwritten), relink the items to the copies and save the project there
+    as `name`.aep (default: the project's name). The open project becomes the collected one. Missing footage is
+    listed, not copied."""
+    root = _path(folder)
+    if os.path.exists(root) and not os.path.isdir(root):
+        raise ToolError(f"not a folder: {root}")
+    if name is not None and (not name.strip() or os.sep in name or name.startswith(".")):
+        raise ToolError("name is a file name without folders, e.g. 'my project'")
+    items = _call("footage_files")
+    footage = os.path.join(root, "Footage")
+    os.makedirs(footage, exist_ok=True)
+    copies, links, missing, size = {}, [], [], 0
+    for it in items:
+        if it["missing"]:
+            missing.append(it["name"])
+            continue
+        src = it["file"]
+        if src not in copies:
+            if it["sequence"]:
+                frames = _sequence_files(src)
+                sub = os.path.join(footage, os.path.splitext(os.path.basename(src))[0].rstrip("0123456789_-. ") or "frames")
+                n, dest = 1, sub
+                while os.path.exists(dest):
+                    n += 1
+                    dest = f"{sub}_{n}"
+                os.makedirs(dest)
+                for f in frames:
+                    shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+                    size += os.path.getsize(f)
+                copies[src] = os.path.join(dest, os.path.basename(src))
+            else:
+                copies[src] = _copy_new(src, footage)
+                size += os.path.getsize(src)
+        links.append({"id": it["id"], "path": copies[src], "sequence": it["sequence"] or None})
+    relinked = _call("relink_footage", links=links) if links else []
+    if name is None:
+        project = _call("status").get("project")
+        name = os.path.splitext(os.path.basename(project))[0] if project else "project"
+    target = os.path.join(root, name if name.endswith(".aep") else name + ".aep")
+    saved = _call("save_project", path=target)
+    return {"project": saved["project"], "files": len(copies), "bytes": size, "relinked": len(relinked),
+            "missing": missing}
+
+
+@_tool
+def replace_text(find: str, replace: str, regex: bool = False, ignore_case: bool = False,
+                 comp: int | str | None = None, all_comps: bool = False) -> dict:
+    """Find and replace in the text of every text layer (keyframed Source Text included) in a comp, or in every
+    comp with all_comps. With regex, `replace` can use $1, $2. Text driven by an expression is skipped and listed.
+    Styling (font, size, color) stays."""
+    if not find:
+        raise ToolError("find is empty")
+    if regex:
+        try:
+            re.compile(find)
+        except re.error as e:
+            raise ToolError(f"bad regex: {e}")
+    if all_comps and comp is not None:
+        raise ToolError("all_comps covers every comp: leave out comp")
+    return _call("replace_text", comp=comp, allComps=all_comps or None, find=find, replace=replace,
+                 regex=regex or None, ignoreCase=ignore_case or None)
+
+
+@_tool
+def list_fonts() -> list:
+    """The fonts the project's text layers use (PostScript names), each with its layers ("comp > layer") and
+    whether it is installed (null when After Effects cannot tell)."""
+    return _call("list_fonts")
+
+
+@_tool
+def replace_font(find: str, replace: str, comp: int | str | None = None, all_comps: bool = True) -> dict:
+    """Swap one font for another in every text layer that uses it (keyframed Source Text included). Fonts are
+    PostScript names as list_fonts shows them, e.g. Montserrat-Bold; the new one must be installed. Every comp by
+    default, or one `comp`."""
+    if not find.strip() or not replace.strip():
+        raise ToolError("find and replace are PostScript font names, e.g. ArialMT")
+    return _call("replace_font", comp=comp, allComps=(all_comps and comp is None) or None, find=find.strip(),
+                 replace=replace.strip())
+
+
 @_tool
 def run_jsx(code: str) -> Any:
     """Run ExtendScript in After Effects and return its value (numbers, strings, arrays; other objects as text).
