@@ -80,6 +80,35 @@ const EFFECTS = [
     {displayName: "Fill", matchName: "ADBE Fill", category: "Generate", params: {"Color": [1, 0, 0, 1]}},
     {displayName: "Slider Control", matchName: "ADBE Slider Control", category: "Expression Controls",
         params: {"Slider": 0}},
+    // list params: [name, value]; null is a topic header (no value), {layer: 0} a layer picker, [x, y] a point,
+    // [r, g, b, a] a color. Lumetri repeats Saturation under Basic Correction and Creative, as After Effects does
+    {displayName: "Lumetri Color", matchName: "ADBE Lumetri", category: "Color Correction", params: [
+        ["Basic Correction", null], ["Temperature", 0], ["Tint", 0], ["Exposure", 0], ["Contrast", 0],
+        ["Highlights", 0], ["Shadows", 0], ["Whites", 0], ["Blacks", 0], ["Saturation", 100],
+        ["Creative", null], ["Faded Film", 0], ["Sharpen", 0], ["Vibrance", 0], ["Saturation", 100],
+        ["Vignette", null], ["Amount", 0], ["Midpoint", 50], ["Roundness", 0], ["Feather", 50]]},
+    {displayName: "Color Balance", matchName: "ADBE Color Balance 2", category: "Color Correction", params: [
+        "Shadow", "Midtone", "Highlight"].flatMap((t) => ["Red", "Green", "Blue"].map((c) => [t + " " + c + " Balance", 0]))
+        .concat([["Preserve Luminosity", 0]])},
+    {displayName: "Keylight (1.2)", matchName: "Keylight 906", category: "Keying", params: [
+        ["View", 1], ["Screen Colour", [0, 0, 0, 1]], ["Screen Gain", 100], ["Screen Balance", 50],
+        ["Screen Matte", null], ["Clip Black", 0], ["Clip White", 100], ["Screen Shrink/Grow", 0],
+        ["Screen Softness", 0]]},
+    {displayName: "Key Cleaner", matchName: "ADBE KeyCleaner", category: "Keying", params: [
+        ["Additional Edge Radius", 1], ["Reduce Chatter", 0], ["Alpha Contrast", 100], ["Strength", 100]]},
+    {displayName: "Advanced Spill Suppressor", matchName: "ADBE Spill2", category: "Keying", params: [
+        ["Method", 1], ["Suppression", 100]]},
+    {displayName: "Simple Choker", matchName: "ADBE Simple Choker", category: "Matte", params: [
+        ["View", 1], ["Choke Matte", 0]]},
+    {displayName: "Transform", matchName: "ADBE Geometry2", category: "Distort", params: [
+        ["Anchor Point", [960, 540]], ["Position", [960, 540]], ["Uniform Scale", 1], ["Scale", 100],
+        ["Rotation", 0], ["Opacity", 100], ["Use Composition\u2019s Shutter Angle", 1], ["Shutter Angle", 0]]},
+    {displayName: "Turbulent Displace", matchName: "ADBE Turbulent Displace", category: "Distort", params: [
+        ["Displacement", 1], ["Amount", 50], ["Size", 100], ["Complexity", 1], ["Evolution", 0]]},
+    {displayName: "CC Snowfall", matchName: "CC Snowfall", category: "Simulation", params: [
+        ["Flakes", 8000], ["Size", 3], ["Speed", 100], ["Wind", 0], ["Opacity", 100]]},
+    {displayName: "CC Rainfall", matchName: "CC Rainfall", category: "Simulation", params: [
+        ["Drops", 5000], ["Size", 1.5], ["Speed", 4000], ["Wind", 0], ["Opacity", 25]]},
 ];
 
 function makeAE(CtxArray) {
@@ -518,8 +547,21 @@ function makeAE(CtxArray) {
             }
             const e = EFFECTS.find((x) => x.displayName === n || x.matchName === n);
             const same = this.children.filter((c) => c.matchName === e.matchName).length;
-            const params = Object.keys(e.params).map((p) => new Property(p, e.matchName + "-" + p, clone(e.params[p]),
-                Array.isArray(e.params[p]) ? PropertyValueType.COLOR : PropertyValueType.OneD));
+            const list = Array.isArray(e.params) ? e.params : Object.entries(e.params);
+            const params = list.map(([p, v], i) => {
+                const match = e.matchName + "-" + String(i + 1).padStart(4, "0");
+                if (v === null) {
+                    return new Property(p, match, null, PropertyValueType.NO_VALUE);
+                }
+                if (v && v.layer !== undefined) {
+                    return new Property(p, match, v.layer, PropertyValueType.LAYER_INDEX);
+                }
+                if (Array.isArray(v)) {
+                    return v.length === 2 ? new Property(p, match, arr(v), PropertyValueType.TwoD_SPATIAL, true) :
+                        new Property(p, match, arr(v), PropertyValueType.COLOR);
+                }
+                return new Property(p, match, v, PropertyValueType.OneD);
+            });
             const fx = new PropertyGroup(same ? e.displayName + " " + (same + 1) : e.displayName, e.matchName, params);
             this.children.push(fx);
             return fx;

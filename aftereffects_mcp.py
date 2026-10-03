@@ -49,8 +49,9 @@ mcp = MCPServer(
     instructions="Controls the running Adobe After Effects: project items, compositions, layers (text, solid, shape, "
     "null, adjustment, camera, light, footage), properties, keyframes with easing, expressions, effects, masks, "
     "vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, motion "
-    "paths and easing curves, point tracking, cameras, extruded 3D and parallax, import, the render queue and frame "
-    "export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "paths and easing curves, point tracking, cameras, extruded 3D and parallax, color grading looks, cutting to the "
+    "beat, transitions, speed ramps, animated mask reveals, green screen keying, camera shake, glitches, weather, "
+    "letterbox, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -1819,6 +1820,292 @@ def replace_font(find: str, replace: str, comp: int | str | None = None, all_com
         raise ToolError("find and replace are PostScript font names, e.g. ArialMT")
     return _call("replace_font", comp=comp, allComps=(all_comps and comp is None) or None, find=find.strip(),
                  replace=replace.strip())
+
+
+# --- color grading, editing, masks, keying, effects ---
+
+# Lumetri Basic Correction ranges, and the Creative and Vignette ones
+GRADE_BASIC = {"exposure": ("Exposure", -5, 5), "contrast": ("Contrast", -100, 100),
+               "highlights": ("Highlights", -100, 100), "shadows": ("Shadows", -100, 100),
+               "whites": ("Whites", -100, 100), "blacks": ("Blacks", -100, 100),
+               "temperature": ("Temperature", -100, 100), "tint": ("Tint", -100, 100),
+               "saturation": ("Saturation", 0, 200)}
+GRADE_CREATIVE = {"faded_film": ("Faded Film", 0, 100), "sharpen": ("Sharpen", -100, 100),
+                  "vibrance": ("Vibrance", -100, 100)}
+# looks: Lumetri settings, plus Color Balance split toning (red, green, blue pushes, -100 to 100)
+LOOKS = {
+    "teal_orange": {"contrast": 15, "saturation": 115, "vibrance": 10,
+                    "shadow_balance": [-20, 0, 25], "highlight_balance": [20, 5, -20]},
+    "bleach_bypass": {"contrast": 45, "saturation": 45, "highlights": -10, "blacks": -10, "sharpen": 15},
+    "noir": {"saturation": 0, "contrast": 50, "blacks": -20, "vignette": -1.5},
+    "warm": {"temperature": 25, "tint": 5, "vibrance": 10},
+    "cool": {"temperature": -25, "tint": -3},
+    "vintage": {"faded_film": 40, "temperature": 15, "saturation": 80, "contrast": -10,
+                "highlight_balance": [10, 5, -10]},
+    "cyberpunk": {"tint": 25, "temperature": -20, "contrast": 25, "vibrance": 30,
+                  "shadow_balance": [0, -10, 30], "highlight_balance": [30, -10, 20]},
+    "matrix": {"tint": -30, "saturation": 70, "contrast": 20, "shadow_balance": [-10, 20, -10]},
+    "golden_hour": {"temperature": 35, "exposure": 0.2, "highlights": -15, "vibrance": 20},
+    "day_for_night": {"exposure": -1.5, "temperature": -40, "saturation": 45, "contrast": 15, "vignette": -2},
+}
+
+
+def _balance(name, v):
+    if v is None:
+        return None
+    if len(v) != 3 or not all(-100 <= float(x) <= 100 for x in v):
+        raise ToolError(f"{name} needs [red, green, blue] pushes, each -100 to 100")
+    return [float(x) for x in v]
+
+
+@_tool
+def color_grade(look: str | None = None, layer: int | str | None = None, exposure: float | None = None,
+                contrast: float | None = None, highlights: float | None = None, shadows: float | None = None,
+                whites: float | None = None, blacks: float | None = None, temperature: float | None = None,
+                tint: float | None = None, saturation: float | None = None, vibrance: float | None = None,
+                faded_film: float | None = None, sharpen: float | None = None, vignette: float | None = None,
+                shadow_balance: list[float] | None = None, midtone_balance: list[float] | None = None,
+                highlight_balance: list[float] | None = None, name: str = "Grade",
+                comp: int | str | None = None) -> dict:
+    """Grade with Lumetri Color: on a new adjustment layer named `name` over the whole comp (default), or on
+    `layer`. Start from a look (teal_orange, bleach_bypass, noir, warm, cool, vintage, cyberpunk, matrix,
+    golden_hour, day_for_night) and/or set: exposure (-5 to 5 stops), contrast, highlights, shadows, whites, blacks,
+    temperature, tint (-100 to 100), saturation (0-200, 100 = unchanged), vibrance, faded_film (0-100), sharpen,
+    vignette (-3 to 3, negative darkens the edges). Split toning: shadow/midtone/highlight_balance [r, g, b] pushes
+    (-100 to 100) with Color Balance. Given values override the look's."""
+    if look is not None and look not in LOOKS:
+        raise ToolError(f"look must be one of: {', '.join(LOOKS)}")
+    given = {k: v for k, v in dict(exposure=exposure, contrast=contrast, highlights=highlights, shadows=shadows,
+                                   whites=whites, blacks=blacks, temperature=temperature, tint=tint,
+                                   saturation=saturation, vibrance=vibrance, faded_film=faded_film,
+                                   sharpen=sharpen, vignette=vignette, shadow_balance=shadow_balance,
+                                   midtone_balance=midtone_balance, highlight_balance=highlight_balance).items()
+             if v is not None}
+    s = {**LOOKS.get(look, {}), **given}
+    if not s:
+        raise ToolError("nothing to grade: pass a look or some settings")
+    basic, creative = {}, {}
+    for table, out in ((GRADE_BASIC, basic), (GRADE_CREATIVE, creative)):
+        for key, (param, lo, hi) in table.items():
+            if key in s:
+                if not lo <= s[key] <= hi:
+                    raise ToolError(f"{key} must be {lo} to {hi}")
+                out[param] = s[key]
+    if "vignette" in s and not -3 <= s["vignette"] <= 3:
+        raise ToolError("vignette must be -3 to 3")
+    balance = {k: _balance(f"{k[:-1]}_balance", s.get(f"{k[:-1]}_balance"))
+               for k in ("shadows", "midtones", "highlights")}
+    balance = {k: v for k, v in balance.items() if v is not None}
+    return _call("color_grade", comp=comp, layer=layer, name=name, basic=basic, creative=creative,
+                 vignette=s.get("vignette"), balance=balance or None)
+
+
+@_tool
+def beat_cut(layers: list[int | str], beats: list[float] | None = None, bpm: float | None = None, every: int = 1,
+             start: float | None = None, end: float | None = None, skip: float = 0.0,
+             comp: int | str | None = None) -> dict:
+    """Cut clips to the music: from `start` to `end` (default the first beat to the comp's end), a cut on every
+    `every`-th beat, cycling through `layers` (each cut a copy named "<layer> cut <n>"). Beats come from `beats`
+    (seconds), a `bpm`, or else the comp's markers (see markers_from_audio). Each clip keeps playing where its last
+    cut left off, plus `skip` seconds, and loops back when its footage runs out. The original layers are turned
+    off."""
+    if not layers:
+        raise ToolError("no layers to cut")
+    if bpm is not None and not 20 <= bpm <= 400:
+        raise ToolError("bpm must be 20-400")
+    if beats is not None and (not beats or beats != sorted(beats) or beats[0] < 0):
+        raise ToolError("beats must be ascending times in seconds, 0 or more")
+    if beats is not None and bpm is not None:
+        raise ToolError("pass beats or bpm, not both")
+    if every < 1 or skip < 0:
+        raise ToolError("every must be 1 or more and skip 0 or more")
+    if start is not None and end is not None and end <= start:
+        raise ToolError("end must be after start")
+    return _call("beat_cut", comp=comp, layers=layers, beats=beats, bpm=bpm, every=every, start=start, end=end,
+                 skip=skip)
+
+
+TRANSITIONS = ("crossfade", "dip_to_black", "dip_to_white", "push_left", "push_right", "push_up", "push_down",
+               "whip_left", "whip_right", "whip_up", "whip_down", "zoom", "spin")
+
+
+@_tool
+def transition(from_layer: int | str, to_layer: int | str, kind: str = "crossfade", duration: float = 0.5,
+               comp: int | str | None = None) -> dict:
+    """A transition from one layer to the next: to_layer is moved in time to overlap the end of from_layer by
+    `duration` seconds (dips: to start where it ends) and above it. kind: crossfade, dip_to_black, dip_to_white
+    (a solid fades up and down over the cut), push_<left|right|up|down> (both slide by a frame), whip_<dir> (a fast
+    push with motion blur), zoom (out-zoom and fade into an in-zoom), spin. Refuses to overwrite properties that
+    already have keyframes."""
+    if kind not in TRANSITIONS:
+        raise ToolError(f"kind must be one of: {', '.join(TRANSITIONS)}")
+    if not 0 < duration <= 10:
+        raise ToolError("duration must be above 0 and at most 10 seconds")
+    return _call("transition", comp=comp, kind=kind, duration=duration, **{"from": from_layer, "to": to_layer})
+
+
+@_tool
+def speed_ramp(layer: int | str, points: list[dict], ramp: float = 0.3, comp: int | str | None = None) -> dict:
+    """Speed ramps with time remapping: points [{"time": comp seconds, "speed": percent}] change the speed from that
+    time on (100 = normal, 50 = half, 0 = freeze, negative = backwards; the layer plays at 100 % until the first
+    point). Each change eases over `ramp` seconds (0 = instant). Fails, naming the time, when the footage would run
+    out."""
+    if not points:
+        raise ToolError("no points")
+    for pt in points:
+        if not isinstance(pt, dict) or "time" not in pt or "speed" not in pt:
+            raise ToolError(f"each point needs time and speed: {pt!r}")
+        if not -1000 <= pt["speed"] <= 1000:
+            raise ToolError("speed must be -1000 to 1000 percent")
+    times = [pt["time"] for pt in points]
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise ToolError("point times must increase")
+    if not 0 <= ramp <= 5:
+        raise ToolError("ramp must be 0-5 seconds")
+    return _call("speed_ramp", comp=comp, layer=layer, ramp=ramp,
+                 points=[{"time": pt["time"], "speed": pt["speed"]} for pt in points])
+
+
+REVEALS = ("wipe_right", "wipe_left", "wipe_down", "wipe_up", "split_vertical", "split_horizontal", "box", "iris")
+
+
+@_tool
+def reveal_mask(layer: int | str, style: str = "wipe_right", duration: float = 1.0, start: float | None = None,
+                feather: float = 0.0, reverse: bool = False, ease: bool = True, comp: int | str | None = None) -> dict:
+    """Reveal a layer with an animated mask: wipe_right (the edge travels left to right), wipe_left, wipe_down,
+    wipe_up, split_vertical (opens sideways from the center line), split_horizontal, box (grows from the center),
+    iris (a circle). Over `duration` seconds from `start` (default the layer's in point); feather softens the edge
+    (px); reverse hides instead. Over existing masks it intersects them."""
+    if style not in REVEALS:
+        raise ToolError(f"style must be one of: {', '.join(REVEALS)}")
+    if duration <= 0 or feather < 0:
+        raise ToolError("duration must be above 0 and feather 0 or more")
+    return _call("reveal_mask", comp=comp, layer=layer, style=style, duration=duration, start=start,
+                 feather=feather, reverse=reverse or None, ease=ease)
+
+
+@_tool
+def set_mask(layer: int | str, mask: int | str, mode: str | None = None, feather: float | None = None,
+             expansion: float | None = None, opacity: float | None = None, inverted: bool | None = None,
+             name: str | None = None, comp: int | str | None = None) -> dict:
+    """Change a mask (by index or name): mode (none, add, subtract, intersect, lighten, darken, difference),
+    feather and expansion (px), opacity (0-100), inverted, name."""
+    if mode is not None and mode not in MASK_MODES:
+        raise ToolError(f"mode must be one of: {', '.join(MASK_MODES)}")
+    if feather is not None and feather < 0:
+        raise ToolError("feather must be 0 or more")
+    if opacity is not None and not 0 <= opacity <= 100:
+        raise ToolError("opacity must be 0-100")
+    return _call("set_mask", comp=comp, layer=layer, mask=mask, mode=mode, feather=feather, expansion=expansion,
+                 opacity=opacity, inverted=inverted, name=name)
+
+
+@_tool
+def animate_mask(layer: int | str, mask: int | str, keys: list[dict], ease: bool = True,
+                 comp: int | str | None = None) -> dict:
+    """Keyframe a mask by hand (rotoscoping, moving holes and shapes): keys [{"time": s, and any of "rect" or
+    "ellipse" [x, y, width, height] or "points" [[x, y], ...] (layer pixels), "feather", "expansion" (px),
+    "opacity"}]. Shapes with the same number of points morph smoothly."""
+    if not keys:
+        raise ToolError("no keys")
+    for k in keys:
+        if not isinstance(k, dict) or "time" not in k:
+            raise ToolError(f"each key needs a time: {k!r}")
+        shapes = [s for s in ("rect", "ellipse", "points") if s in k]
+        if len(shapes) > 1:
+            raise ToolError("a key takes one shape: rect, ellipse or points")
+        if not shapes and not any(p in k for p in ("feather", "expansion", "opacity")):
+            raise ToolError(f"key at {k['time']} s sets nothing")
+        for s in ("rect", "ellipse"):
+            if s in k:
+                _rect(s, k[s])
+        if "points" in k and (len(k["points"]) < 3 or any(len(pt) != 2 for pt in k["points"])):
+            raise ToolError("points needs at least 3 [x, y]")
+        if k.get("feather", 0) < 0 or not 0 <= k.get("opacity", 0) <= 100:
+            raise ToolError("feather must be 0 or more and opacity 0-100")
+    return _call("animate_mask", comp=comp, layer=layer, mask=mask, keys=keys, ease=ease)
+
+
+SCREENS = {"green": [0.2, 0.75, 0.3], "blue": [0.1, 0.25, 0.75]}
+
+
+@_tool
+def key_out(layer: int | str, screen: str | list[float] = "green", screen_gain: float | None = None,
+            clip_black: float | None = None, clip_white: float | None = None, shrink: float | None = None,
+            softness: float | None = None, clean: bool = True, edge_radius: float | None = None,
+            despill: bool = True, choke: float | None = None, comp: int | str | None = None) -> dict:
+    """Key a green or blue screen with Keylight: screen green, blue, or the screen's exact color (hex or [r, g, b]
+    0-1, best sampled from the footage). screen_gain (default 100), clip_black/clip_white (0-100) crush the matte,
+    shrink (negative shrinks the matte, px), softness. clean adds Key Cleaner (edge_radius), despill the Advanced
+    Spill Suppressor, choke a Simple Choker."""
+    color = SCREENS.get(screen) if isinstance(screen, str) and screen in SCREENS else _rgb("screen", screen)
+    for nm, v, lo, hi in (("clip_black", clip_black, 0, 100), ("clip_white", clip_white, 0, 100),
+                          ("screen_gain", screen_gain, 0, 200), ("choke", choke, -10, 10)):
+        if v is not None and not lo <= v <= hi:
+            raise ToolError(f"{nm} must be {lo} to {hi}")
+    if clip_black is not None and clip_white is not None and clip_black >= clip_white:
+        raise ToolError("clip_black must be below clip_white")
+    return _call("key_out", comp=comp, layer=layer, color=color, screenGain=screen_gain, clipBlack=clip_black,
+                 clipWhite=clip_white, shrink=shrink, softness=softness, clean=clean or None, edgeRadius=edge_radius,
+                 despill=despill or None, choke=choke or None)
+
+
+@_tool
+def camera_shake(style: str = "handheld", amount: float = 10, frequency: float = 6, rotation: float = 0.5,
+                 at: float = 0.0, decay: float = 4, motion_blur: bool = True, layer: int | str | None = None,
+                 name: str = "Shake", comp: int | str | None = None) -> dict:
+    """Shake the shot with a Transform effect driven by wiggle: style handheld (steady drift) or impact (a hit at
+    `at` seconds that dies away at `decay` per second). amount in px, rotation in degrees, frequency per second. On
+    a new adjustment layer over the whole comp (scaled up so no edges show), or on `layer`."""
+    if style not in ("handheld", "impact"):
+        raise ToolError("style must be handheld or impact")
+    if not 0 < amount <= 500 or not 0 < frequency <= 60 or not 0 <= rotation <= 45 or decay <= 0 or at < 0:
+        raise ToolError("need 0 < amount <= 500, 0 < frequency <= 60, rotation 0-45, decay > 0, at >= 0")
+    return _call("camera_shake", comp=comp, layer=layer, name=name, style=style, amount=amount, frequency=frequency,
+                 rotation=rotation, at=at, decay=decay, motionBlur=motion_blur or None)
+
+
+@_tool
+def glitch(start: float = 0.0, duration: float = 1.0, intensity: float = 1.0, frequency: float = 12,
+           density: float = 0.5, layer: int | str | None = None, name: str = "Glitch",
+           comp: int | str | None = None) -> dict:
+    """Digital glitch hits: blocky displacement and horizontal jumps, random per frame chunk (`frequency` chunks
+    per second, `density` 0-1 of them hit), from `start` for `duration` seconds at `intensity` (0.1-5). On a new
+    adjustment layer spanning that time, or on `layer`."""
+    if start < 0 or duration <= 0:
+        raise ToolError("start must be 0 or more and duration above 0")
+    if not 0.1 <= intensity <= 5 or not 1 <= frequency <= 60 or not 0 < density <= 1:
+        raise ToolError("need intensity 0.1-5, frequency 1-60, density above 0 up to 1")
+    return _call("glitch", comp=comp, layer=layer, name=name, start=start, duration=duration, intensity=intensity,
+                 frequency=frequency, density=density)
+
+
+@_tool
+def weather(kind: str = "snow", amount: float | None = None, size: float | None = None, speed: float | None = None,
+            wind: float | None = None, opacity: float | None = None, name: str | None = None,
+            comp: int | str | None = None) -> dict:
+    """Snow or rain over the comp: CC Snowfall or CC Rainfall on a new adjustment layer. amount is flakes or drops,
+    size, speed, wind and opacity are the effect's own units; left out, its defaults stay."""
+    if kind not in ("snow", "rain"):
+        raise ToolError("kind must be snow or rain")
+    if amount is not None and amount < 0 or size is not None and size <= 0 or opacity is not None and not \
+            0 <= opacity <= 100:
+        raise ToolError("amount must be 0 or more, size above 0, opacity 0-100")
+    return _call("weather", comp=comp, kind=kind, name=name or kind.capitalize(), amount=amount, size=size,
+                 speed=speed, wind=wind, opacity=opacity)
+
+
+@_tool
+def letterbox(aspect: float = 2.39, color: list[float] = [0, 0, 0], animate: float = 0.0, start: float = 0.0,
+              name: str = "Letterbox", comp: int | str | None = None) -> dict:
+    """Cinema bars: a solid on top with a mask cut to the picture area for `aspect` (e.g. 2.39, 2.0, 1.85),
+    sliding in over `animate` seconds from `start` when above 0."""
+    if not 1 <= aspect <= 4:
+        raise ToolError("aspect must be 1-4 (width / height)")
+    if animate < 0 or start < 0:
+        raise ToolError("animate and start must be 0 or more")
+    return _call("letterbox", comp=comp, aspect=aspect, color=_color("color", color), animate=animate, start=start,
+                 name=name)
 
 
 @_tool

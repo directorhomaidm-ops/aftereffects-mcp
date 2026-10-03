@@ -30,6 +30,8 @@ def test_all_tools_registered():
         "align_layers", "distribute_layers", "grid_layout", "comp_from_footage", "number_counter",
         "retime_keyframes", "interpret_footage", "replace_color", "fit_text", "sort_layers", "collect_files",
         "replace_text", "list_fonts", "replace_font",
+        "color_grade", "beat_cut", "transition", "speed_ramp", "reveal_mask", "set_mask", "animate_mask", "key_out",
+        "camera_shake", "glitch", "weather", "letterbox",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -242,7 +244,8 @@ def test_effects(ae):
 
 
 def test_list_effects(ae):
-    assert [e["name"] for e in d.list_effects()] == ["Gaussian Blur", "Glow", "Fill", "Slider Control"]
+    assert [e["name"] for e in d.list_effects()][:5] == ["Gaussian Blur", "Glow", "Fill", "Slider Control",
+                                                         "Lumetri Color"]
     assert d.list_effects("blur & sharpen") == [{"name": "Gaussian Blur", "matchName": "ADBE Gaussian Blur 2",
                                                  "category": "Blur & Sharpen"}]
 
@@ -2126,3 +2129,377 @@ def test_fonts(ae):
         d.replace_font("Helvetica", "Comic")
     with pytest.raises(ToolError, match="PostScript"):
         d.replace_font(" ", "Helvetica")
+
+
+# --- color grading, editing, masks, keying, effects ---
+
+
+def _fx(layer, i, comp=1):
+    return f"ae.app.project.item({comp}).layer({layer}).property('ADBE Effect Parade').property({i})"
+
+
+def _params(ae, layer, i, comp=1):
+    # [name, value] of an effect's parameters, topic headers left out
+    return ae.inspect(_fx(layer, i, comp) + ".children.filter(p => p.propertyValueType !== 6412)"
+                      ".map(p => [p.name, p.value])")
+
+
+def test_color_grade(ae):
+    d.create_comp("Main")
+    d.add_layer("solid", name="Shot")
+    out = d.color_grade("teal_orange", contrast=30, vignette=-1)
+    assert out["layer"] == "Grade" and out["index"] == 1 and out["effects"] == ["Lumetri Color", "Color Balance"]
+    assert ae.inspect("ae.app.project.item(1).layer(1).adjustmentLayer") is True
+    lum = dict((n, v) for n, v in _params(ae, 1, 1)[:9])
+    assert (lum["Contrast"], lum["Saturation"]) == (30, 115)  # the given contrast wins over the look's
+    p = _params(ae, 1, 1)
+    # vibrance and the vignette land in their own topics; the Creative Saturation stays at 100
+    assert p[9:] == [["Faded Film", 0], ["Sharpen", 0], ["Vibrance", 10], ["Saturation", 100], ["Amount", -1],
+                     ["Midpoint", 50], ["Roundness", 0], ["Feather", 50]]
+    bal = dict(_params(ae, 1, 2))
+    assert ([bal[f"Shadow {c} Balance"] for c in ("Red", "Green", "Blue")] == [-20, 0, 25] and
+            bal["Highlight Red Balance"] == 20 and bal["Midtone Red Balance"] == 0 and bal["Preserve Luminosity"] == 1)
+    # on a layer, without a look: Lumetri only
+    out = d.color_grade(layer="Shot", saturation=0, faded_film=20)
+    assert (out["layer"], out["effects"], out["set"]) == ("Shot", ["Lumetri Color"],
+                                                          {"Saturation": 0, "Creative Faded Film": 20})
+    assert d.color_grade(midtone_balance=[0, 0, 10])["effects"] == ["Lumetri Color", "Color Balance"]
+    for kwargs, msg in [({}, "nothing to grade"), ({"look": "sepia"}, "look must be"), ({"exposure": 6}, "exposure"),
+                        ({"saturation": -1}, "saturation"), ({"vignette": 4}, "vignette"),
+                        ({"shadow_balance": [0, 0]}, "shadow_balance"), ({"look": "noir", "contrast": 101}, "contrast")]:
+        with pytest.raises(ToolError, match=msg):
+            d.color_grade(**kwargs)
+
+
+def test_color_grade_missing_parameter(ae):
+    # a parameter After Effects names differently is reported with what the effect has
+    d.create_comp("Main")
+    d.add_layer("solid", name="Shot")
+    with pytest.raises(ToolError, match=r"Lumetri Color has no parameter Creative > Nope \(has: Faded Film"):
+        d.run_jsx("aemcp.commands.color_grade({layer: 1, basic: {}, creative: {Nope: 1}}).layer")
+    # names repeated across Lumetri's topics go to the topic asked for
+    d.run_jsx("aemcp.commands.color_grade({layer: 1, basic: {Saturation: 120}, creative: {Saturation: 40}}).layer")
+    assert [v for n, v in _params(ae, 1, 2) if n == "Saturation"] == [120, 40]
+    d.add_layer("camera", name="Cam")
+    with pytest.raises(ToolError, match="Cam cannot take effects"):
+        d.color_grade("warm", layer="Cam")
+
+
+def _cuts(ae):
+    return ae.inspect("ae.app.project.item(3)._layers.filter(l => l.enabled)"
+                      ".map(l => [l.name, l.inPoint, l.outPoint, l.inPoint - l.startTime])")
+
+
+def test_beat_cut(ae, tmp_path):
+    for n in ("a.mov", "b.mov"):
+        (tmp_path / n).write_bytes(b"x")
+        d.import_file(str(tmp_path / n))  # 5 s clips
+    d.create_comp("Main", duration=6)
+    d.add_layer("item", item="a.mov")
+    d.add_layer("item", item="b.mov")
+    d.set_layer("b.mov", start_time=-1, in_point=0)  # b shows from its 1 s mark
+    out = d.beat_cut(["a.mov", "b.mov"], bpm=120, end=4, every=2, comp="Main")
+    # a cut every second (2 beats of 0.5 s); each clip carries on where its last cut ended
+    assert [(c["from"], c["to"], c["source"]) for c in out["cuts"]] == [
+        (0, 1, 0), (1, 2, 1), (2, 3, 1), (3, 4, 2)]
+    assert out["hidden"] == ["a.mov", "b.mov"]
+    assert sorted(_cuts(ae), key=lambda r: r[1]) == [["a.mov cut 1", 0, 1, 0], ["b.mov cut 2", 1, 2, 1],
+                                                     ["a.mov cut 3", 2, 3, 1], ["b.mov cut 4", 3, 4, 2]]
+    # from the comp's markers, with skip, looping back when the footage runs out
+    for t in (0, 2, 4.5):
+        d.add_marker(t)
+    out = d.beat_cut(["a.mov"], skip=0.5, end=6)
+    assert [(c["from"], c["to"], c["source"]) for c in out["cuts"]] == [(0, 2, 0), (2, 4.5, 2.5), (4.5, 6, 0)]
+    # b loops back to where it started showing (1 s), not to 0
+    out = d.beat_cut(["b.mov"], beats=[0, 3, 6])
+    assert [(c["from"], c["to"], c["source"]) for c in out["cuts"]] == [(0, 3, 1), (3, 6, 1)]
+
+
+def test_beat_cut_errors(ae, tmp_path):
+    (tmp_path / "a.mov").write_bytes(b"x")
+    d.import_file(str(tmp_path / "a.mov"))
+    d.create_comp("Main", duration=20)
+    d.add_layer("item", item="a.mov")
+    with pytest.raises(ToolError, match="no beats"):
+        d.beat_cut(["a.mov"])
+    with pytest.raises(ToolError, match="fewer than two cuts"):
+        d.beat_cut(["a.mov"], beats=[1])
+    with pytest.raises(ToolError, match="a.mov .5 s. is shorter than a 6 s cut"):
+        d.beat_cut(["a.mov"], beats=[0, 6, 12])
+    with pytest.raises(ToolError, match="listed twice"):
+        d.beat_cut(["a.mov", 1], bpm=60)
+    d.time_remap("a.mov", [{"time": 0, "source": 0}, {"time": 4, "source": 2}])
+    with pytest.raises(ToolError, match="remapped"):
+        d.beat_cut(["a.mov"], bpm=60)
+    for kwargs, msg in [({"bpm": 10}, "bpm"), ({"beats": [2, 1]}, "ascending"), ({"beats": [1], "bpm": 60}, "not both"),
+                        ({"every": 0}, "every"), ({"start": 2, "end": 1}, "after start")]:
+        with pytest.raises(ToolError, match=msg):
+            d.beat_cut(["a.mov"], **kwargs)
+
+
+def _layer(layer, comp=1):
+    if isinstance(layer, str):
+        return f"ae.app.project.item({comp})._layers.find(l => l.name === {json.dumps(layer)})"
+    return f"ae.app.project.item({comp}).layer({layer})"
+
+
+def _key_values(ae, layer, prop, comp=1):
+    return ae.inspect(_layer(layer, comp) + ".property('ADBE Transform Group')"
+                      f".property('{prop}').keys.map(k => [k.time, k.value])")
+
+
+def test_transition(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="A")
+    d.set_layer("A", out_point=4)
+    d.add_layer("solid", name="B")
+    d.set_layer("B", start_time=6)
+    d.move_layer("B", to="bottom")  # B under A: the transition puts it on top
+    out = d.transition("A", "B", "crossfade", 1)
+    assert out == {"kind": "crossfade", "from": "A", "to": "B", "start": 3, "end": 4}
+    assert _order(ae) == ["B", "A"]
+    assert ae.inspect("ae.app.project.item(1).layer(1).inPoint") == 3
+    assert _key_values(ae, 1, "ADBE Opacity") == [[3, 0], [4, 100]]
+    with pytest.raises(ToolError, match="B's Opacity is already animated"):
+        d.transition("A", "B", "zoom", 1)
+    with pytest.raises(ToolError, match="two different layers"):
+        d.transition("A", "A")
+    with pytest.raises(ToolError, match="longer than A"):
+        d.transition("A", "B", "push_left", 5)
+
+
+def test_transition_kinds(ae):
+    d.create_comp("Main", duration=10)
+    for n in ("C", "B", "A"):
+        d.add_layer("solid", name=n)
+    d.set_layer("A", out_point=2)
+    out = d.transition("A", "B", "push_left", 0.5)
+    assert (out["start"], out["end"]) == (1.5, 2)
+    assert _key_values(ae, "A", "ADBE Position") == [[1.5, [960, 540, 0]], [2, [-960, 540, 0]]]
+    assert _key_values(ae, "B", "ADBE Position") == [[1.5, [2880, 540, 0]], [2, [960, 540, 0]]]
+    d.set_layer("B", out_point=5)
+    out = d.transition("B", "C", "dip_to_white", 1)
+    # C starts at the cut; the solid fades up to it and back down
+    assert (out["start"], out["end"]) == (4.5, 5.5)
+    assert ae.inspect("[ae.app.project.item(1).layer(1).name, ae.app.project.item(1).layer(1).inPoint, "
+                      "ae.app.project.item(1).layer(1).outPoint]") == ["Dip to white", 4.5, 5.5]
+    assert _key_values(ae, 1, "ADBE Opacity") == [[4.5, 0], [5, 100], [5.5, 0]]
+    assert ae.inspect("ae.app.project.item(1).layer(1).source.mainSource.color") == [1, 1, 1]
+    assert ae.inspect(_layer("C") + ".inPoint") == 5
+
+
+def test_transition_whip_zoom_spin(ae):
+    d.create_comp("Main", duration=10)
+    for n in ("F", "E", "D", "C", "B", "A"):
+        d.add_layer("solid", name=n)
+    d.set_layer("A", out_point=2)
+    d.transition("A", "B", "whip_up", 0.4)
+    assert ae.inspect("[ae.app.project.item(1).motionBlur, " + _layer('A') + ".motionBlur]") == [True,
+                                                                                                             True]
+    assert ae.inspect(_layer("B") + ".property('ADBE Transform Group').property('ADBE Position')"
+                      ".keys.map(k => k.inEase[0].influence)") == [90, 90]
+    assert _key_values(ae, "B", "ADBE Position")[0] == [1.6, [960, 1620, 0]]
+    d.set_layer("C", out_point=3)
+    d.transition("C", "D", "zoom", 1)
+    assert _key_values(ae, "C", "ADBE Scale") == [[2, [100, 100, 100]], [3, [160, 160, 100]]]
+    assert _key_values(ae, "D", "ADBE Scale") == [[2, [60, 60, 100]], [3, [100, 100, 100]]]
+    assert _key_values(ae, "C", "ADBE Opacity") == [[2, 100], [3, 0]]
+    d.set_layer("E", out_point=3)
+    d.transition("E", "F", "spin", 1)
+    assert _key_values(ae, "E", "ADBE Rotate Z") == [[2, 0], [3, 90]]
+    assert _key_values(ae, "F", "ADBE Rotate Z") == [[2, -90], [3, 0]]
+    for kwargs, msg in [({"kind": "wipe"}, "kind must be"), ({"duration": 0}, "duration")]:
+        with pytest.raises(ToolError, match=msg):
+            d.transition("A", "B", **kwargs)
+
+
+def _remap(ae, layer=1):
+    return ae.inspect(f"ae.app.project.item(2).layer({layer}).property('ADBE Time Remapping')"
+                      ".keys.map(k => [Math.round(k.time * 1e4) / 1e4, Math.round(k.value * 1e4) / 1e4, k.inType, "
+                      "k.inEase ? k.inEase[0].speed : null, k.outEase ? k.outEase[0].speed : null])")
+
+
+def test_speed_ramp_math(ae, tmp_path):
+    (tmp_path / "run.mov").write_bytes(b"x")
+    d.import_file(str(tmp_path / "run.mov"))
+    d.create_comp("Main", duration=8)
+    d.add_layer("item", item="run.mov")
+    d.set_layer("run.mov", out_point=4)
+    out = d.speed_ramp("run.mov", [{"time": 1, "speed": 50}, {"time": 3, "speed": 200}], ramp=0.4)
+    # 100 % to 0.8 s; 0.4 s ramp averaging 75 %; 50 % to 2.8 s; ramp averaging 125 %; 200 % to 4 s
+    assert out == {"layer": "run.mov", "ramp": 0.4,
+                   "keys": [[0, 0], [0.8, 0.8], [1.2, 1.1], [2.8, 1.9], [3.2, 2.4], [4, 4]]}
+    assert _remap(ae) == [[0, 0, 6613, 1, 1], [0.8, 0.8, 6613, 1, 1], [1.2, 1.1, 6613, 0.5, 0.5],
+                          [2.8, 1.9, 6613, 0.5, 0.5], [3.2, 2.4, 6613, 2, 2], [4, 4, 6613, 2, 2]]
+    # instant changes, starting slow at the in point; a freeze holds the frame
+    out = d.speed_ramp("run.mov", [{"time": 0, "speed": 50}, {"time": 2, "speed": 0}], ramp=0)
+    assert out["keys"] == [[0, 0], [2, 1], [4, 1]]
+    assert [k[2] for k in _remap(ae)] == [6612, 6612, 6612]
+    # ramps shrink to fit between close points
+    assert d.speed_ramp("run.mov", [{"time": 1, "speed": 50}, {"time": 1.2, "speed": 100}], ramp=1)["ramp"] == 0.18
+    with pytest.raises(ToolError, match="source time 8 s at 4 s, outside its 5 s"):
+        d.speed_ramp("run.mov", [{"time": 0, "speed": 200}], ramp=0)
+    with pytest.raises(ToolError, match="outside run.mov"):
+        d.speed_ramp("run.mov", [{"time": 4, "speed": 50}])
+    for pts, msg in [([], "no points"), ([{"time": 1}], "time and speed"), ([{"time": 1, "speed": 2000}], "speed"),
+                     ([{"time": 2, "speed": 50}, {"time": 1, "speed": 50}], "increase")]:
+        with pytest.raises(ToolError, match=msg):
+            d.speed_ramp("run.mov", pts)
+    with pytest.raises(ToolError, match="ramp"):
+        d.speed_ramp("run.mov", [{"time": 1, "speed": 50}], ramp=6)
+
+
+def _mask_keys(ae, layer=1, mask=1):
+    return ae.inspect(f"ae.app.project.item(1).layer({layer}).property('ADBE Mask Parade').property({mask})"
+                      ".property('ADBE Mask Shape').keys.map(k => [k.time, k.value.vertices])")
+
+
+def test_reveal_mask(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Card")  # 1920 x 1080
+    out = d.reveal_mask("Card", "wipe_right", duration=2, start=1)
+    assert out == {"layer": "Card", "mask": "Reveal", "style": "wipe_right", "from": 1, "to": 3, "mode": "add"}
+    keys = _mask_keys(ae)
+    assert keys[0] == [1, [[0, 0], [0.01, 0], [0.01, 1080], [0, 1080]]]
+    assert keys[1] == [3, [[0, 0], [1920, 0], [1920, 1080], [0, 1080]]]
+    # reversed, feathered, over an existing mask: hides, with room for the feather, and intersects
+    out = d.reveal_mask("Card", "wipe_up", feather=10, reverse=True)
+    assert out["mode"] == "intersect"
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(2).maskMode") == 6815
+    keys = _mask_keys(ae, mask=2)
+    assert keys[0][1] == [[-10, -10], [1930, -10], [1930, 1090], [-10, 1090]]
+    assert keys[1][1] == [[-10, 1089.99], [1930, 1089.99], [1930, 1090], [-10, 1090]]
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(2)"
+                      ".property('ADBE Mask Feather').value") == [10, 10]
+    expected = {"wipe_left": [1919.99, 0], "wipe_down": [0, 0], "split_vertical": [959.99, 0],
+                "split_horizontal": [0, 539.99], "box": [959.99, 539.99]}
+    for i, (style, first) in enumerate(expected.items()):
+        d.reveal_mask("Card", style)
+        assert _mask_keys(ae, mask=3 + i)[0][1][0] == first
+    d.reveal_mask("Card", "iris")
+    full = _mask_keys(ae, mask=8)[1][1]
+    assert max(math.hypot(x - 960, y - 540) for x, y in full) == pytest.approx(math.hypot(960, 540), abs=0.5)
+    d.add_layer("text", text="Title")
+    assert d.reveal_mask("Title", "box")["mode"] == "add"  # text measures its own box
+    with pytest.raises(ToolError, match="style must be"):
+        d.reveal_mask("Card", "diagonal")
+    d.add_layer("camera", name="Cam")
+    with pytest.raises(ToolError, match="cannot take masks"):
+        d.reveal_mask("Cam")
+
+
+def test_set_and_animate_mask(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Plate")
+    d.add_mask("Plate", "rect", rect=[0, 0, 100, 100], name="Hole")
+    out = d.set_mask("Plate", "Hole", mode="subtract", feather=8, expansion=-2, opacity=80, inverted=True,
+                     name="Window")
+    assert out == {"mask": "Window", "inverted": True, "feather": [8, 8], "expansion": -2, "opacity": 80}
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(1).maskMode") == 6814
+    assert d.set_mask("Plate", 1, inverted=False)["inverted"] is False
+    out = d.animate_mask("Plate", "Window", [
+        {"time": 0, "rect": [0, 0, 100, 100], "feather": 0},
+        {"time": 1, "ellipse": [50, 50, 200, 100], "opacity": 50},
+        {"time": 2, "points": [[0, 0], [300, 0], [150, 200]], "expansion": 5}])
+    assert out == {"mask": "Window", "keys": {"shape": 3, "feather": 1, "expansion": 1, "opacity": 1}}
+    keys = _mask_keys(ae)
+    assert [k[0] for k in keys] == [0, 1, 2] and keys[2][1] == [[0, 0], [300, 0], [150, 200]]
+    with pytest.raises(ToolError, match=r"no mask Nope on Plate \(has: Window\)"):
+        d.set_mask("Plate", "Nope")
+    with pytest.raises(ToolError, match="no mask 3"):
+        d.animate_mask("Plate", 3, [{"time": 0, "opacity": 1}])
+    for keys, msg in [([], "no keys"), ([{"rect": [0, 0, 1, 1]}], "needs a time"), ([{"time": 0}], "sets nothing"),
+                      ([{"time": 0, "rect": [0, 0, 1, 1], "points": [[0, 0]] * 3}], "one shape"),
+                      ([{"time": 0, "rect": [0, 0, 0, 1]}], "positive width"),
+                      ([{"time": 0, "points": [[0, 0]]}], "at least 3"), ([{"time": 0, "opacity": 101}], "opacity")]:
+        with pytest.raises(ToolError, match=msg):
+            d.animate_mask("Plate", 1, keys)
+    with pytest.raises(ToolError, match="mode must be"):
+        d.set_mask("Plate", 1, mode="xor")
+
+
+def test_key_out(ae):
+    d.create_comp("Main")
+    d.add_layer("solid", name="Talent")
+    out = d.key_out("Talent", clip_black=20, clip_white=80, shrink=-1, softness=2, edge_radius=3, choke=1.5)
+    assert out["effects"] == ["Keylight (1.2)", "Key Cleaner", "Advanced Spill Suppressor", "Simple Choker"]
+    assert out["set"] == {"Screen Colour": [0.2, 0.75, 0.3, 1], "Clip Black": 20, "Clip White": 80,
+                          "Screen Shrink/Grow": -1, "Screen Softness": 2, "Additional Edge Radius": 3,
+                          "Choke Matte": 1.5}
+    assert _params(ae, 1, 4) == [["View", 1], ["Choke Matte", 1.5]]
+    out = d.key_out("Talent", screen="#0033CC", clean=False, despill=False, screen_gain=110)
+    assert out["effects"] == ["Keylight (1.2) 2"]
+    assert out["set"] == {"Screen Colour": [0, 0.2, 0.8, 1], "Screen Gain": 110}
+    assert d.key_out("Talent", "blue")["set"]["Screen Colour"] == [0.1, 0.25, 0.75, 1]
+    for kwargs, msg in [({"screen": "pink"}, "hex color"), ({"clip_black": 101}, "clip_black"),
+                        ({"clip_black": 50, "clip_white": 40}, "below clip_white"), ({"choke": 20}, "choke")]:
+        with pytest.raises(ToolError, match=msg):
+            d.key_out("Talent", **kwargs)
+
+
+def test_camera_shake(ae):
+    d.create_comp("Main")  # 1920 x 1080
+    out = d.camera_shake(amount=20, rotation=1)
+    assert (out["layer"], out["effect"], out["style"]) == ("Shake", "Shake", "handheld")
+    # scaled so a 20 px move and a 1 degree turn never show the edges
+    assert out["set"]["scale"] == pytest.approx((1 + 40 / 1080) * (math.cos(math.radians(1)) + math.sin(
+        math.radians(1)) * 1920 / 1080) * 100, abs=0.01)
+    assert out["set"]["shutterAngle"] == 180
+    fx = _fx(1, 1)
+    assert ae.inspect(fx + ".property('Position').expression") == "var k = 1;\nadd(value, mul(sub(wiggle(6, 20), " \
+                                                                  "value), k));"
+    assert "wiggle(6, 1)" in ae.inspect(fx + ".property('Rotation').expression")
+    assert ae.inspect(fx + ".children[6].value") == 0  # Use Composition's Shutter Angle off
+    d.add_layer("solid", name="Car")
+    out = d.camera_shake("impact", at=2, decay=6, rotation=0, motion_blur=False, layer="Car")
+    assert out["set"] == {}  # a layer keeps its scale
+    expr = ae.inspect(_fx(1, 1) + ".property('Position').expression")
+    assert expr.startswith("var t = time - 2;\nvar k = t < 0 ? 0 : Math.exp(-6 * t);")
+    assert ae.inspect(_fx(1, 1) + ".property('Rotation').expression") == ""
+    for kwargs, msg in [({"style": "drunk"}, "handheld or impact"), ({"amount": 0}, "amount"),
+                        ({"rotation": 50}, "rotation")]:
+        with pytest.raises(ToolError, match=msg):
+            d.camera_shake(**kwargs)
+
+
+def test_glitch(ae):
+    d.create_comp("Main", duration=10)
+    out = d.glitch(start=2, duration=1.5, intensity=2)
+    assert out == {"layer": "Glitch", "index": 1, "from": 2, "to": 3.5}
+    assert ae.inspect("[ae.app.project.item(1).layer(1).inPoint, ae.app.project.item(1).layer(1).outPoint, "
+                      "ae.app.project.item(1).layer(1).adjustmentLayer]") == [2, 3.5, True]
+    amount = ae.inspect(_fx(1, 1) + ".property('Amount').expression")
+    assert "time >= 2 && time < 3.5" in amount and "seedRandom(Math.floor(time * 12), true)" in amount
+    assert amount.endswith("hit ? random(30, 150) * 2 : value;")
+    assert ae.inspect(_fx(1, 1) + ".property('Amount').value") == 0
+    assert ae.inspect(_fx(1, 2) + ".property('Position').expression").endswith(
+        "hit ? add(value, [random(-1, 1) * 153.6, 0]) : value;")
+    d.add_layer("text", text="Logo")
+    assert d.glitch(start=9, duration=3, layer="Logo")["to"] == 12  # a layer is not trimmed
+    for kwargs, msg in [({"duration": 0}, "duration"), ({"intensity": 9}, "intensity"), ({"density": 0}, "density")]:
+        with pytest.raises(ToolError, match=msg):
+            d.glitch(**kwargs)
+
+
+def test_weather_and_letterbox(ae):
+    d.create_comp("Main", duration=5)
+    out = d.weather("snow", amount=12000, size=4, wind=20)
+    assert out == {"layer": "Snow", "index": 1, "effect": "CC Snowfall", "set": {"Flakes": 12000, "Size": 4,
+                                                                               "Wind": 20}}
+    out = d.weather("rain", amount=9000, speed=6000, opacity=40, name="Storm")
+    assert out["set"] == {"Drops": 9000, "Speed": 6000, "Opacity": 40} and out["layer"] == "Storm"
+    with pytest.raises(ToolError, match="snow or rain"):
+        d.weather("hail")
+    out = d.letterbox(2.4)
+    assert out == {"layer": "Letterbox", "index": 1, "aspect": 2.4, "bar": 140}
+    m = "ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(1)"
+    assert ae.inspect(m + ".inverted") is True
+    assert ae.inspect(m + ".property('ADBE Mask Shape').value.vertices") == [[-1, 140], [1921, 140], [1921, 940],
+                                                                              [-1, 940]]
+    d.letterbox(2, animate=1, start=0.5, name="Bars")
+    assert [k[0] for k in _mask_keys(ae)] == [0.5, 1.5]
+    assert _mask_keys(ae)[0][1] == [[-1, -1], [1921, -1], [1921, 1081], [-1, 1081]]
+    with pytest.raises(ToolError, match="1.778:1 already"):
+        d.letterbox(1.5)
+    with pytest.raises(ToolError, match="aspect must be"):
+        d.letterbox(0.5)

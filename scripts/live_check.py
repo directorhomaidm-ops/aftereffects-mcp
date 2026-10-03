@@ -345,6 +345,35 @@ def main():
          note="check frame_font.png: Helvetica, not a substitute")
     step("export the font frame", lambda: d.export_frame(str(work / "frame_font.png"), time=1.5, comp="counter check"),
          needs=True if fonts else "no fonts listed")
+    print("\nGrading, editing, masks, keying, effects")
+    step("color_grade teal_orange on an adjustment layer", lambda: _grade(work), needs=have,
+         note="Lumetri parameter names by topic, Color Balance names; check frame_grade.png")
+    step("reveal_mask iris on the swatch", lambda: d.reveal_mask("swatch.png", "iris", duration=1, feather=30,
+                                                                comp="aemcp check"), needs=have)
+    step("set_mask + animate_mask the reveal's feather", lambda: (d.set_mask("swatch.png", "Reveal", expansion=5,
+         comp="aemcp check"), d.animate_mask("swatch.png", "Reveal", [{"time": 0, "feather": 0}, {"time": 1,
+         "feather": 40}], comp="aemcp check"))[1], needs=have)
+    edit = step("beat_cut two solids at 120 bpm", lambda: _beat_cut(), needs=have)
+    step("transition whip_left between the cuts", lambda: d.transition("A cut 1", "B cut 2", "whip_left", 0.3,
+                                                                      comp="edit check"), needs=True if edit else
+         "no cuts")
+    step("speed_ramp a precomp: 30 % then 120 %", lambda: _ramp(), needs=have,
+         note="time remap keys with temporal ease speeds")
+    step("key_out a green solid", lambda: _key(work), needs=have,
+         note="Keylight 906, Key Cleaner, Advanced Spill Suppressor, Simple Choker names; frame_key.png shows the "
+              "background through")
+    step("camera_shake impact at 1 s", lambda: d.camera_shake("impact", at=1, amount=30, rotation=1,
+                                                              comp="edit check"), needs=True if edit else "no cuts",
+         note="Transform effect: Position, Rotation, Scale, Use Composition's Shutter Angle")
+    step("glitch 2-2.5 s", lambda: d.glitch(2, 0.5, comp="edit check"), needs=True if edit else "no cuts",
+         note="Turbulent Displace Amount, Size, Evolution")
+    step("weather snow", lambda: d.weather("snow", amount=6000, wind=10, comp="edit check"),
+         needs=True if edit else "no cuts", note="CC Snowfall Flakes, Wind")
+    step("letterbox 2.39 sliding in", lambda: d.letterbox(2.39, animate=0.5, comp="edit check"),
+         needs=True if edit else "no cuts")
+    step("export the effects frame", lambda: d.export_frame(str(work / "frame_fx.png"), time=2.2,
+                                                           comp="edit check"), needs=True if edit else "no cuts",
+         note="check frame_fx.png: bars, snow, a glitch hit, the shake")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -553,6 +582,36 @@ def _sort():
 def _collect(work):
     out = d.collect_files(str(work / "collected"), name="aemcp_collected")
     expect(Path(out["project"]).exists(), f"no project at {out['project']}")
+    return out
+
+
+def _grade(work):
+    out = d.color_grade("teal_orange", vignette=-1, name="Look", comp="aemcp check")
+    expect(out["effects"] == ["Lumetri Color", "Color Balance"], f"effects: {out['effects']}")
+    d.export_frame(str(work / "frame_grade.png"), time=1, comp="aemcp check")
+    return out
+
+
+def _beat_cut():
+    d.create_comp("edit check", 1920, 1080, 4, 30)
+    d.add_layer("solid", name="A", color=[0.8, 0.3, 0.2], comp="edit check")
+    d.add_layer("solid", name="B", color=[0.2, 0.4, 0.8], comp="edit check")
+    out = d.beat_cut(["A", "B"], bpm=120, every=2, comp="edit check")
+    expect(len(out["cuts"]) == 4, f"cuts: {out['cuts']}")
+    return out
+
+
+def _ramp():
+    d.add_layer("item", item="retime check", comp="edit check")
+    return d.speed_ramp("retime check", [{"time": 1, "speed": 30}, {"time": 2, "speed": 120}], comp="edit check")
+
+
+def _key(work):
+    d.create_comp("key check", 640, 360, 1, 30)
+    d.add_layer("solid", name="Plate", color=[0.9, 0.5, 0.1], comp="key check")
+    d.add_layer("solid", name="Screen", color=[0.2, 0.75, 0.3], comp="key check")
+    out = d.key_out("Screen", choke=1, comp="key check")
+    d.export_frame(str(work / "frame_key.png"), time=0, comp="key check")
     return out
 
 

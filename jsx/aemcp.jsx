@@ -554,6 +554,139 @@ var aemcp = (function () {
         return out;
     }
 
+    function norm(s) {
+        return s.toLowerCase().replace(/’/g, "'");
+    }
+
+    function flatParams(group, out) {
+        var i, q;
+        for (i = 1; i <= group.numProperties; i++) {
+            q = group.property(i);
+            out.push(q);
+            if (q.propertyType !== PropertyType.PROPERTY) {
+                flatParams(q, out);
+            }
+        }
+        return out;
+    }
+
+    function findParam(fx, name, section) {
+        // an effect parameter by display name ("Use Composition*" matches a prefix), after the topic named
+        // `section` when given: Lumetri repeats names (Saturation) across its topics
+        var all = flatParams(fx, []), on = !section, names = [], i, q, n, want = norm(name), prefix = false;
+        if (want.charAt(want.length - 1) === "*") {
+            prefix = true;
+            want = want.substring(0, want.length - 1);
+        }
+        for (i = 0; i < all.length; i++) {
+            q = all[i];
+            n = norm(q.name);
+            if (!on) {
+                on = n === norm(section);
+                continue;
+            }
+            if (q.propertyType === PropertyType.PROPERTY && q.propertyValueType !== PropertyValueType.NO_VALUE) {
+                if (n === want || (prefix && n.substring(0, want.length) === want)) {
+                    return q;
+                }
+                names.push(q.name);
+            }
+        }
+        fail(fx.name + " has no parameter " + (section ? section + " > " : "") + name + " (has: " +
+            names.slice(0, 40).join(", ") + ")");
+    }
+
+    function setParam(fx, name, value, section) {
+        var p = findParam(fx, name, section);
+        p.setValue(value);
+        return plain(p.value);
+    }
+
+    function addFx(l, matchName, what) {
+        // set an effect's parameters before adding the next: adding effects can invalidate older references
+        var parade = l.property("ADBE Effect Parade");
+        if (!parade) {
+            fail(l.name + " cannot take effects (cameras and lights have none)");
+        }
+        if (!parade.canAddProperty(matchName)) {
+            fail(what + " (" + matchName + ") is not available in this After Effects");
+        }
+        return parade.addProperty(matchName);
+    }
+
+    function adjustmentLayer(c, name) {
+        var l = c.layers.addSolid([1, 1, 1], name, c.width, c.height, c.pixelAspect, c.duration);
+        l.adjustmentLayer = true;
+        return l;
+    }
+
+    function span(l, t0, t1) {
+        // trim a layer to [t0, t1], in an order that never puts the in point after the out point
+        if (t0 < l.outPoint) {
+            l.inPoint = t0;
+            l.outPoint = t1;
+        } else {
+            l.outPoint = t1;
+            l.inPoint = t0;
+        }
+    }
+
+    function box(x0, y0, x1, y1) {
+        return polygon([[x0, y0], [x1, y0], [x1, y1], [x0, y1]]);
+    }
+
+    function findMask(l, ref) {
+        var group = l.property("ADBE Mask Parade"), m = null, i, names = [];
+        if (!group) {
+            fail(l.name + " has no masks (cameras and lights have none)");
+        }
+        if (typeof ref === "number") {
+            m = ref >= 1 && ref <= group.numProperties ? group.property(ref) : null;
+        } else {
+            for (i = 1; i <= group.numProperties; i++) {
+                if (group.property(i).name === ref) {
+                    m = group.property(i);
+                }
+            }
+        }
+        if (!m) {
+            for (i = 1; i <= group.numProperties; i++) {
+                names.push(group.property(i).name);
+            }
+            fail("no mask " + ref + " on " + l.name + " (has: " + (names.join(", ") || "none") + ")");
+        }
+        return m;
+    }
+
+    function setRemap(l, keys) {
+        // replace a layer's time remapping with keys [{time, source, kind, inSpeed, outSpeed}]. After Effects adds
+        // keys at the in and out points; removing the last key turns time remapping off, so one old key stays until
+        // the new ones are in
+        var p, i, k, idx, oldTime, keepOld = false;
+        l.timeRemapEnabled = true;
+        p = l.property("ADBE Time Remapping");
+        while (p.numKeys > 1) {
+            p.removeKey(p.numKeys);
+        }
+        oldTime = p.numKeys ? p.keyTime(1) : null;
+        for (i = 0; i < keys.length; i++) {
+            k = keys[i];
+            if (oldTime !== null && Math.abs(k.time - oldTime) < 1e-6) {
+                keepOld = true;
+            }
+            p.setValueAtTime(k.time, k.source);
+            idx = p.nearestKeyIndex(k.time);
+            p.setInterpolationTypeAtKey(idx, k.kind, k.kind);
+            if (k.inSpeed !== undefined) {
+                p.setTemporalEaseAtKey(idx, [new KeyframeEase(k.inSpeed, 33.33)], [new KeyframeEase(k.outSpeed, 33.33)]);
+            }
+        }
+        if (oldTime !== null && !keepOld && p.numKeys > 1) {
+            p.removeKey(p.nearestKeyIndex(oldTime));
+        }
+        return p;
+    }
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -1113,32 +1246,16 @@ var aemcp = (function () {
         },
 
         time_remap: function (a) {
-            var l = findLayer(findComp(a.comp), a.layer), p, i, k, idx, kind, oldTime, keepOld = false;
+            var l = findLayer(findComp(a.comp), a.layer), keys = [], i, k, p;
             if (!l.canSetTimeRemapEnabled) {
                 fail(l.name + " cannot be time remapped (it needs footage or a precomp with duration)");
             }
-            l.timeRemapEnabled = true;
-            p = l.property("ADBE Time Remapping");
-            // After Effects adds keys at the in and out points; the given ones replace them. Removing the last key
-            // turns time remapping off, so one old key stays until the new ones are in.
-            while (p.numKeys > 1) {
-                p.removeKey(p.numKeys);
-            }
-            oldTime = p.numKeys ? p.keyTime(1) : null;
             for (i = 0; i < a.keys.length; i++) {
                 k = a.keys[i];
-                if (oldTime !== null && Math.abs(k.time - oldTime) < 1e-6) {
-                    keepOld = true;
-                }
-                p.setValueAtTime(k.time, k.source);
-                idx = p.nearestKeyIndex(k.time);
-                kind = k.hold ? KeyframeInterpolationType.HOLD : (a.smooth ? KeyframeInterpolationType.BEZIER :
-                    KeyframeInterpolationType.LINEAR);
-                p.setInterpolationTypeAtKey(idx, kind, kind);
+                keys.push({time: k.time, source: k.source, kind: k.hold ? KeyframeInterpolationType.HOLD :
+                    (a.smooth ? KeyframeInterpolationType.BEZIER : KeyframeInterpolationType.LINEAR)});
             }
-            if (oldTime !== null && !keepOld && p.numKeys > 1) {
-                p.removeKey(p.nearestKeyIndex(oldTime));
-            }
+            p = setRemap(l, keys);
             return {layer: l.name, keys: p.numKeys, timeRemap: l.timeRemapEnabled};
         },
 
@@ -2693,6 +2810,522 @@ var aemcp = (function () {
                 fail("no text uses " + a.find + " (see list_fonts)");
             }
             return {font: a.replace, layers: out};
+        },
+
+        color_grade: function (a) {
+            var c = findComp(a.comp), l = a.layer !== undefined ? findLayer(c, a.layer) : adjustmentLayer(c, a.name),
+                fx, k, set = {}, effects = [], i, j, tones = ["Shadow", "Midtone", "Highlight"],
+                keys = ["shadows", "midtones", "highlights"], ch = ["Red", "Green", "Blue"];
+            fx = addFx(l, "ADBE Lumetri", "Lumetri Color");
+            effects.push(fx.name);
+            for (k in a.basic) {
+                if (a.basic.hasOwnProperty(k)) {
+                    set[k] = setParam(fx, k, a.basic[k], "Basic Correction");
+                }
+            }
+            for (k in a.creative) {
+                if (a.creative.hasOwnProperty(k)) {
+                    set["Creative " + k] = setParam(fx, k, a.creative[k], "Creative");
+                }
+            }
+            if (a.vignette !== undefined) {
+                set["Vignette Amount"] = setParam(fx, "Amount", a.vignette, "Vignette");
+            }
+            if (a.balance) {
+                // split toning: Color Balance pushes shadows, midtones and highlights toward a color
+                fx = addFx(l, "ADBE Color Balance 2", "Color Balance");
+                effects.push(fx.name);
+                for (i = 0; i < keys.length; i++) {
+                    for (j = 0; a.balance[keys[i]] && j < 3; j++) {
+                        set[tones[i] + " " + ch[j] + " Balance"] = setParam(fx, tones[i] + " " + ch[j] + " Balance",
+                            a.balance[keys[i]][j]);
+                    }
+                }
+                setParam(fx, "Preserve Luminosity", 1);
+            }
+            return {layer: l.name, index: l.index, effects: effects, set: set};
+        },
+
+        beat_cut: function (a) {
+            var c = findComp(a.comp), srcs = [], beats = [], cuts = [], out = [], hidden = [], i, k, t, l, d, s, seg,
+                src, mk = c.markerProperty, t0, t1;
+            for (i = 0; i < a.layers.length; i++) {
+                l = findLayer(c, a.layers[i]);
+                for (k = 0; k < srcs.length; k++) {
+                    if (srcs[k].layer === l) {
+                        fail(l.name + " is listed twice");
+                    }
+                }
+                if (l.stretch !== 100 || l.timeRemapEnabled) {
+                    fail(l.name + " is time-stretched or remapped: beat_cut needs it at normal speed");
+                }
+                // the source time at the in point, and how long the source runs (stills and text: no limit)
+                srcs.push({layer: l, s0: l.inPoint - l.startTime, next: l.inPoint - l.startTime,
+                    dur: l.source && l.source.duration > 0 ? l.source.duration : null});
+            }
+            t1 = a.end !== undefined ? a.end : c.duration;
+            if (a.beats) {
+                beats = a.beats;
+            } else if (a.bpm) {
+                for (t = a.start || 0; t < t1 - 1e-6; t += 60 / a.bpm) {
+                    beats.push(t);
+                }
+            } else {
+                for (i = 1; i <= mk.numKeys; i++) {
+                    beats.push(mk.keyTime(i));
+                }
+                if (!beats.length) {
+                    fail("no beats: pass beats or bpm, or put markers on the comp (markers_from_audio)");
+                }
+            }
+            t0 = a.start !== undefined ? a.start : beats[0];
+            cuts.push(t0);
+            for (i = 0, k = 0; i < beats.length; i++) {
+                if (beats[i] > t0 + 1e-6 && beats[i] < t1 - 1e-6) {
+                    k += 1;
+                    if (k % a.every === 0) {
+                        cuts.push(beats[i]);
+                    }
+                }
+            }
+            cuts.push(t1);
+            if (cuts.length < 3) {
+                fail("fewer than two cuts between " + round(t0) + " and " + round(t1) + " s: add beats or lower every");
+            }
+            for (k = 0; k < cuts.length - 1; k++) {
+                seg = cuts[k + 1] - cuts[k];
+                src = srcs[k % srcs.length];
+                s = src.next;
+                if (src.dur !== null && s + seg > src.dur + 1e-6) {
+                    s = src.s0 + seg <= src.dur + 1e-6 ? src.s0 : 0;  // out of footage: loop back to its start
+                    if (s + seg > src.dur + 1e-6) {
+                        fail(src.layer.name + " (" + round(src.dur) + " s) is shorter than a " + round(seg) + " s cut");
+                    }
+                }
+                d = src.layer.duplicate();
+                d.name = src.layer.name + " cut " + (k + 1);
+                d.enabled = true;
+                d.startTime = cuts[k] - s;
+                span(d, cuts[k], cuts[k + 1]);
+                src.next = s + seg + a.skip;
+                out.push({layer: d.name, from: round(cuts[k]), to: round(cuts[k + 1]), source: round(s)});
+            }
+            for (i = 0; i < srcs.length; i++) {
+                srcs[i].layer.enabled = false;
+                hidden.push(srcs[i].layer.name);
+            }
+            return {cuts: out, hidden: hidden};
+        },
+
+        transition: function (a) {
+            var c = findComp(a.comp), A = findLayer(c, a.from), B = findLayer(c, a.to), d = a.duration, kind = a.kind,
+                dip = kind.substring(0, 4) === "dip_", cut, t0, t1, D, pa, pb, v, solid, ease = "ease", infl = 33.33,
+                dir = kind.substring(kind.indexOf("_") + 1);
+            function fresh(l, match) {
+                var p = transform(l, match);
+                if (p.numKeys) {
+                    fail(l.name + "'s " + p.name + " is already animated: the transition would overwrite it");
+                }
+                return p;
+            }
+            function shifted(v, dx, dy) {
+                var out = [], i;
+                for (i = 0; i < v.length; i++) {
+                    out.push(v[i]);
+                }
+                out[0] += dx;
+                out[1] += dy;
+                return out;
+            }
+            function scaled(v, f) {
+                return [v[0] * f, v[1] * f].concat(v.length > 2 ? [v[2]] : []);
+            }
+            if (A === B) {
+                fail("a transition needs two different layers");
+            }
+            if (A.outPoint - d < A.inPoint - 1e-6) {
+                fail("the transition (" + d + " s) is longer than " + A.name);
+            }
+            // B starts where A ends (dips) or overlaps A's last `duration` seconds
+            cut = A.outPoint;
+            B.startTime += (dip ? cut : cut - d) - B.inPoint;
+            t0 = dip ? cut - d / 2 : cut - d;
+            t1 = dip ? cut + d / 2 : cut;
+            if (B.index > A.index) {
+                B.moveBefore(A);
+            }
+            if (kind === "crossfade") {
+                pb = fresh(B, "ADBE Opacity");
+                v = pb.value;
+                keyAt(pb, t0, 0, "linear");
+                keyAt(pb, t1, v, "linear");
+            } else if (dip) {
+                solid = c.layers.addSolid(kind === "dip_to_white" ? [1, 1, 1] : [0, 0, 0],
+                    kind === "dip_to_white" ? "Dip to white" : "Dip to black", c.width, c.height, c.pixelAspect,
+                    c.duration);
+                span(solid, t0, t1);
+                pa = transform(solid, "ADBE Opacity");
+                keyAt(pa, t0, 0, ease);
+                keyAt(pa, cut, 100, ease);
+                keyAt(pa, t1, 0, ease);
+            } else if (kind.substring(0, 5) === "push_" || kind.substring(0, 5) === "whip_") {
+                D = {left: [-c.width, 0], right: [c.width, 0], up: [0, -c.height], down: [0, c.height]}[dir];
+                if (kind.substring(0, 5) === "whip_") {
+                    infl = 90;  // a fast middle and soft ends; motion blur smears it
+                    A.motionBlur = true;
+                    B.motionBlur = true;
+                    c.motionBlur = true;
+                }
+                pa = fresh(A, "ADBE Position");
+                pb = fresh(B, "ADBE Position");
+                v = pa.value;
+                keyAt(pa, t0, v, ease, infl);
+                keyAt(pa, t1, shifted(v, D[0], D[1]), ease, infl);
+                v = pb.value;
+                keyAt(pb, t0, shifted(v, -D[0], -D[1]), ease, infl);
+                keyAt(pb, t1, v, ease, infl);
+            } else if (kind === "zoom") {
+                pa = fresh(A, "ADBE Scale");
+                v = pa.value;
+                keyAt(pa, t0, v, "ease_in");
+                keyAt(pa, t1, scaled(v, 1.6), "ease_in");
+                pa = fresh(A, "ADBE Opacity");
+                keyAt(pa, t0, pa.value, "linear");
+                keyAt(pa, t1, 0, "linear");
+                pb = fresh(B, "ADBE Scale");
+                v = pb.value;
+                keyAt(pb, t0, scaled(v, 0.6), "ease_out");
+                keyAt(pb, t1, v, "ease_out");
+                pb = fresh(B, "ADBE Opacity");
+                v = pb.value;
+                keyAt(pb, t0, 0, "linear");
+                keyAt(pb, t1, v, "linear");
+            } else {  // spin
+                pa = fresh(A, "ADBE Rotate Z");
+                keyAt(pa, t0, pa.value, ease);
+                keyAt(pa, t1, pa.value + 90, ease);
+                pa = fresh(A, "ADBE Opacity");
+                keyAt(pa, t0, pa.value, "linear");
+                keyAt(pa, t1, 0, "linear");
+                pb = fresh(B, "ADBE Rotate Z");
+                v = pb.value;
+                keyAt(pb, t0, v - 90, ease);
+                keyAt(pb, t1, v, ease);
+                pb = fresh(B, "ADBE Opacity");
+                v = pb.value;
+                keyAt(pb, t0, 0, "linear");
+                keyAt(pb, t1, v, "linear");
+            }
+            return {kind: kind, from: A.name, to: B.name, start: round(t0), end: round(t1)};
+        },
+
+        speed_ramp: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), pts = a.points, keys = [], t0 = l.inPoint, t1 = l.outPoint,
+                s, cur, t, i, r = a.ramp, gap, dur, x, y, out, LIN = KeyframeInterpolationType.LINEAR,
+                BEZ = KeyframeInterpolationType.BEZIER;
+            if (!l.canSetTimeRemapEnabled) {
+                fail(l.name + " cannot be time remapped (it needs footage or a precomp with duration)");
+            }
+            if (l.stretch !== 100) {
+                fail(l.name + " is time-stretched: set its stretch back to 100 %");
+            }
+            dur = l.source.duration;
+            s = l.timeRemapEnabled ? l.property("ADBE Time Remapping").valueAtTime(t0, true) : t0 - l.startTime;
+            for (i = 0; i < pts.length; i++) {
+                if (pts[i].time < t0 - 1e-6 || pts[i].time >= t1 - 1e-6) {
+                    fail("speed change at " + pts[i].time + " s is outside " + l.name + " (" + round(t0) + "-" +
+                        round(t1) + " s)");
+                }
+            }
+            // ramps never overlap each other or the layer's ends
+            for (i = 0; i < pts.length; i++) {
+                gap = (i + 1 < pts.length ? pts[i + 1].time : t1) - pts[i].time;
+                if (pts[i].time > t0 + 1e-6) {
+                    gap = Math.min(gap, pts[i].time - (i > 0 ? pts[i - 1].time : t0));
+                }
+                r = Math.min(r, gap * 0.9);
+            }
+            cur = pts[0].time <= t0 + 1e-6 ? pts[0].speed : 100;
+            keys.push({time: t0, source: s, kind: BEZ, inSpeed: cur / 100, outSpeed: cur / 100});
+            t = t0;
+            for (i = 0; i < pts.length; i++) {
+                if (pts[i].time <= t0 + 1e-6) {
+                    continue;
+                }
+                if (r > 0) {
+                    // a linear change of speed across the ramp: its source time is the average speed times its length
+                    x = pts[i].time - r / 2;
+                    s += (x - t) * cur / 100;
+                    keys.push({time: x, source: s, kind: BEZ, inSpeed: cur / 100, outSpeed: cur / 100});
+                    y = pts[i].time + r / 2;
+                    s += r * (cur + pts[i].speed) / 200;
+                    keys.push({time: y, source: s, kind: BEZ, inSpeed: pts[i].speed / 100, outSpeed: pts[i].speed / 100});
+                    t = y;
+                } else {
+                    s += (pts[i].time - t) * cur / 100;
+                    keys.push({time: pts[i].time, source: s, kind: LIN});
+                    t = pts[i].time;
+                }
+                cur = pts[i].speed;
+            }
+            s += (t1 - t) * cur / 100;
+            keys.push({time: t1, source: s, kind: r > 0 ? BEZ : LIN, inSpeed: r > 0 ? cur / 100 : undefined,
+                outSpeed: cur / 100});
+            if (r <= 0) {
+                keys[0].kind = LIN;
+                keys[0].inSpeed = undefined;
+                keys[keys.length - 1].inSpeed = undefined;
+            }
+            for (i = 0; i < keys.length; i++) {
+                if (keys[i].source < -1e-6 || keys[i].source > dur + 1e-6) {
+                    fail("at these speeds " + l.name + " would need source time " + round(keys[i].source, 2) +
+                        " s at " + round(keys[i].time, 2) + " s, outside its " + round(dur, 2) +
+                        " s: lower the speeds or trim the layer (set_layer out_point)");
+                }
+            }
+            setRemap(l, keys);
+            out = [];
+            for (i = 0; i < keys.length; i++) {
+                out.push([round(keys[i].time), round(keys[i].source)]);
+            }
+            return {layer: l.name, keys: out, ramp: round(r)};
+        },
+
+        reveal_mask: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), group = l.property("ADBE Mask Parade"), r, f = a.feather,
+                x0, y0, x1, y1, cx, cy, e = 0.01, full, start, R, m, p, s = a.style, t0, kind = a.ease ? "ease" : "linear",
+                others;
+            if (!group) {
+                fail(l.name + " cannot take masks (cameras and lights have none)");
+            }
+            r = contentRect(l);
+            x0 = r.left - f;
+            y0 = r.top - f;
+            x1 = r.left + r.width + f;
+            y1 = r.top + r.height + f;
+            cx = (x0 + x1) / 2;
+            cy = (y0 + y1) / 2;
+            full = box(x0, y0, x1, y1);
+            if (s === "wipe_right") {
+                start = box(x0, y0, x0 + e, y1);
+            } else if (s === "wipe_left") {
+                start = box(x1 - e, y0, x1, y1);
+            } else if (s === "wipe_down") {
+                start = box(x0, y0, x1, y0 + e);
+            } else if (s === "wipe_up") {
+                start = box(x0, y1 - e, x1, y1);
+            } else if (s === "split_vertical") {
+                start = box(cx - e, y0, cx + e, y1);
+            } else if (s === "split_horizontal") {
+                start = box(x0, cy - e, x1, cy + e);
+            } else if (s === "box") {
+                start = box(cx - e, cy - e, cx + e, cy + e);
+            } else {  // iris: a circle that ends around the whole layer
+                R = Math.sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)) / 2;
+                full = ellipse(cx - R, cy - R, 2 * R, 2 * R);
+                start = ellipse(cx - e, cy - e, 2 * e, 2 * e);
+            }
+            others = group.numProperties;
+            m = group.addProperty("ADBE Mask Atom");
+            m.name = "Reveal";
+            // over existing masks, intersect: the reveal then limits what they already show
+            m.maskMode = others ? MaskMode.INTERSECT : MaskMode.ADD;
+            if (f) {
+                m.property("ADBE Mask Feather").setValue([f, f]);
+            }
+            p = m.property("ADBE Mask Shape");
+            t0 = a.start !== undefined ? a.start : l.inPoint;
+            keyAt(p, t0, a.reverse ? full : start, kind);
+            keyAt(p, t0 + a.duration, a.reverse ? start : full, kind);
+            return {layer: l.name, mask: m.name, style: s, from: round(t0), to: round(t0 + a.duration),
+                mode: others ? "intersect" : "add"};
+        },
+
+        set_mask: function (a) {
+            var m = findMask(findLayer(findComp(a.comp), a.layer), a.mask);
+            if (a.mode !== undefined) {
+                m.maskMode = enumValue(MaskMode, a.mode, "mask mode");
+            }
+            if (a.feather !== undefined) {
+                m.property("ADBE Mask Feather").setValue([a.feather, a.feather]);
+            }
+            if (a.expansion !== undefined) {
+                m.property("ADBE Mask Offset").setValue(a.expansion);
+            }
+            if (a.opacity !== undefined) {
+                m.property("ADBE Mask Opacity").setValue(a.opacity);
+            }
+            if (a.inverted !== undefined) {
+                m.inverted = a.inverted;
+            }
+            if (a.name) {
+                m.name = a.name;
+            }
+            return {mask: m.name, inverted: m.inverted, feather: plain(m.property("ADBE Mask Feather").value),
+                expansion: plain(m.property("ADBE Mask Offset").value), opacity: plain(m.property("ADBE Mask Opacity").value)};
+        },
+
+        animate_mask: function (a) {
+            var m = findMask(findLayer(findComp(a.comp), a.layer), a.mask), i, k, kind = a.ease ? "ease" : "linear",
+                n = {shape: 0, feather: 0, expansion: 0, opacity: 0}, r;
+            for (i = 0; i < a.keys.length; i++) {
+                k = a.keys[i];
+                if (k.rect) {
+                    r = k.rect;
+                    keyAt(m.property("ADBE Mask Shape"), k.time, box(r[0], r[1], r[0] + r[2], r[1] + r[3]), kind);
+                    n.shape += 1;
+                } else if (k.ellipse) {
+                    r = k.ellipse;
+                    keyAt(m.property("ADBE Mask Shape"), k.time, ellipse(r[0], r[1], r[2], r[3]), kind);
+                    n.shape += 1;
+                } else if (k.points) {
+                    keyAt(m.property("ADBE Mask Shape"), k.time, polygon(k.points), kind);
+                    n.shape += 1;
+                }
+                if (k.feather !== undefined) {
+                    keyAt(m.property("ADBE Mask Feather"), k.time, [k.feather, k.feather], kind);
+                    n.feather += 1;
+                }
+                if (k.expansion !== undefined) {
+                    keyAt(m.property("ADBE Mask Offset"), k.time, k.expansion, kind);
+                    n.expansion += 1;
+                }
+                if (k.opacity !== undefined) {
+                    keyAt(m.property("ADBE Mask Opacity"), k.time, k.opacity, kind);
+                    n.opacity += 1;
+                }
+            }
+            return {mask: m.name, keys: n};
+        },
+
+        key_out: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), fx, set = {}, effects = [];
+            fx = addFx(l, "Keylight 906", "Keylight (1.2)");
+            effects.push(fx.name);
+            set["Screen Colour"] = setParam(fx, "Screen Colour", [a.color[0], a.color[1], a.color[2], 1]);
+            if (a.screenGain !== undefined) {
+                set["Screen Gain"] = setParam(fx, "Screen Gain", a.screenGain);
+            }
+            if (a.clipBlack !== undefined) {
+                set["Clip Black"] = setParam(fx, "Clip Black", a.clipBlack);
+            }
+            if (a.clipWhite !== undefined) {
+                set["Clip White"] = setParam(fx, "Clip White", a.clipWhite);
+            }
+            if (a.shrink !== undefined) {
+                set["Screen Shrink/Grow"] = setParam(fx, "Screen Shrink/Grow", a.shrink);
+            }
+            if (a.softness !== undefined) {
+                set["Screen Softness"] = setParam(fx, "Screen Softness", a.softness);
+            }
+            if (a.clean) {
+                // Adobe's chain: Keylight, then Key Cleaner for the edges, then Advanced Spill Suppressor
+                fx = addFx(l, "ADBE KeyCleaner", "Key Cleaner");
+                effects.push(fx.name);
+                if (a.edgeRadius !== undefined) {
+                    set["Additional Edge Radius"] = setParam(fx, "Additional Edge Radius", a.edgeRadius);
+                }
+            }
+            if (a.despill) {
+                fx = addFx(l, "ADBE Spill2", "Advanced Spill Suppressor");
+                effects.push(fx.name);
+            }
+            if (a.choke) {
+                fx = addFx(l, "ADBE Simple Choker", "Simple Choker");
+                effects.push(fx.name);
+                set["Choke Matte"] = setParam(fx, "Choke Matte", a.choke);
+            }
+            return {layer: l.name, effects: effects, set: set};
+        },
+
+        camera_shake: function (a) {
+            var c = findComp(a.comp), adj = a.layer === undefined, l = adj ? adjustmentLayer(c, a.name) :
+                findLayer(c, a.layer), fx, env, rot = a.rotation * Math.PI / 180, lo = Math.min(c.width, c.height),
+                hi = Math.max(c.width, c.height), scale, out = {};
+            env = a.style === "impact" ? "var t = time - " + a.at + ";\nvar k = t < 0 ? 0 : Math.exp(-" + a.decay +
+                " * t);\n" : "var k = 1;\n";
+            fx = addFx(l, "ADBE Geometry2", "Transform");
+            fx.name = "Shake";
+            findParam(fx, "Position").expression = env + "add(value, mul(sub(wiggle(" + a.frequency + ", " + a.amount +
+                "), value), k));";
+            if (a.rotation) {
+                findParam(fx, "Rotation").expression = env + "value + (wiggle(" + a.frequency + ", " + a.rotation +
+                    ") - value) * k;";
+            }
+            if (adj) {
+                // grow just enough that the moving frame never shows its edges
+                scale = (1 + 2 * a.amount / lo) * (Math.cos(rot) + Math.sin(rot) * hi / lo) * 100;
+                out.scale = setParam(fx, "Scale", round(scale, 2));
+            }
+            if (a.motionBlur) {
+                setParam(fx, "Use Composition*", 0);
+                out.shutterAngle = setParam(fx, "Shutter Angle", 180);
+            }
+            return {layer: l.name, index: l.index, effect: fx.name, style: a.style, set: out};
+        },
+
+        glitch: function (a) {
+            var c = findComp(a.comp), adj = a.layer === undefined, l = adj ? adjustmentLayer(c, a.name) :
+                findLayer(c, a.layer), e = a.start + a.duration, gate, fx;
+            if (adj) {
+                span(l, a.start, Math.min(e, c.duration));
+            }
+            // the same random hits for every property in a frame chunk: seedRandom on the chunk number
+            gate = "var on = time >= " + a.start + " && time < " + e + ";\nseedRandom(Math.floor(time * " +
+                a.frequency + "), true);\nvar hit = on && random() < " + a.density + ";\n";
+            fx = addFx(l, "ADBE Turbulent Displace", "Turbulent Displace");
+            fx.name = "Glitch Displace";
+            setParam(fx, "Amount", 0);
+            setParam(fx, "Size", 40);
+            findParam(fx, "Amount").expression = gate + "hit ? random(30, 150) * " + a.intensity + " : value;";
+            findParam(fx, "Evolution").expression = "time * 720;";
+            fx = addFx(l, "ADBE Geometry2", "Transform");
+            fx.name = "Glitch Offset";
+            findParam(fx, "Position").expression = gate + "hit ? add(value, [random(-1, 1) * " +
+                round(c.width * 0.04 * a.intensity, 1) + ", 0]) : value;";
+            return {layer: l.name, index: l.index, from: round(a.start), to: round(e)};
+        },
+
+        weather: function (a) {
+            var c = findComp(a.comp), snow = a.kind === "snow", l = adjustmentLayer(c, a.name), fx, set = {};
+            fx = addFx(l, snow ? "CC Snowfall" : "CC Rainfall", snow ? "CC Snowfall" : "CC Rainfall");
+            if (a.amount !== undefined) {
+                set[snow ? "Flakes" : "Drops"] = setParam(fx, snow ? "Flakes" : "Drops", a.amount);
+            }
+            if (a.size !== undefined) {
+                set.Size = setParam(fx, "Size", a.size);
+            }
+            if (a.speed !== undefined) {
+                set.Speed = setParam(fx, "Speed", a.speed);
+            }
+            if (a.wind !== undefined) {
+                set.Wind = setParam(fx, "Wind", a.wind);
+            }
+            if (a.opacity !== undefined) {
+                set.Opacity = setParam(fx, "Opacity", a.opacity);
+            }
+            return {layer: l.name, index: l.index, effect: fx.name, set: set};
+        },
+
+        letterbox: function (a) {
+            var c = findComp(a.comp), W = c.width, H = c.height, bar = (H - W * c.pixelAspect / a.aspect) / 2, l, m, p,
+                inner;
+            if (bar <= 0.5) {
+                fail(c.name + " is " + round(W * c.pixelAspect / H, 3) + ":1 already: letterbox needs a wider aspect");
+            }
+            l = c.layers.addSolid(a.color, a.name, W, H, c.pixelAspect, c.duration);
+            m = l.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+            m.name = "Picture";
+            m.inverted = true;  // the solid shows outside the picture: the bars
+            p = m.property("ADBE Mask Shape");
+            inner = box(-1, bar, W + 1, H - bar);
+            if (a.animate > 0) {
+                keyAt(p, a.start, box(-1, -1, W + 1, H + 1), "ease");
+                keyAt(p, a.start + a.animate, inner, "ease");
+            } else {
+                p.setValue(inner);
+            }
+            return {layer: l.name, index: l.index, aspect: a.aspect, bar: round(bar, 2)};
         },
 
         run_jsx: function (a) {
