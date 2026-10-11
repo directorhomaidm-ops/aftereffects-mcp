@@ -47,6 +47,14 @@ Most cuts should stay hard cuts; transitions are punctuation.
   (`set_layer` out_point) or lower the speeds.
 - Hit-and-slow: a ramp down to 20-30 % on the impact, then back to 100-200 %.
 
+## Photos and formats
+
+- A photo montage: `slideshow(["a.jpg", "b.jpg", ...], duration=3, overlap=0.5)` imports the
+  files, fills the frame with each, and alternates zoom-in and zoom-out Ken Burns moves.
+- One still or shot: `ken_burns(layer, zoom=[100, 115], pan="left", amount=120)`.
+- Vertical and square versions for social: `reframe(comp, "9:16")` (`focus` keeps the subject
+  in frame), or `"blur_fill"` to show the whole picture over a blurred copy.
+
 ## Check
 
 `export_frame` at the cut points and in the middle of each ramp. Look for black frames

@@ -741,6 +741,137 @@ var aemcp = (function () {
         "mm:ss.cs": 'p(Math.floor(t / 60)) + ":" + p(s) + "." + p(cs)'
     };
 
+    function offset2(v, dx, dy) {
+        var out = [], i;
+        for (i = 0; i < v.length; i++) {
+            out.push(v[i]);
+        }
+        out[0] += dx;
+        out[1] += dy;
+        return out;
+    }
+
+    function scale2(v, f) {
+        return [v[0] * f, v[1] * f].concat(v.length > 2 ? [v[2]] : []);
+    }
+
+    function animateLayer(l, a) {
+        // in: from off-stage to the layer's resting value; out: the reverse. Keys elsewhere on the same properties
+        // stay (an in at the start and an out at the end), keys inside the span are refused
+        var inn = a.direction === "in", t0 = a.start, d = a.duration, t1 = t0 + d, kind = a.ease ? "ease" : "linear",
+            done = [], s = a.style, dist = a.distance, dx = 0, dy = 0, p, r, fx;
+        function prop(match) {
+            var q = transform(l, match), i;
+            for (i = 1; i <= q.numKeys; i++) {
+                if (q.keyTime(i) > t0 - 1e-6 && q.keyTime(i) < t1 + 1e-6) {
+                    fail(l.name + "'s " + q.name + " already has keyframes between " + round(t0) + " and " + round(t1) +
+                        " s");
+                }
+            }
+            return q;
+        }
+        function rest(q) {
+            return q.numKeys ? q.valueAtTime(inn ? t1 : t0, true) : q.value;
+        }
+        function move(q, away) {
+            var v = rest(q);
+            keyAt(q, t0, inn ? away(v) : v, kind);
+            keyAt(q, t1, inn ? v : away(v), kind);
+            done.push(q.name);
+        }
+        if (s !== "scale" && s !== "pop") {
+            move(prop("ADBE Opacity"), function () {
+                return 0;
+            });
+        }
+        if (s.substring(0, 6) === "slide_") {
+            // slide_left travels leftward: in from the right, out to the left
+            dx = {left: -dist, right: dist, up: 0, down: 0}[s.substring(6)];
+            dy = {left: 0, right: 0, up: -dist, down: dist}[s.substring(6)];
+            move(prop("ADBE Position"), function (v) {
+                return inn ? offset2(v, -dx, -dy) : offset2(v, dx, dy);
+            });
+        } else if (s === "scale") {
+            move(prop("ADBE Scale"), function (v) {
+                return scale2(v, 0);
+            });
+        } else if (s === "pop") {
+            p = prop("ADBE Scale");
+            r = rest(p);
+            keyAt(p, t0, inn ? scale2(r, 0) : r, "ease");
+            keyAt(p, t0 + d * (inn ? 0.65 : 0.35), scale2(r, 1.1), "ease");  // the overshoot
+            keyAt(p, t1, inn ? r : scale2(r, 0), "ease");
+            done.push(p.name);
+        } else if (s === "blur") {
+            fx = addFx(l, "ADBE Gaussian Blur 2", "Gaussian Blur");
+            fx.name = "Blur " + a.direction;
+            p = findParam(fx, "Blurriness");
+            keyAt(p, t0, inn ? 40 : 0, kind);
+            keyAt(p, t1, inn ? 0 : 40, kind);
+            done.push(fx.name);
+        } else if (s === "rotate") {
+            move(prop("ADBE Rotate Z"), function (v) {
+                return inn ? v - 90 : v + 90;
+            });
+        }
+        return {layer: l.name, style: s, direction: a.direction, from: round(t0), to: round(t1), animated: done};
+    }
+
+    function rectGroup(root, name, size, pos, color, opacity, roundness) {
+        var g = root.addProperty("ADBE Vector Group"), contents, rect, fill;
+        g.name = name;
+        contents = g.property("ADBE Vectors Group");
+        rect = contents.addProperty("ADBE Vector Shape - Rect");
+        rect.property("ADBE Vector Rect Size").setValue(size);
+        rect.property("ADBE Vector Rect Position").setValue(pos);
+        if (roundness) {
+            rect.property("ADBE Vector Rect Roundness").setValue(roundness);
+        }
+        fill = contents.addProperty("ADBE Vector Graphic - Fill");
+        fill.property("ADBE Vector Fill Color").setValue([color[0], color[1], color[2], 1]);
+        fill.property("ADBE Vector Fill Opacity").setValue(opacity);
+        return g;
+    }
+
+    function kenBurns(c, l, a) {
+        // scale to cover the frame times zoom, and pan by `amount` px, never far enough to show an edge
+        var r, fs, s0, s1, smin, ox, oy, dx = 0, dy = 0, t0 = a.start !== undefined ? a.start : l.inPoint,
+            t1 = a.end !== undefined ? a.end : l.outPoint, kind = a.ease ? "ease" : "linear", pos, sc;
+        still(l, "ken_burns");
+        r = contentRect(l);
+        fs = Math.max(c.width / r.width, c.height / r.height) * 100;
+        s0 = fs * a.zoom[0] / 100;
+        s1 = fs * a.zoom[1] / 100;
+        smin = Math.min(s0, s1);
+        ox = (r.width * smin / 100 - c.width) / 2;
+        oy = (r.height * smin / 100 - c.height) / 2;
+        if (a.pan === "left" || a.pan === "right") {
+            dx = a.pan === "left" ? -a.amount : a.amount;
+        } else if (a.pan === "up" || a.pan === "down") {
+            dy = a.pan === "up" ? -a.amount : a.amount;
+        }
+        if (Math.abs(dx) / 2 > ox + 1e-6 || Math.abs(dy) / 2 > oy + 1e-6) {
+            fail("panning " + a.amount + " px would show " + l.name + "'s edges: at zoom " + a.zoom[0] + "-" +
+                a.zoom[1] + " % it has room for " + round(2 * Math.max(0, dx ? ox : oy), 1) + " px; zoom in more");
+        }
+        if (t1 <= t0) {
+            fail("end must be after start");
+        }
+        transform(l, "ADBE Anchor Point").setValue([r.left + r.width / 2, r.top + r.height / 2]);
+        sc = transform(l, "ADBE Scale");
+        keyAt(sc, t0, [s0, s0], kind);
+        keyAt(sc, t1, [s1, s1], kind);
+        pos = transform(l, "ADBE Position");
+        if (dx || dy) {
+            keyAt(pos, t0, [c.width / 2 - dx / 2, c.height / 2 - dy / 2], kind);
+            keyAt(pos, t1, [c.width / 2 + dx / 2, c.height / 2 + dy / 2], kind);
+        } else {
+            pos.setValue([c.width / 2, c.height / 2]);
+        }
+        return {layer: l.name, scale: [round(s0, 2), round(s1, 2)], pan: [dx, dy], from: round(t0), to: round(t1),
+            room: [round(2 * ox, 1), round(2 * oy, 1)]};
+    }
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -3698,6 +3829,248 @@ var aemcp = (function () {
             span(b, t.inPoint, t.outPoint);
             b.moveAfter(t);
             return {layer: b.name, index: b.index, text: t.name};
+        },
+
+        animate_layer: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer);
+            if (a.start === undefined) {
+                a.start = a.direction === "in" ? l.inPoint : l.outPoint - a.duration;
+            }
+            return animateLayer(l, a);
+        },
+
+        lower_third: function (a) {
+            var c = findComp(a.comp), right = a.side === "right", t0 = a.start, t1 = a.start + a.duration,
+                pad = a.barWidth + 24, x = right ? c.width - a.margin : a.margin, y = c.height - a.margin,
+                base = a.subtitle ? y - a.subtitleSize * 1.5 : y, top, bottom, title, sub = null, bar, g, sc, made, i;
+            function text(str, size, color, py, name) {
+                var l = c.layers.addText(str), p = l.property("ADBE Text Properties").property("ADBE Text Document"),
+                    doc = p.value;
+                doc.fontSize = size;
+                doc.applyFill = true;
+                doc.fillColor = color;
+                doc.justification = right ? ParagraphJustification.RIGHT_JUSTIFY : ParagraphJustification.LEFT_JUSTIFY;
+                if (a.font) {
+                    doc.font = a.font;
+                }
+                p.setValue(doc);
+                l.name = name;
+                transform(l, "ADBE Position").setValue([right ? x - pad : x + pad, py]);
+                span(l, t0, t1);
+                return l;
+            }
+            title = text(a.title, a.titleSize, a.textColor, base, a.name + " title");
+            if (a.subtitle) {
+                sub = text(a.subtitle, a.subtitleSize, a.subtitleColor, y, a.name + " subtitle");
+            }
+            // the accent bar spans both lines: from the title's cap height to below the last baseline
+            top = base - a.titleSize * 0.8;
+            bottom = y + (a.subtitle ? a.subtitleSize : a.titleSize) * 0.3;
+            bar = c.layers.addShape();
+            bar.name = a.name + " bar";
+            transform(bar, "ADBE Position").setValue([0, 0]);
+            g = rectGroup(bar.property("ADBE Root Vectors Group"), "Bar", [a.barWidth, bottom - top], [0, 0], a.accent,
+                100, 0);
+            g.property("ADBE Vector Transform Group").property("ADBE Vector Position").setValue(
+                [right ? x - a.barWidth / 2 : x + a.barWidth / 2, (top + bottom) / 2]);
+            span(bar, t0, t1);
+            // the bar grows from its middle, the text slides out from behind it, everything fades at the end
+            sc = bar.property("ADBE Root Vectors Group").property("Bar").property("ADBE Vector Transform Group")
+                .property("ADBE Vector Scale");
+            keyAt(sc, t0, [100, 0], "ease");
+            keyAt(sc, t0 + 0.35, [100, 100], "ease");
+            keyAt(sc, t1 - 0.35, [100, 100], "ease");
+            keyAt(sc, t1, [100, 0], "ease");
+            made = [title];
+            if (sub) {
+                made.push(sub);
+            }
+            for (i = 0; i < made.length; i++) {
+                animateLayer(made[i], {style: right ? "slide_left" : "slide_right", direction: "in",
+                    start: t0 + 0.15 + 0.1 * i, duration: 0.5, distance: 60, ease: true});
+                animateLayer(made[i], {style: "fade", direction: "out", start: t1 - 0.4, duration: 0.3, ease: true});
+            }
+            return {layers: [title.name].concat(sub ? [sub.name] : []).concat([bar.name]), from: round(t0),
+                to: round(t1)};
+        },
+
+        ken_burns: function (a) {
+            var c = findComp(a.comp);
+            return kenBurns(c, findLayer(c, a.layer), a);
+        },
+
+        slideshow: function (a) {
+            var n = a.items.length, d = a.duration, o = a.overlap, total = n * d - (n - 1) * o, c, i, it, l, t, kb, r, fs,
+                over, pans = ["left", "up", "right", "down"], pan, out = [], z0 = 105, z1 = 105 + (a.zoom - 100), op;
+            c = app.project.items.addComp(a.name, a.width, a.height, 1, total, a.fps);
+            for (i = 0; i < n; i++) {
+                it = findItem(a.items[i]);
+                if (!(it instanceof FootageItem || it instanceof CompItem) || !it.width) {
+                    fail(it.name + " has no picture to show");
+                }
+                l = c.layers.add(it);  // later slides on top, so each one fades in over the last
+                t = i * (d - o);
+                l.startTime = t;
+                span(l, t, t + d);
+                kb = {zoom: i % 2 ? [z1, z0] : [z0, z1], start: t, end: t + d, pan: "none", amount: 0, ease: false};
+                if (a.kenBurns) {
+                    // pan as far as the smaller zoom leaves room for, up to `pan` px
+                    r = contentRect(l);
+                    fs = Math.max(a.width / r.width, a.height / r.height) * 100;
+                    pan = pans[i % 4];
+                    over = pan === "left" || pan === "right" ? r.width * fs * z0 / 10000 - a.width :
+                        r.height * fs * z0 / 10000 - a.height;
+                    kb.pan = pan;
+                    kb.amount = Math.max(0, Math.min(a.pan, over - 0.5));
+                } else {
+                    kb.zoom = [100, 100];
+                }
+                kenBurns(c, l, kb);
+                if (i > 0 && o > 0) {
+                    op = transform(l, "ADBE Opacity");
+                    keyAt(op, t, 0, "linear");
+                    keyAt(op, t + o, 100, "linear");
+                }
+                out.push({layer: l.name, from: round(t), to: round(t + d), pan: kb.pan, amount: round(kb.amount, 1)});
+            }
+            c.openInViewer();
+            return {comp: c.name, id: c.id, duration: round(total), slides: out};
+        },
+
+        progress_bar: function (a) {
+            var c = findComp(a.comp), l = c.layers.addShape(), root, w = c.width - 2 * a.margin, t0 = a.start,
+                t1 = a.start + (a.duration !== undefined ? a.duration : c.duration - a.start), sc, g,
+                y = a.position === "top" ? a.margin + a.height / 2 : c.height - a.margin - a.height / 2,
+                rnd = a.rounded ? a.height / 2 : 0;
+            if (t1 <= t0) {
+                fail("the bar needs time to fill: start is at or past the comp's end");
+            }
+            l.name = a.name;
+            transform(l, "ADBE Position").setValue([0, 0]);  // layer pixels = comp pixels
+            root = l.property("ADBE Root Vectors Group");
+            // the rect's left edge sits on its group's origin, so scaling the group grows it rightward
+            g = rectGroup(root, "Bar", [w, a.height], [w / 2, 0], a.color, 100, rnd);
+            g.property("ADBE Vector Transform Group").property("ADBE Vector Position").setValue([a.margin, y]);
+            if (a.trackOpacity > 0) {
+                g = rectGroup(root, "Track", [w, a.height], [w / 2, 0], a.trackColor, a.trackOpacity, rnd);
+                g.property("ADBE Vector Transform Group").property("ADBE Vector Position").setValue([a.margin, y]);
+            }
+            sc = root.property("Bar").property("ADBE Vector Transform Group").property("ADBE Vector Scale");
+            keyAt(sc, t0, [0, 100], "linear");
+            keyAt(sc, t1, [100, 100], "linear");
+            return {layer: l.name, index: l.index, from: round(t0), to: round(t1)};
+        },
+
+        gradient_background: function (a) {
+            var c = findComp(a.comp), W = c.width, H = c.height, l, fx, th = a.angle * Math.PI / 180, L, s, e, common;
+            l = c.layers.addSolid([0, 0, 0], a.name, W, H, c.pixelAspect, c.duration);
+            l.moveToEnd();
+            fx = addFx(l, "ADBE Ramp", "Gradient Ramp");
+            setParam(fx, "Start Color", [a.colors[0][0], a.colors[0][1], a.colors[0][2], 1]);
+            setParam(fx, "End Color", [a.colors[1][0], a.colors[1][1], a.colors[1][2], 1]);
+            if (a.kind === "radial") {
+                setParam(fx, "Ramp Shape", 2);
+                s = [W / 2, H / 2];
+                e = [W / 2 + Math.max(W, H) * 0.6, H / 2];
+            } else {
+                // a line through the center at `angle`, just long enough to reach the frame's corners
+                L = (Math.abs(W * Math.cos(th)) + Math.abs(H * Math.sin(th))) / 2;
+                s = [W / 2 - L * Math.cos(th), H / 2 - L * Math.sin(th)];
+                e = [W / 2 + L * Math.cos(th), H / 2 + L * Math.sin(th)];
+            }
+            setParam(fx, "Start of Ramp", s);
+            setParam(fx, "End of Ramp", e);
+            if (a.cycle > 0) {
+                common = "var w = " + W + ", h = " + H + ", a = (" + a.angle + " + time * 360 / " + a.cycle +
+                    ") * Math.PI / 180;\nvar L = (Math.abs(w * Math.cos(a)) + Math.abs(h * Math.sin(a))) / 2;\n";
+                findParam(fx, "Start of Ramp").expression = common + "[w / 2 - L * Math.cos(a), h / 2 - L * Math.sin(a)];";
+                findParam(fx, "End of Ramp").expression = common + "[w / 2 + L * Math.cos(a), h / 2 + L * Math.sin(a)];";
+            }
+            return {layer: l.name, index: l.index, kind: a.kind, start: [round(s[0], 1), round(s[1], 1)],
+                end: [round(e[0], 1), round(e[1], 1)]};
+        },
+
+        reframe: function (a) {
+            var src = findComp(a.comp), W = a.width, H = a.height, c, l, bg, fx, s, sw, sh, ox, oy, fill;
+            c = app.project.items.addComp(a.name || src.name + " " + a.label, W, H, src.pixelAspect, src.duration,
+                src.frameRate);
+            fill = Math.max(W / src.width, H / src.height) * 100;
+            l = c.layers.add(src);
+            s = a.mode === "fill" ? fill : Math.min(W / src.width, H / src.height) * 100;
+            transform(l, "ADBE Scale").setValue([s, s]);
+            if (a.mode === "fill") {
+                // keep the focus point in frame: slide the picture toward it, never past its edges
+                sw = src.width * s / 100;
+                sh = src.height * s / 100;
+                ox = (sw - W) / 2;
+                oy = (sh - H) / 2;
+                transform(l, "ADBE Position").setValue([W / 2 + Math.max(-ox, Math.min(ox, (0.5 - a.focus[0]) * sw)),
+                    H / 2 + Math.max(-oy, Math.min(oy, (0.5 - a.focus[1]) * sh))]);
+            } else if (a.mode === "blur_fill") {
+                bg = c.layers.add(src);
+                bg.moveToEnd();
+                bg.name = src.name + " blurred";
+                transform(bg, "ADBE Scale").setValue([fill * 1.1, fill * 1.1]);  // past the blur's soft edge
+                fx = addFx(bg, "ADBE Gaussian Blur 2", "Gaussian Blur");
+                setParam(fx, "Blurriness", a.blur);
+                setParam(fx, "Repeat Edge Pixels", 1);
+            }
+            c.openInViewer();
+            return {comp: c.name, id: c.id, width: W, height: H, mode: a.mode, scale: round(s, 2)};
+        },
+
+        corner_pin: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), names = ["Upper Left", "Upper Right", "Lower Right",
+                "Lower Left"], anc, pos, sc, fx, j, k, p;
+            still(l, "corner_pin");
+            anc = transform(l, "ADBE Anchor Point").value;
+            pos = transform(l, "ADBE Position").value;
+            sc = transform(l, "ADBE Scale").value;
+            function local(pt) {
+                // Corner Pin works in layer pixels: undo the layer's position, scale and anchor
+                return [(pt[0] - pos[0]) * 100 / sc[0] + anc[0], (pt[1] - pos[1]) * 100 / sc[1] + anc[1]];
+            }
+            fx = addFx(l, "ADBE Corner Pin", "Corner Pin");
+            for (j = 0; j < 4; j++) {
+                p = findParam(fx, names[j]);
+                if (a.keys.length === 1 && a.keys[0].time === undefined) {
+                    p.setValue(local(a.keys[0].corners[j]));
+                } else {
+                    for (k = 0; k < a.keys.length; k++) {
+                        keyAt(p, a.keys[k].time, local(a.keys[k].corners[j]), "linear");
+                    }
+                }
+            }
+            return {layer: l.name, effect: fx.name, keys: a.keys[0].time === undefined ? 0 : a.keys.length,
+                upperLeft: plain(findParam(fx, "Upper Left").valueAtTime(a.keys[0].time || 0, true))};
+        },
+
+        neon: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), fx, effects = [], col = [a.color[0], a.color[1], a.color[2], 1],
+                core = [], i, glows = [[12, 1.5], [60, 1]];
+            for (i = 0; i < 3; i++) {
+                core.push(a.color[i] + (1 - a.color[i]) * 0.6);  // a hot, nearly white tube
+            }
+            core.push(1);
+            fx = addFx(l, "ADBE Fill", "Fill");
+            setParam(fx, "Color", core);
+            effects.push(fx.name);
+            for (i = 0; i < glows.length; i++) {
+                // a tight glow for the tube's halo, a wide one for the light it throws
+                fx = addFx(l, "ADBE Glo2", "Glow");
+                setParam(fx, "Glow Threshold", 20);
+                setParam(fx, "Glow Radius", glows[i][0]);
+                setParam(fx, "Glow Intensity", glows[i][1] * a.intensity);
+                setParam(fx, "Glow Colors", 2);  // A & B Colors
+                setParam(fx, "Color A", col);
+                setParam(fx, "Color B", col);
+                effects.push(fx.name);
+            }
+            if (a.flicker) {
+                transform(l, "ADBE Opacity").expression = "seedRandom(Math.floor(time * 12), true);\nrandom() < " +
+                    a.flicker + " ? random(20, 60) : value;";
+            }
+            return {layer: l.name, effects: effects, flicker: a.flicker || 0};
         },
 
         run_jsx: function (a) {

@@ -52,7 +52,8 @@ mcp = MCPServer(
     "paths and easing curves, point tracking, cameras, extruded 3D and parallax, color grading looks, cutting to the "
     "beat, transitions, speed ramps, animated mask reveals, green screen keying, camera shake, glitches, weather, "
     "letterbox, arrows, spotlights, text boxes, timers, split screens, picture-in-picture, region blur, audio "
-    "visualizers, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "visualizers, entrances and exits, lower thirds, Ken Burns slideshows, progress bars, gradients, social "
+    "reframing, corner pin, neon, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -2258,6 +2259,192 @@ def text_box(layer: int | str, padding: list[float] = [30, 16], color: list[floa
         raise ToolError("opacity must be 0-100 and radius 0 or more")
     return _call("text_box", comp=comp, layer=layer, name=name, padding=[float(v) for v in padding],
                  color=_color("color", color), opacity=opacity, radius=radius)
+
+
+# --- motion design: entrances, lower thirds, photos, formats, screens, neon ---
+
+ANIM_STYLES = ("fade", "slide_left", "slide_right", "slide_up", "slide_down", "scale", "pop", "blur", "rotate")
+
+
+@_tool
+def animate_layer(layer: int | str, style: str = "fade", direction: str = "in", duration: float = 0.6,
+                  start: float | None = None, distance: float = 200, ease: bool = True,
+                  comp: int | str | None = None) -> dict:
+    """Animate any layer in or out: fade, slide_<left|right|up|down> (travels that way by `distance` px, with a
+    fade), scale, pop (scale with an overshoot), blur (a Gaussian Blur clears, with a fade) or rotate (a quarter
+    turn, with a fade). In starts at the layer's in point, out ends at its out point, unless `start` is given.
+    An in and an out on the same layer combine; keys already inside the span are refused."""
+    if style not in ANIM_STYLES:
+        raise ToolError(f"style must be one of: {', '.join(ANIM_STYLES)}")
+    if direction not in ("in", "out"):
+        raise ToolError("direction must be in or out")
+    if duration <= 0 or distance <= 0 or (start is not None and start < 0):
+        raise ToolError("duration and distance must be above 0, start 0 or more")
+    return _call("animate_layer", comp=comp, layer=layer, style=style, direction=direction, duration=duration,
+                 start=start, distance=distance, ease=ease)
+
+
+@_tool
+def lower_third(title: str, subtitle: str | None = None, start: float = 0.0, duration: float = 5.0,
+                side: str = "left", accent: list[float] = [1, 0.75, 0.1], text_color: list[float] = [1, 1, 1],
+                subtitle_color: list[float] = [0.85, 0.85, 0.85], title_size: float = 64, subtitle_size: float = 36,
+                font: str | None = None, bar_width: float = 8, margin: float = 120, name: str = "Lower third",
+                comp: int | str | None = None) -> dict:
+    """A name strap: title and optional subtitle text next to an accent bar, in the bottom left (or right) corner
+    `margin` px from the edges, from `start` for `duration` seconds. The bar grows in, the text slides out from
+    behind it, and everything leaves at the end. font is a PostScript name (see list_fonts)."""
+    if not title.strip():
+        raise ToolError("title is empty")
+    if side not in ("left", "right"):
+        raise ToolError("side must be left or right")
+    if duration < 1.5 or start < 0:
+        raise ToolError("duration must be at least 1.5 seconds (in and out) and start 0 or more")
+    if title_size <= 0 or subtitle_size <= 0 or bar_width <= 0 or margin < 0:
+        raise ToolError("sizes and bar_width must be above 0, margin 0 or more")
+    return _call("lower_third", comp=comp, title=title, subtitle=subtitle or None, start=start, duration=duration,
+                 side=side, accent=_color("accent", accent), textColor=_color("text_color", text_color),
+                 subtitleColor=_color("subtitle_color", subtitle_color), titleSize=title_size,
+                 subtitleSize=subtitle_size, font=font, barWidth=bar_width, margin=margin, name=name)
+
+
+PANS = ("none", "left", "right", "up", "down")
+
+
+def _zoom(zoom):
+    if len(zoom) != 2 or min(zoom) < 100 or max(zoom) > 400:
+        raise ToolError("zoom needs [start, end] percent of the frame-filling size, each 100-400")
+    return [float(z) for z in zoom]
+
+
+@_tool
+def ken_burns(layer: int | str, zoom: list[float] = [100, 115], pan: str = "none", amount: float = 0,
+              start: float | None = None, end: float | None = None, ease: bool = False,
+              comp: int | str | None = None) -> dict:
+    """A slow push on a still or a shot: scale from zoom[0] to zoom[1] percent of the size that fills the frame,
+    while the picture moves `pan` (left, right, up, down) by `amount` px, from `start` to `end` (default the
+    layer's in and out points). Refuses a pan that would show the picture's edges, and says how much room there is."""
+    if pan not in PANS:
+        raise ToolError(f"pan must be one of: {', '.join(PANS)}")
+    if amount < 0 or (pan != "none" and amount == 0):
+        raise ToolError("amount must be 0 or more, and above 0 with a pan")
+    return _call("ken_burns", comp=comp, layer=layer, zoom=_zoom(zoom), pan=pan, amount=amount, start=start, end=end,
+                 ease=ease)
+
+
+@_tool
+def slideshow(items: list[int | str], duration: float = 3.0, overlap: float = 0.5, ken_burns: bool = True,
+              zoom: float = 115, pan: float = 80, width: int = 1920, height: int = 1080, fps: float = 30,
+              name: str = "Slideshow") -> dict:
+    """A new comp that shows `items` (project items, or image and video files, which are imported) one after
+    another for `duration` seconds each, crossfading over `overlap` seconds, each filling the frame with a slow
+    Ken Burns move: zooming in and out by turns (to `zoom` %) and panning up to `pan` px in turn."""
+    if not items:
+        raise ToolError("no items")
+    if duration <= 0 or not 0 <= overlap < duration:
+        raise ToolError("duration must be above 0 and overlap 0 or more, below duration")
+    if not 100 <= zoom <= 200 or pan < 0:
+        raise ToolError("zoom must be 100-200 and pan 0 or more")
+    if not (16 <= width <= 8192 and 16 <= height <= 8192 and 1 <= fps <= 120):
+        raise ToolError("width and height must be 16-8192, fps 1-120")
+    refs = []
+    for it in items:
+        if isinstance(it, str) and os.path.isfile(_path(it)):
+            refs.append(import_file(it)["id"])
+        else:
+            refs.append(it)
+    return _call("slideshow", items=refs, duration=duration, overlap=overlap, kenBurns=ken_burns, zoom=zoom, pan=pan,
+                 width=width, height=height, fps=fps, name=name)
+
+
+@_tool
+def progress_bar(start: float = 0.0, duration: float | None = None, position: str = "bottom", height: float = 8,
+                 margin: float = 0, color: list[float] = [1, 1, 1], track_color: list[float] = [1, 1, 1],
+                 track_opacity: float = 25, rounded: bool = True, name: str = "Progress",
+                 comp: int | str | None = None) -> dict:
+    """A bar that fills left to right from `start` over `duration` seconds (default to the comp's end), along the
+    bottom or top edge, `height` px, `margin` px in from the edges, over a faint track (track_opacity 0 hides it)."""
+    if position not in ("bottom", "top"):
+        raise ToolError("position must be bottom or top")
+    if height <= 0 or margin < 0 or start < 0 or (duration is not None and duration <= 0):
+        raise ToolError("height and duration must be above 0, margin and start 0 or more")
+    if not 0 <= track_opacity <= 100:
+        raise ToolError("track_opacity must be 0-100")
+    return _call("progress_bar", comp=comp, start=start, duration=duration, position=position, height=height,
+                 margin=margin, color=_color("color", color), trackColor=_color("track_color", track_color),
+                 trackOpacity=track_opacity, rounded=rounded or None, name=name)
+
+
+@_tool
+def gradient_background(colors: list[str | list[float]] = ["#1B2A49", "#5B2A86"], kind: str = "linear",
+                        angle: float = 90, cycle: float = 0, name: str = "Background",
+                        comp: int | str | None = None) -> dict:
+    """A gradient background at the bottom of the comp (Gradient Ramp on a solid): two colors (hex or [r, g, b]),
+    linear at `angle` degrees (90: top to bottom, 0: left to right) or radial from the center. cycle > 0 turns a
+    linear gradient around once every `cycle` seconds."""
+    if len(colors) != 2:
+        raise ToolError("colors takes two colors")
+    if kind not in ("linear", "radial"):
+        raise ToolError("kind must be linear or radial")
+    if cycle < 0 or (cycle and kind == "radial"):
+        raise ToolError("cycle must be 0 or more, and only turns a linear gradient")
+    return _call("gradient_background", comp=comp, colors=[_rgb("colors", c) for c in colors], kind=kind, angle=angle,
+                 cycle=cycle, name=name)
+
+
+FORMATS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350), "16:9": (1920, 1080), "4:3": (1440, 1080)}
+
+
+@_tool
+def reframe(comp: int | str, aspect: str = "9:16", mode: str = "fill", focus: list[float] = [0.5, 0.5],
+            blur: float = 60, name: str | None = None) -> dict:
+    """Make another format of a comp for social video: a new comp at 9:16 (1080 x 1920), 1:1, 4:5, 16:9 or 4:3
+    holding the comp, scaled to fill (cropping; focus [x, y] 0-1 is the point of the picture to keep in frame),
+    fit (whole picture, bars) or blur_fill (whole picture over a blurred, filling copy of itself)."""
+    if aspect not in FORMATS:
+        raise ToolError(f"aspect must be one of: {', '.join(FORMATS)}")
+    if mode not in ("fill", "fit", "blur_fill"):
+        raise ToolError("mode must be fill, fit or blur_fill")
+    if len(focus) != 2 or not all(0 <= f <= 1 for f in focus):
+        raise ToolError("focus needs [x, y], each 0-1")
+    if blur <= 0:
+        raise ToolError("blur must be above 0")
+    w, h = FORMATS[aspect]
+    return _call("reframe", comp=comp, width=w, height=h, label=aspect.replace(":", "x"), mode=mode,
+                 focus=[float(f) for f in focus], blur=blur, name=name)
+
+
+def _corners(name, v):
+    if len(v) != 4 or any(len(pt) != 2 for pt in v):
+        raise ToolError(f"{name} needs four [x, y] points: top left, top right, bottom right, bottom left")
+    return [[float(pt[0]), float(pt[1])] for pt in v]
+
+
+@_tool
+def corner_pin(layer: int | str, corners: list[list[float]] | None = None, keys: list[dict] | None = None,
+               comp: int | str | None = None) -> dict:
+    """Pin a layer's four corners onto a screen, sign or page in the shot (comp pixels, clockwise from the top
+    left: [[tl], [tr], [br], [bl]]) with Corner Pin. For a moving shot, keys [{"time": s, "corners": [...]}]
+    keyframe them (e.g. from tracked points). The layer must be unparented and unrotated."""
+    if (corners is None) == (keys is None):
+        raise ToolError("pass corners or keys")
+    if corners is not None:
+        rows = [{"corners": _corners("corners", corners)}]
+    else:
+        if not keys or any(not isinstance(k, dict) or "time" not in k or "corners" not in k for k in keys):
+            raise ToolError("each key needs time and corners")
+        rows = [{"time": float(k["time"]), "corners": _corners("corners", k["corners"])} for k in keys]
+    return _call("corner_pin", comp=comp, layer=layer, keys=rows)
+
+
+@_tool
+def neon(layer: int | str, color: str | list[float] = "#FF2D95", intensity: float = 1.0, flicker: float = 0.0,
+         comp: int | str | None = None) -> dict:
+    """A neon sign look for text or shapes: a hot, nearly white core (Fill) inside two colored glows, a tight halo
+    and a wide spill, at `intensity` (0.2-4). flicker (0-1) is the share of moments the tube dips."""
+    if not 0.2 <= intensity <= 4 or not 0 <= flicker <= 1:
+        raise ToolError("intensity must be 0.2-4 and flicker 0-1")
+    return _call("neon", comp=comp, layer=layer, color=_rgb("color", color), intensity=intensity,
+                 flicker=flicker or None)
 
 
 @_tool

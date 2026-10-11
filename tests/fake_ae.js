@@ -75,8 +75,9 @@ const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0
 const EFFECTS = [
     {displayName: "Gaussian Blur", matchName: "ADBE Gaussian Blur 2", category: "Blur & Sharpen",
         params: {"Blurriness": 0, "Blur Dimensions": 1, "Repeat Edge Pixels": 0}},
-    {displayName: "Glow", matchName: "ADBE Glo2", category: "Stylize",
-        params: {"Glow Threshold": 60, "Glow Radius": 10, "Glow Intensity": 1}},
+    {displayName: "Glow", matchName: "ADBE Glo2", category: "Stylize", params: [
+        ["Glow Threshold", 60], ["Glow Radius", 10], ["Glow Intensity", 1], ["Glow Colors", 1],
+        ["Color A", [1, 1, 1, 1]], ["Color B", [0, 0, 0, 1]]]},
     {displayName: "Fill", matchName: "ADBE Fill", category: "Generate", params: {"Color": [1, 0, 0, 1]}},
     {displayName: "Slider Control", matchName: "ADBE Slider Control", category: "Expression Controls",
         params: {"Slider": 0}},
@@ -105,6 +106,11 @@ const EFFECTS = [
         ["Rotation", 0], ["Opacity", 100], ["Use Composition\u2019s Shutter Angle", 1], ["Shutter Angle", 0]]},
     {displayName: "Turbulent Displace", matchName: "ADBE Turbulent Displace", category: "Distort", params: [
         ["Displacement", 1], ["Amount", 50], ["Size", 100], ["Complexity", 1], ["Evolution", 0]]},
+    {displayName: "Gradient Ramp", matchName: "ADBE Ramp", category: "Generate", params: [
+        ["Start of Ramp", [960, 0]], ["Start Color", [0, 0, 0, 1]], ["End of Ramp", [960, 1080]],
+        ["End Color", [1, 1, 1, 1]], ["Ramp Shape", 1], ["Ramp Scatter", 0], ["Blend With Original", 0]]},
+    {displayName: "Corner Pin", matchName: "ADBE Corner Pin", category: "Distort", params: [
+        ["Upper Left", [0, 0]], ["Upper Right", [1920, 0]], ["Lower Left", [0, 1080]], ["Lower Right", [1920, 1080]]]},
     {displayName: "Mosaic", matchName: "ADBE Mosaic", category: "Stylize", params: [
         ["Horizontal Blocks", 10], ["Vertical Blocks", 10], ["Sharp Colors", 0]]},
     {displayName: "Audio Spectrum", matchName: "ADBE AudSpect", category: "Generate", params: [

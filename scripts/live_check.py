@@ -382,6 +382,15 @@ def main():
     step("picture_in_picture + split_screen", lambda: _layouts(work), needs=have, note="check frame_layout.png")
     step("audio_visualizer on the beat WAV", lambda: _visualize(work), needs=have,
          note="Audio Spectrum names (Audio Layer, Frequency bands...); frame_audio.png shows bars")
+    print("\nMotion design: entrances, lower thirds, photos, formats, screens, neon")
+    step("gradient background, lower third, animate_layer pop, progress bar, neon", lambda: _motion(work),
+         needs=have, note="Gradient Ramp and Glow names; check frame_motion.png")
+    step("slideshow of the swatches with Ken Burns", lambda: _slides(work), needs=have,
+         note="each slide fills the frame with no edges showing: check frame_slides.png")
+    step("reframe the explainer to 9:16 with a blurred fill", lambda: d.reframe("explain check", "9:16",
+         "blur_fill"), needs=have)
+    step("corner_pin a solid onto a quad", lambda: _pin(work), needs=have,
+         note="Corner Pin param names; frame_pin.png shows the solid in the quad")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -662,6 +671,34 @@ def _visualize(work):
     d.add_layer("item", item="beat.wav", comp="layout check")
     out = d.audio_visualizer("beat.wav", height=250, comp="layout check")
     d.export_frame(str(work / "frame_audio.png"), time=1, comp="layout check")
+    return out
+
+
+def _motion(work):
+    d.create_comp("motion check", 1920, 1080, 6, 30)
+    d.gradient_background(["#14213D", "#7B2CBF"], angle=45, cycle=6, comp="motion check")
+    d.lower_third("Sara Ahmed", "Director", start=0.5, duration=4, comp="motion check")
+    d.add_layer("text", text="NEON", name="Neon", comp="motion check")
+    d.neon("Neon", "#00E5FF", flicker=0.05, comp="motion check")
+    d.animate_layer("Neon", "pop", duration=0.6, comp="motion check")
+    d.progress_bar(comp="motion check")
+    d.export_frame(str(work / "frame_motion.png"), time=2, comp="motion check")
+    return d.describe_comp("motion check")["layers"][0]["name"]
+
+
+def _slides(work):
+    # files, so they are imported again: the project's swatch was replaced earlier
+    out = d.slideshow([str(work / "swatch.png"), str(work / "swatch_v2.png")], duration=2, overlap=0.5,
+                      name="slides check")
+    d.export_frame(str(work / "frame_slides.png"), time=1.75, comp="slides check")
+    return out
+
+
+def _pin(work):
+    d.create_comp("pin check", 1920, 1080, 2, 30)
+    d.add_layer("solid", name="Screen", color=[0.2, 0.8, 0.4], comp="pin check")
+    out = d.corner_pin("Screen", corners=[[600, 300], [1300, 260], [1350, 760], [620, 700]], comp="pin check")
+    d.export_frame(str(work / "frame_pin.png"), time=0, comp="pin check")
     return out
 
 

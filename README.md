@@ -142,6 +142,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `timer` | `from_seconds`, `to_seconds`, `duration`, `start`, `format` (mm:ss, m:ss, hh:mm:ss, ss.cs, mm:ss.cs), `layer`, `name`, `comp` | `{layer, index, from, to, format, error}` |
 | `audio_visualizer` | `audio`, `kind` (spectrum, waveform), `from_point`, `to_point`, `color`, `height`, `detail`, `thickness`, `name`, `comp` | `{layer, index, effect, audio}` |
 | `text_box` | `layer`, `padding = [30, 16]`, `color`, `opacity`, `radius`, `name`, `comp` | `{layer, index, text}` |
+| `animate_layer` | `layer`, `style` (fade, slide_<dir>, scale, pop, blur, rotate), `direction` (in, out), `duration`, `start`, `distance`, `ease`, `comp` | `{layer, style, direction, from, to, animated}` |
+| `lower_third` | `title`, `subtitle`, `start`, `duration`, `side`, `accent`, `text_color`, `subtitle_color`, `title_size`, `subtitle_size`, `font`, `bar_width`, `margin`, `name`, `comp` | `{layers, from, to}` |
+| `ken_burns` | `layer`, `zoom = [100, 115]`, `pan` (none, left, right, up, down), `amount`, `start`, `end`, `ease`, `comp` | `{layer, scale, pan, from, to, room}` |
+| `slideshow` | `items` (project items or files), `duration`, `overlap`, `ken_burns`, `zoom`, `pan`, `width`, `height`, `fps`, `name` | `{comp, id, duration, slides}` |
+| `progress_bar` | `start`, `duration`, `position` (bottom, top), `height`, `margin`, `color`, `track_color`, `track_opacity`, `rounded`, `name`, `comp` | `{layer, index, from, to}` |
+| `gradient_background` | `colors` (two, hex or [r, g, b]), `kind` (linear, radial), `angle`, `cycle`, `name`, `comp` | `{layer, index, kind, start, end}` |
+| `reframe` | `comp`, `aspect` (9:16, 1:1, 4:5, 16:9, 4:3), `mode` (fill, fit, blur_fill), `focus`, `blur`, `name` | `{comp, id, width, height, mode, scale}` |
+| `corner_pin` | `layer`, `corners` (clockwise from top left, comp pixels) or `keys` [{time, corners}], `comp` | `{layer, effect, keys, upperLeft}` |
+| `neon` | `layer`, `color`, `intensity`, `flicker`, `comp` | `{layer, effects, flicker}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -193,13 +202,15 @@ Notes:
 - `beat_cut` and `speed_ramp` refuse time-stretched layers; `speed_ramp` replaces the layer's time remapping and fails, naming the time, when the footage would run out.
 - `split_text` places each part by measuring the layer's own text (`sourceRectAtTime` of the text up to that part), so kerning between parts is the only drift. `text_box` follows its text through expressions; renaming the text layer updates them.
 - `picture_in_picture` and `split_screen` set static transforms: they refuse parented or rotated layers and animated anchor, position or scale.
+- `animate_layer` reads the resting value from the layer, so an in and an out on the same layer chain; it refuses keyframes already inside its own span. `ken_burns` and `slideshow` never pan far enough to show a picture's edge (`ken_burns` fails and reports the room there is).
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Skills
 
 `skills/` holds Claude skills that teach the workflows behind the tools: `ae-color-grading`, `ae-editing`
 (cutting to music, transitions, speed), `ae-masks`, `ae-compositing` (keying and integration), `ae-vfx` and
-`ae-explainers` (arrows, spotlights, labels, timers, layouts, hiding faces and plates).
+`ae-explainers` (arrows, spotlights, labels, timers, layouts, hiding faces and plates) and `ae-motion-graphics`
+(entrances, lower thirds, backgrounds, slideshows, social formats).
 Install them for Claude Code by copying them into your skills folder:
 
 ```bash
