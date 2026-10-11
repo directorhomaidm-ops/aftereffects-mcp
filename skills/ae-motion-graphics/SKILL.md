@@ -1,11 +1,12 @@
 ---
 name: ae-motion-graphics
-description: Motion graphics in After Effects through the aftereffects MCP server - animating layers in and out (fades, slides, pops, blurs), lower thirds and name straps, gradient backgrounds, progress bars, neon text, title cards, social video formats. Use when asked to animate something in or out, make a lower third or title, build a background, add a progress bar, make text glow or look neon, or produce versions for Instagram, TikTok or YouTube Shorts in After Effects (موشن جرافيك، حركة دخول وخروج، شريط اسم، خلفية متدرجة، نيون، شريط تقدم، فيديو عمودي).
+description: Motion graphics in After Effects through the aftereffects MCP server - animating layers in and out (fades, slides, pops, blurs), lower thirds and name straps, gradient backgrounds, progress bars, neon text, title cards, animated charts (bar, donut, line), custom paths, bounces and orbits, social video formats. Use when asked to animate something in or out, make a lower third or title, build a background, add a progress bar, make text glow or look neon, or produce versions for Instagram, TikTok or YouTube Shorts in After Effects (موشن جرافيك، حركة دخول وخروج، شريط اسم، خلفية متدرجة، نيون، شريط تقدم، رسوم بيانية، فيديو عمودي).
 ---
 
 # Motion graphics in After Effects
 
-Tools: `animate_layer`, `lower_third`, `gradient_background`, `progress_bar`, `neon`,
+Tools: `animate_layer`, `lower_third`, `gradient_background`, `progress_bar`, `neon`, `bar_chart`,
+`donut_chart`, `line_chart`, `draw_path`, `bounce_drop`, `orbit`,
 `animate_text`, `text_box`, `stagger_layers`, `reframe`, `set_motion_blur`, `export_frame`.
 
 ## Entrances and exits
@@ -38,6 +39,22 @@ slides and pops.
 `lower_third("Name", "Role", start=2, duration=5)` builds the bar, the title and the subtitle,
 with their animations, in the bottom left; `side="right"` mirrors it. Use the brand color for
 `accent`. Keep the duration between 4 and 6 s: long enough to read twice.
+
+## Data and diagrams
+
+- `bar_chart(values, labels=[...], suffix="%")`: bars grow one after another, values pop on top.
+- `donut_chart(values, labels=[...])`: a ring sweeps on clockwise with percent labels;
+  `thickness` equal to `radius` makes a pie.
+- `line_chart(values, box=[x, y, w, h])`: a line draws itself on, with dots at each point.
+- Keep one idea per chart and at most 6-8 bars or slices; put the source and the unit in a small
+  label.
+- `draw_path(points, smooth=True, duration=1)` for routes, underlines, scribbles and custom shapes.
+
+## Physics and loops
+
+- `bounce_drop(layer)` drops a logo or a card into place with diminishing bounces.
+- `orbit(layer, center, radius, period)` circles a layer for ever (an expression); `ratio` 0.3
+  flattens it into a tilted orbit.
 
 ## Progress and formats
 

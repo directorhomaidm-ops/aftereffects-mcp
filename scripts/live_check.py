@@ -391,6 +391,12 @@ def main():
          "blur_fill"), needs=have)
     step("corner_pin a solid onto a quad", lambda: _pin(work), needs=have,
          note="Corner Pin param names; frame_pin.png shows the solid in the quad")
+    print("\nTalking heads, sound, charts, film, physics, paths")
+    step("duck_audio + cut_silences on generated speech", lambda: _talk(work), needs=have,
+         note="audioEnabled on the turned-off original; Audio Levels keys relative to the fade")
+    step("bar, donut and line charts", lambda: _charts(work), needs=have, note="check frame_charts.png at 3 s")
+    step("film_look, bounce_drop, draw_path, orbit", lambda: _film(work), needs=have,
+         note="Noise (Amount of Noise), Exposure and Glow names; check frame_film.png")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -699,6 +705,60 @@ def _pin(work):
     d.add_layer("solid", name="Screen", color=[0.2, 0.8, 0.4], comp="pin check")
     out = d.corner_pin("Screen", corners=[[600, 300], [1300, 260], [1350, 760], [620, 700]], comp="pin check")
     d.export_frame(str(work / "frame_pin.png"), time=0, comp="pin check")
+    return out
+
+
+def write_speech(path, loud, seconds, rate=16000):
+    """A 300 Hz tone during the `loud` spans, near silence elsewhere: something to cut and duck by."""
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = bytearray()
+        for i in range(int(rate * seconds)):
+            t = i / rate
+            amp = 0.5 if any(a <= t < b for a, b in loud) else 0.0003
+            frames += int(amp * 32767 * math.sin(2 * math.pi * 300 * t)).to_bytes(2, "little", signed=True)
+        w.writeframes(bytes(frames))
+
+
+def _talk(work):
+    write_speech(work / "voice.wav", [(0.5, 2), (3, 4)], 5)
+    write_speech(work / "music.wav", [(0, 5)], 5)
+    d.import_file(str(work / "voice.wav"))
+    d.import_file(str(work / "music.wav"))
+    d.create_comp("talk check", 1920, 1080, 6, 30)
+    d.add_layer("item", item="music.wav", comp="talk check")
+    d.add_layer("item", item="voice.wav", comp="talk check")
+    duck = d.duck_audio("music.wav", "voice.wav", comp="talk check")
+    cut = d.cut_silences("voice.wav", comp="talk check")
+    expect(len(cut["parts"]) == 2, f"parts: {cut['parts']}")
+    return {"ducks": duck["ducks"], "parts": [p["source"] for p in cut["parts"]], "removed": cut["removed"]}
+
+
+def _charts(work):
+    d.create_comp("chart check", 1920, 1080, 5, 30)
+    d.gradient_background(["#101820", "#22313F"], comp="chart check")
+    d.bar_chart([42, 77, 63, 91], labels=["Q1", "Q2", "Q3", "Q4"], origin=[160, 900], height=420,
+                suffix="%", comp="chart check")
+    d.donut_chart([45, 30, 25], labels=["Web", "Store", "Apps"], center=[1300, 380], radius=180, thickness=60,
+                  comp="chart check")
+    d.line_chart([3, 5, 4, 8, 7, 10], box=[900, 680, 800, 300], comp="chart check")
+    d.export_frame(str(work / "frame_charts.png"), time=3, comp="chart check")
+    return d.comp_info("chart check")["layers"][0]["name"]
+
+
+def _film(work):
+    d.create_comp("film check", 1920, 1080, 4, 30)
+    d.add_layer("solid", name="Plate", color=[0.5, 0.45, 0.4], comp="film check")
+    d.draw_path([[300, 800], [700, 500], [1100, 700], [1600, 300]], smooth=True, width=10, duration=1,
+                comp="film check")
+    d.add_shape("ellipse", size=[120, 120], fill=[1, 0.8, 0.2], layer_name="Ball", comp="film check")
+    d.bounce_drop("Ball", comp="film check")
+    d.add_shape("ellipse", size=[40, 40], fill=[0.6, 0.9, 1], layer_name="Moon", comp="film check")
+    d.orbit("Moon", radius=250, period=3, comp="film check")
+    out = d.film_look(comp="film check")
+    d.export_frame(str(work / "frame_film.png"), time=1.2, comp="film check")
     return out
 
 

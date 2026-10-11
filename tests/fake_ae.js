@@ -111,6 +111,11 @@ const EFFECTS = [
         ["End Color", [1, 1, 1, 1]], ["Ramp Shape", 1], ["Ramp Scatter", 0], ["Blend With Original", 0]]},
     {displayName: "Corner Pin", matchName: "ADBE Corner Pin", category: "Distort", params: [
         ["Upper Left", [0, 0]], ["Upper Right", [1920, 0]], ["Lower Left", [0, 1080]], ["Lower Right", [1920, 1080]]]},
+    {displayName: "Noise", matchName: "ADBE Noise", category: "Noise & Grain", params: [
+        ["Amount of Noise", 0], ["Noise Type", 1], ["Clipping", 1]]},
+    {displayName: "Exposure", matchName: "ADBE Exposure2", category: "Color Correction", params: [
+        ["Channels", 1], ["Master", null], ["Exposure", 0], ["Offset", 0], ["Gamma Correction", 1],
+        ["Red", null], ["Red Exposure", 0]]},
     {displayName: "Mosaic", matchName: "ADBE Mosaic", category: "Stylize", params: [
         ["Horizontal Blocks", 10], ["Vertical Blocks", 10], ["Sharp Colors", 0]]},
     {displayName: "Audio Spectrum", matchName: "ADBE AudSpect", category: "Generate", params: [
@@ -659,6 +664,7 @@ function makeAE(CtxArray) {
             this.inPoint = 0;
             this.outPoint = comp.duration;
             this.enabled = true;
+            this.audioEnabled = true;
             this._parent = null;
             this.nullLayer = false;
             this.adjustmentLayer = false;

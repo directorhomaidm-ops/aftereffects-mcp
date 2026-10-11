@@ -53,7 +53,8 @@ mcp = MCPServer(
     "beat, transitions, speed ramps, animated mask reveals, green screen keying, camera shake, glitches, weather, "
     "letterbox, arrows, spotlights, text boxes, timers, split screens, picture-in-picture, region blur, audio "
     "visualizers, entrances and exits, lower thirds, Ken Burns slideshows, progress bars, gradients, social "
-    "reframing, corner pin, neon, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "reframing, corner pin, neon, silence cutting, music ducking, charts, film looks, bounces, paths, orbits, "
+    "import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -1404,13 +1405,33 @@ def set_motion_blur(on: bool = True, layers: str | list[int | str] | None = "all
                  shutterPhase=shutter_phase)
 
 
-def _onsets(path, sensitivity, min_gap):
-    """Times (s) of sharp rises in loudness in a PCM WAV: an energy envelope in 10 ms hops, the positive change,
-    peaks above mean + sensitivity x deviation, at least min_gap apart."""
+def _ffmpeg_wav(path):
+    """Decode a file's audio to a temporary 16 kHz mono WAV with ffmpeg; the caller deletes it."""
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise ToolError(f"{os.path.basename(path)} is not a PCM WAV; install ffmpeg to read audio from other files "
+                        "(brew install ffmpeg)")
+    fd, out = tempfile.mkstemp(suffix=".wav", prefix="aemcp_")
+    os.close(fd)
+    r = subprocess.run([exe, "-v", "error", "-y", "-i", path, "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", out],
+                       capture_output=True, text=True)
+    if r.returncode:
+        os.unlink(out)
+        raise ToolError(f"ffmpeg could not read {os.path.basename(path)}: {r.stderr.strip()[:300]}")
+    return out
+
+
+def _envelope(path):
+    """Loudness of a file's audio in 10 ms hops: RMS of 16-bit samples. Reads PCM WAV here; anything else (a
+    video's sound) through ffmpeg."""
     try:
         w = wave.open(path, "rb")
-    except (wave.Error, EOFError, OSError) as e:
-        raise ToolError(f"{os.path.basename(path)} is not a PCM WAV ({e}); beat markers read WAV files") from None
+    except (wave.Error, EOFError, OSError):
+        tmp = _ffmpeg_wav(path)
+        try:
+            return _envelope(tmp)
+        finally:
+            os.unlink(tmp)
     with w:
         rate, ch, width, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
         raw = w.readframes(n)
@@ -1429,6 +1450,13 @@ def _onsets(path, sensitivity, min_gap):
     for i in range(0, len(pcm) - hop + 1, hop):
         chunk = pcm[i:i + hop:max(1, ch * (rate // 8000))]
         env.append(math.sqrt(math.fsum(x * x for x in chunk) / max(1, len(chunk))))
+    return env
+
+
+def _onsets(path, sensitivity, min_gap):
+    """Times (s) of sharp rises in loudness: the energy envelope's positive change, peaks above mean + sensitivity x
+    deviation, at least min_gap apart."""
+    env = _envelope(path)
     rise = [max(0.0, b - a) for a, b in zip(env, env[1:])]
     if not rise or max(rise) == 0:
         return []
@@ -2445,6 +2473,243 @@ def neon(layer: int | str, color: str | list[float] = "#FF2D95", intensity: floa
         raise ToolError("intensity must be 0.2-4 and flicker 0-1")
     return _call("neon", comp=comp, layer=layer, color=_rgb("color", color), intensity=intensity,
                  flicker=flicker or None)
+
+
+# --- talking heads, sound, charts, film, physics, paths ---
+
+
+def _runs(flags, min_len):
+    """[start, end) hop ranges where flags is True for at least min_len hops."""
+    out, start = [], None
+    for i, f in enumerate(list(flags) + [False]):
+        if f and start is None:
+            start = i
+        elif not f and start is not None:
+            if i - start >= min_len:
+                out.append((start, i))
+            start = None
+    return out
+
+
+def _db(env):
+    return [20 * math.log10(max(e, 1.0) / 32768) for e in env]
+
+
+@_tool
+def cut_silences(layer: int | str, threshold_db: float = -40, min_silence: float = 0.5, padding: float = 0.12,
+                 comp: int | str | None = None) -> dict:
+    """Jump cuts for talking heads and voice-overs: find the pauses in a layer's sound (quieter than threshold_db
+    for at least min_silence seconds), cut them out and close the gaps. `padding` seconds of each pause stay on
+    both sides so words are not clipped. The kept parts become copies "<layer> 1", "<layer> 2"... back to back from
+    the layer's in point; the original is turned off. Reads WAV, or other files through ffmpeg."""
+    if not -90 <= threshold_db <= 0:
+        raise ToolError("threshold_db must be -90 to 0")
+    if min_silence <= 0 or padding < 0 or 2 * padding >= min_silence:
+        raise ToolError("min_silence must be above 0, and padding 0 or more and below half of min_silence")
+    src = _call("audio_source", comp=comp, layer=layer)
+    db = _db(_envelope(src["file"]))
+    s0, s1 = src["inPoint"] - src["startTime"], src["outPoint"] - src["startTime"]  # the trim, in source seconds
+    s1 = min(s1, len(db) / 100)  # the sound ends with the file
+    lo, hi = max(0, int(math.ceil(s0 * 100))), min(len(db), int(s1 * 100))
+    quiet = _runs([x < threshold_db for x in db[lo:hi]], int(round(min_silence * 100)))
+    gaps = [((lo + a) / 100 + padding, (lo + b) / 100 - padding) for a, b in quiet]
+    # a pause at either end of the trim only loses the side that touches speech
+    gaps = [(s0 if a - padding <= s0 + 1e-9 else a, s1 if b + padding >= s1 - 1e-9 else b) for a, b in gaps]
+    keep, t = [], s0
+    for a, b in gaps:
+        if a - t > 0.01:
+            keep.append([round(t, 3), round(a, 3)])
+        t = b
+    if s1 - t > 0.01:
+        keep.append([round(t, 3), round(s1, 3)])
+    removed = round((s1 - s0) - sum(b - a for a, b in keep), 3)
+    if not gaps:
+        return {"layer": layer, "parts": [], "removed": 0, "message": "no pauses found: raise threshold_db or lower "
+                "min_silence"}
+    if not keep:
+        raise ToolError("the whole layer is quieter than threshold_db: lower it")
+    out = _call("cut_segments", comp=comp, layer=layer, segments=keep)
+    return {**out, "removed": removed, "pauses": len(gaps)}
+
+
+@_tool
+def duck_audio(music: int | str, voice: int | str, amount_db: float = -12, threshold_db: float = -35,
+               attack: float = 0.15, release: float = 0.4, hold: float = 0.5, comp: int | str | None = None) -> dict:
+    """Lower the music under speech: wherever `voice` is louder than threshold_db, the music's Audio Levels dip by
+    amount_db, easing down over `attack` seconds before the words and back up over `release` after them; pauses
+    shorter than `hold` stay ducked. Reads WAV, or other files through ffmpeg. Existing fades are kept."""
+    if not -60 <= amount_db < 0:
+        raise ToolError("amount_db must be below 0, down to -60")
+    if not -90 <= threshold_db <= 0:
+        raise ToolError("threshold_db must be -90 to 0")
+    if not (0 < attack <= 3 and 0 < release <= 5 and 0 <= hold <= 10):
+        raise ToolError("attack and release must be above 0 (up to 3 and 5 s), hold 0-10 s")
+    src = _call("audio_source", comp=comp, layer=voice)
+    db = _db(_envelope(src["file"]))
+    speech = [(src["startTime"] + a / 100, src["startTime"] + b / 100) for a, b in _runs([x >= threshold_db for x in
+                                                                                          db], 1)]
+    speech = [(max(a, src["inPoint"]), min(b, src["outPoint"])) for a, b in speech
+              if b > src["inPoint"] and a < src["outPoint"]]
+    merged = []
+    for a, b in speech:
+        # close pauses shorter than hold, and dips that would overlap their ramps
+        if merged and a - merged[-1][1] < max(hold, attack + release):
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    if not merged:
+        raise ToolError("no speech louder than threshold_db in the voice: lower it")
+    keys = []
+    for a, b in merged:
+        keys += [{"time": round(max(0.0, a - attack), 3), "db": 0}, {"time": round(a, 3), "db": amount_db},
+                 {"time": round(b, 3), "db": amount_db}, {"time": round(b + release, 3), "db": 0}]
+    out = _call("duck_audio", comp=comp, layer=music, keys=keys)
+    return {**out, "ducks": [[round(a, 3), round(b, 3)] for a, b in merged]}
+
+
+def _colors(name, colors):
+    if not colors:
+        raise ToolError(f"{name} needs at least one color")
+    return [_rgb(name, c) for c in colors]
+
+
+PALETTE = ["#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#EDC948", "#B07AA1", "#FF9DA7"]
+
+
+@_tool
+def bar_chart(values: list[float], labels: list[str] | None = None, origin: list[float] = [360, 860],
+              height: float = 500, bar_width: float = 80, gap: float = 40, max_value: float | None = None,
+              colors: list[str | list[float]] | None = None, radius: float = 6, show_values: bool = True,
+              value_format: str = "{:,.0f}", prefix: str = "", suffix: str = "", font_size: float = 32,
+              text_color: list[float] = [1, 1, 1], start: float = 0.0, duration: float = 0.8, stagger: float = 0.12,
+              name: str = "Bar chart", comp: int | str | None = None) -> dict:
+    """An animated bar chart: bars standing on a baseline that starts at origin [x, y] (comp pixels, the first
+    bar's left edge), max_value (default the largest) `height` px tall, growing up one after another (`stagger` s
+    apart) from `start`. labels go under the bars; show_values puts each value above its bar, formatted with
+    value_format, prefix and suffix (e.g. "$", "%")."""
+    if not values or any(v < 0 for v in values) or len(values) > 60:
+        raise ToolError("values: 1-60 numbers, 0 or more")
+    top = max_value if max_value is not None else max(values)
+    if top <= 0 or max(values) > top:
+        raise ToolError("max_value must be above 0 and at least the largest value")
+    if labels is not None and len(labels) != len(values):
+        raise ToolError("labels needs one label per value")
+    if height <= 0 or bar_width <= 0 or gap < 0 or duration <= 0 or stagger < 0 or start < 0:
+        raise ToolError("height, bar_width and duration must be above 0; gap, stagger and start 0 or more")
+    try:
+        texts = [prefix + value_format.format(v) + suffix for v in values] if show_values else None
+    except (ValueError, IndexError, KeyError) as e:
+        raise ToolError(f"bad value_format: {e}") from None
+    return _call("bar_chart", comp=comp, values=[float(v) for v in values], labels=labels, valueTexts=texts,
+                 origin=_point("origin", origin), height=height, barWidth=bar_width, gap=gap, max=float(top),
+                 colors=_colors("colors", colors or PALETTE), radius=radius, fontSize=font_size,
+                 textColor=_color("text_color", text_color), start=start, duration=duration, stagger=stagger,
+                 name=name)
+
+
+@_tool
+def donut_chart(values: list[float], labels: list[str] | None = None, center: list[float] = [960, 540],
+                radius: float = 260, thickness: float = 90, colors: list[str | list[float]] | None = None,
+                show_percent: bool = True, font_size: float = 30, text_color: list[float] = [1, 1, 1],
+                start: float = 0.0, duration: float = 1.5, name: str = "Donut chart",
+                comp: int | str | None = None) -> dict:
+    """An animated donut (or pie) chart: slices sized by `values`, sweeping on clockwise from the top over
+    `duration` seconds. thickness is the ring's width in px (thickness = radius makes a pie). Labels sit outside
+    their slices, with the percentage when show_percent."""
+    if not values or any(v < 0 for v in values) or sum(values) <= 0 or len(values) > 24:
+        raise ToolError("values: 1-24 numbers, 0 or more, not all 0")
+    if labels is not None and len(labels) != len(values):
+        raise ToolError("labels needs one label per value")
+    if radius <= 0 or not 0 < thickness <= radius or duration <= 0 or start < 0:
+        raise ToolError("need radius > 0, 0 < thickness <= radius, duration > 0, start >= 0")
+    total = sum(values)
+    texts = None
+    if labels is not None or show_percent:
+        texts = []
+        for i, v in enumerate(values):
+            pct = f"{round(100 * v / total)}%" if show_percent else ""
+            texts.append(" ".join(t for t in ((labels[i] if labels else ""), pct) if t))
+    return _call("donut_chart", comp=comp, values=[float(v) for v in values], labels=texts,
+                 center=_point("center", center), radius=radius, thickness=thickness,
+                 colors=_colors("colors", colors or PALETTE), fontSize=font_size,
+                 textColor=_color("text_color", text_color), start=start, duration=duration, name=name)
+
+
+@_tool
+def line_chart(values: list[float], box: list[float] = [260, 240, 1400, 600], min_value: float | None = None,
+               max_value: float | None = None, color: str | list[float] = "#4E79A7", width: float = 6,
+               smooth: bool = True, dots: bool = True, start: float = 0.0, duration: float = 2.0,
+               name: str = "Line chart", comp: int | str | None = None) -> dict:
+    """An animated line chart drawing itself on from left to right inside box [x, y, width, height] (comp pixels),
+    values spread evenly across it between min_value and max_value (default their range); smooth curves it, dots
+    pop on as the line reaches each point."""
+    if len(values) < 2 or len(values) > 200:
+        raise ToolError("values: 2-200 numbers")
+    _rect("box", box)
+    lo = min(values) if min_value is None else min_value
+    hi = max(values) if max_value is None else max_value
+    if hi <= lo:
+        hi = lo + 1  # a flat line sits on the bottom
+    if min(values) < lo or max(values) > hi:
+        raise ToolError("min_value and max_value must include every value")
+    if width <= 0 or duration <= 0 or start < 0:
+        raise ToolError("width and duration must be above 0, start 0 or more")
+    return _call("line_chart", comp=comp, values=[float(v) for v in values], box=[float(v) for v in box],
+                 lo=float(lo), hi=float(hi), color=_rgb("color", color), width=width, smooth=smooth,
+                 dots=dots or None, start=start, duration=duration, name=name)
+
+
+@_tool
+def film_look(grain: float = 4, weave: float = 1.0, flicker: float = 0.03, halation: float = 0.4,
+              layer: int | str | None = None, name: str = "Film", comp: int | str | None = None) -> dict:
+    """Make digital footage feel like film: grain (Noise amount, %), gate weave (px of drift), exposure flicker
+    (stops) and halation (a red-orange glow around highlights, intensity); 0 leaves one out. On a new adjustment
+    layer over the whole comp, or on `layer`. Pair it with color_grade("vintage") or a look of your own."""
+    if not (0 <= grain <= 30 and 0 <= weave <= 10 and 0 <= flicker <= 0.5 and 0 <= halation <= 3):
+        raise ToolError("need grain 0-30, weave 0-10, flicker 0-0.5, halation 0-3")
+    if not (grain or weave or flicker or halation):
+        raise ToolError("everything is 0: nothing to add")
+    return _call("film_look", comp=comp, layer=layer, name=name, grain=grain, weave=weave, flicker=flicker,
+                 halation=halation)
+
+
+@_tool
+def bounce_drop(layer: int | str, height: float = 400, bounces: int = 3, elasticity: float = 0.45,
+                fall: float = 0.5, start: float | None = None, comp: int | str | None = None) -> dict:
+    """Drop a layer into its place with a bounce: it falls `height` px over `fall` seconds onto its current
+    position, then bounces `bounces` times, each `elasticity` (0-1) as high as the last, faster as they shrink."""
+    if height <= 0 or fall <= 0 or not 0 <= bounces <= 10 or not 0 < elasticity < 1:
+        raise ToolError("need height > 0, fall > 0, bounces 0-10, 0 < elasticity < 1")
+    return _call("bounce_drop", comp=comp, layer=layer, height=height, bounces=bounces, elasticity=elasticity,
+                 fall=fall, start=start)
+
+
+@_tool
+def draw_path(points: list[list[float]], closed: bool = False, smooth: bool = False,
+              stroke: list[float] | None = [1, 1, 1], width: float = 6, fill: list[float] | None = None,
+              duration: float = 0.0, start: float = 0.0, name: str = "Path", comp: int | str | None = None) -> dict:
+    """A custom vector shape through points [[x, y], ...] (comp pixels): open or closed, straight or smooth (a curve
+    through every point), stroked and/or filled. duration > 0 draws it on from `start`."""
+    if len(points) < 2 or (closed and len(points) < 3):
+        raise ToolError("a path needs at least 2 points (3 when closed)")
+    pts = [_point("points", p) for p in points]
+    if stroke is None and fill is None:
+        raise ToolError("give it a stroke or a fill")
+    if width <= 0 or duration < 0 or start < 0:
+        raise ToolError("width must be above 0, duration and start 0 or more")
+    return _call("draw_path", comp=comp, points=pts, closed=closed, smooth=smooth, stroke=_color("stroke", stroke),
+                 width=width, fill=_color("fill", fill), duration=duration, start=start, name=name)
+
+
+@_tool
+def orbit(layer: int | str, center: list[float] = [960, 540], radius: float = 300, period: float = 4.0,
+          start_angle: float = -90, clockwise: bool = True, ratio: float = 1.0, comp: int | str | None = None) -> dict:
+    """Move a layer around a circle (or an ellipse: ratio is height / width) at center, once every `period` seconds,
+    starting at start_angle degrees (-90 is the top, 0 the right). An expression drives the position."""
+    if radius <= 0 or period <= 0 or ratio <= 0:
+        raise ToolError("radius, period and ratio must be above 0")
+    return _call("orbit", comp=comp, layer=layer, center=_point("center", center), radius=radius, period=period,
+                 startAngle=start_angle, dir=1 if clockwise else -1, ratio=ratio)
 
 
 @_tool
