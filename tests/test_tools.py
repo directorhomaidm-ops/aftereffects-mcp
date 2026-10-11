@@ -34,6 +34,8 @@ def test_all_tools_registered():
         "camera_shake", "glitch", "weather", "letterbox",
         "draw_arrow", "spotlight", "blur_region", "picture_in_picture", "split_screen", "split_text", "timer",
         "audio_visualizer", "text_box",
+        "animate_layer", "lower_third", "ken_burns", "slideshow", "progress_bar", "gradient_background", "reframe",
+        "corner_pin", "neon",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -2246,8 +2248,10 @@ def _layer(layer, comp=1):
 
 
 def _key_values(ae, layer, prop, comp=1):
-    return ae.inspect(_layer(layer, comp) + ".property('ADBE Transform Group')"
-                      f".property('{prop}').keys.map(k => [k.time, k.value])")
+    # times and values rounded to 1e-6: 4.9, not 4.8999999999999995
+    return ae.inspect("(function () { const r = (x) => Array.isArray(x) ? Array.from(x, r) : Math.round(x * 1e6) / 1e6;"
+                      " return " + _layer(layer, comp) + ".property('ADBE Transform Group')"
+                      f".property('{prop}').keys.map(k => [r(k.time), r(k.value)]); }})()")
 
 
 def test_transition(ae):
@@ -2790,3 +2794,255 @@ def test_text_box(ae):
     for kwargs, msg in [({"padding": [1]}, "padding"), ({"opacity": 120}, "opacity")]:
         with pytest.raises(ToolError, match=msg):
             d.text_box("Title", **kwargs)
+
+
+# --- motion design: entrances, lower thirds, photos, formats, screens, neon ---
+
+
+def _kv(ae, expr):
+    return ae.inspect("(function () { const r = (x) => Array.isArray(x) ? Array.from(x, r) : Math.round(x * 1e6) / 1e6;"
+                      " return " + expr + ".keys.map(k => [r(k.time), r(k.value)]); })()")
+
+
+def test_animate_layer(ae):
+    d.create_comp("Main", duration=10)
+    d.add_layer("solid", name="Card")
+    d.set_layer("Card", in_point=1, out_point=8)
+    out = d.animate_layer("Card", "slide_left", duration=0.5, distance=300)
+    assert out == {"layer": "Card", "style": "slide_left", "direction": "in", "from": 1, "to": 1.5,
+                   "animated": ["Opacity", "Position"]}
+    # slide_left travels leftward: it comes in from the right
+    assert _key_values(ae, "Card", "ADBE Position") == [[1, [1260, 540, 0]], [1.5, [960, 540, 0]]]
+    assert _key_values(ae, "Card", "ADBE Opacity") == [[1, 0], [1.5, 100]]
+    out = d.animate_layer("Card", "slide_down", "out", duration=1)
+    assert (out["from"], out["to"]) == (7, 8)  # it ends at the out point
+    # and leaves downward from where the in left it
+    assert _key_values(ae, "Card", "ADBE Position")[2:] == [[7, [960, 540, 0]], [8, [960, 740, 0]]]
+    assert _key_values(ae, "Card", "ADBE Opacity")[2:] == [[7, 100], [8, 0]]
+    with pytest.raises(ToolError, match=r"Card's Opacity already has keyframes between 1 and 1.6 s"):
+        d.animate_layer("Card", "fade")
+    d.add_layer("text", text="Pop")
+    d.animate_layer("Pop", "pop", duration=1, start=2)
+    # x and y pop; z (not used by 2D layers) stays
+    assert _key_values(ae, "Pop", "ADBE Scale") == [[2, [0, 0, 100]], [2.65, [110, 110, 100]], [3, [100, 100, 100]]]
+    assert ae.inspect(_layer("Pop") + ".property('ADBE Transform Group').property('ADBE Opacity').numKeys") == 0
+    d.animate_layer("Pop", "pop", "out", duration=1, start=5)
+    assert _key_values(ae, "Pop", "ADBE Scale")[3:] == [[5, [100, 100, 100]], [5.35, [110, 110, 100]], [6, [0, 0, 100]]]
+    d.add_layer("solid", name="Soft")
+    out = d.animate_layer("Soft", "blur", duration=1)
+    assert out["animated"] == ["Opacity", "Blur in"]
+    blur = _layer("Soft") + ".property('ADBE Effect Parade').property(1).property('Blurriness')"
+    assert _kv(ae, blur) == [[0, 40], [1, 0]]
+    d.add_layer("solid", name="Turn")
+    d.animate_layer("Turn", "rotate", "out", duration=1, start=3)
+    assert _key_values(ae, "Turn", "ADBE Rotate Z") == [[3, 0], [4, 90]]
+    d.add_layer("solid", name="Grow")
+    d.animate_layer("Grow", "scale")
+    assert _key_values(ae, "Grow", "ADBE Scale") == [[0, [0, 0, 100]], [0.6, [100, 100, 100]]]
+    assert _key_values(ae, "Grow", "ADBE Opacity") == []  # scale and pop do not fade
+    for kwargs, msg in [({"style": "spin"}, "style must be"), ({"direction": "up"}, "in or out"),
+                        ({"duration": 0}, "duration")]:
+        with pytest.raises(ToolError, match=msg):
+            d.animate_layer("Card", **kwargs)
+
+
+def test_lower_third(ae):
+    d.create_comp("Main", duration=10)
+    out = d.lower_third("Sara Ahmed", "Director", start=1, duration=4)
+    assert out == {"layers": ["Lower third title", "Lower third subtitle", "Lower third bar"], "from": 1, "to": 5}
+    # left side: bar at x 120-128, text 24 px after it; the subtitle's baseline 120 px above the bottom, the
+    # title's 1.5 subtitle sizes above that (where the slides end)
+    assert _key_values(ae, "Lower third title", "ADBE Position")[-1] == [1.65, [152, 1080 - 120 - 54, 0]]
+    assert _key_values(ae, "Lower third subtitle", "ADBE Position")[-1] == [1.75, [152, 960, 0]]
+    doc = ae.inspect(_layer("Lower third title") + ".property('ADBE Text Properties')"
+                     ".property('ADBE Text Document').value")
+    assert (doc["fontSize"], doc["fillColor"], doc["justification"]) == (64, [1, 1, 1], 7413)
+    for name in ("Lower third title", "Lower third subtitle", "Lower third bar"):
+        assert ae.inspect(f"[{_layer(name)}.inPoint, {_layer(name)}.outPoint]") == [1, 5]
+    g = _shape_group("Lower third bar", "Bar")
+    assert ae.inspect(g + ".property('ADBE Vectors Group').property(1).property('ADBE Vector Rect Size').value") == [
+        8, 960 + 36 * 0.3 - (906 - 64 * 0.8)]
+    assert ae.inspect(g + ".property('ADBE Vector Transform Group').property('ADBE Vector Position').value") == [
+        124, (906 - 64 * 0.8 + 960 + 36 * 0.3) / 2]
+    assert _kv(ae, g + ".property('ADBE Vector Transform Group').property('ADBE Vector Scale')") == [
+        [1, [100, 0]], [1.35, [100, 100]], [4.65, [100, 100]], [5, [100, 0]]]
+    # the text slides right from behind the bar, the subtitle 0.1 s later, and both fade out at the end
+    assert _key_values(ae, "Lower third title", "ADBE Position") == [[1.15, [92, 906, 0]], [1.65, [152, 906, 0]]]
+    assert _key_values(ae, "Lower third subtitle", "ADBE Opacity") == [[1.25, 0], [1.75, 100], [4.6, 100], [4.9, 0]]
+    out = d.lower_third("Solo", side="right", name="LT2", accent=[0, 0.6, 1])
+    assert _key_values(ae, "LT2 title", "ADBE Position") == [[0.15, [1828, 960, 0]], [0.65, [1768, 960, 0]]]
+    assert ae.inspect(_layer("LT2 title") + ".property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.justification") == 7414
+    for kwargs, msg in [({"title": " "}, "title is empty"), ({"side": "top"}, "left or right"),
+                        ({"duration": 1}, "1.5 seconds")]:
+        with pytest.raises(ToolError, match=msg):
+            d.lower_third(**{"title": "A", **kwargs})
+
+
+def test_ken_burns(ae, tmp_path):
+    (tmp_path / "photo.png").write_bytes(b"x")
+    d.import_file(str(tmp_path / "photo.png"))  # 1920 x 1080
+    d.create_comp("Main", 1080, 1080, duration=6)
+    d.add_layer("item", item="photo.png")
+    out = d.ken_burns("photo.png", zoom=[100, 120], pan="left", amount=400, start=1, end=5)
+    # filling a square needs 100 % here (height); 840 px of width is spare at 100 %
+    assert out == {"layer": "photo.png", "scale": [100, 120], "pan": [-400, 0], "from": 1, "to": 5,
+                   "room": [840, 0]}
+    assert _key_values(ae, "photo.png", "ADBE Scale", comp=2) == [[1, [100, 100, 100]], [5, [120, 120, 100]]]
+    assert _key_values(ae, "photo.png", "ADBE Position", comp=2) == [[1, [740, 540, 0]], [5, [340, 540, 0]]]
+    d.add_layer("item", item="photo.png")
+    with pytest.raises(ToolError, match=r"panning 10 px would show photo.png's edges: at zoom 100-115 % it has room "
+                                        r"for 0 px; zoom in more"):
+        d.ken_burns(1, pan="up", amount=10, comp="Main")
+    out = d.ken_burns(1, zoom=[110, 120], pan="up", amount=100, comp="Main")
+    assert out["pan"] == [0, -100] and out["room"][1] == 108
+    with pytest.raises(ToolError, match="photo.png's Position is animated"):
+        d.ken_burns(1, comp="Main")
+    for kwargs, msg in [({"zoom": [90, 100]}, "zoom needs"), ({"pan": "spin"}, "pan must be"),
+                        ({"pan": "left"}, "above 0 with a pan")]:
+        with pytest.raises(ToolError, match=msg):
+            d.ken_burns(1, comp="Main", **kwargs)
+
+
+def test_slideshow(ae, tmp_path):
+    for n in ("a.png", "b.png", "c.png"):
+        (tmp_path / n).write_bytes(b"x")
+    d.import_file(str(tmp_path / "a.png"))
+    out = d.slideshow(["a.png", str(tmp_path / "b.png"), str(tmp_path / "c.png")], duration=3, overlap=0.5,
+                      width=1080, height=1080)
+    assert (out["comp"], out["duration"]) == ("Slideshow", 8)
+    assert [(s["from"], s["to"], s["pan"]) for s in out["slides"]] == [(0, 3, "left"), (2.5, 5.5, "up"),
+                                                                        (5, 8, "right")]
+    # sideways there is plenty of room; up and down only what the 105 % start zoom leaves: 54 px
+    assert [s["amount"] for s in out["slides"]] == [80, 53.5, 80]
+    c = ae.inspect("ae.app.project._items.findIndex(i => i.name === 'Slideshow') + 1")
+    layers = ae.inspect(f"ae.app.project.item({c})._layers.map(l => l.name)")
+    assert layers == ["c.png", "b.png", "a.png"]  # the latest on top
+    assert _key_values(ae, 2, "ADBE Scale", comp=c) == [[2.5, [120, 120, 100]], [5.5, [105, 105, 100]]]  # zoom out
+    assert _key_values(ae, 2, "ADBE Opacity", comp=c) == [[2.5, 0], [3, 100]]
+    assert ae.inspect(f"ae.app.project.item({c}).layer(3).property('ADBE Transform Group')"
+                      ".property('ADBE Opacity').numKeys") == 0  # the first slide does not fade in
+    out = d.slideshow(["a.png", "b.png"], ken_burns=False, overlap=0, name="Plain")
+    assert [s["pan"] for s in out["slides"]] == ["none", "none"]
+    for kwargs, msg in [({"items": []}, "no items"), ({"overlap": 3}, "below duration"), ({"zoom": 300}, "zoom")]:
+        with pytest.raises(ToolError, match=msg):
+            d.slideshow(**{"items": ["a.png"], **kwargs})
+
+
+def test_progress_bar(ae):
+    d.create_comp("Main", duration=10)
+    out = d.progress_bar(start=1, height=10, margin=20, color=[1, 0, 0])
+    assert out == {"layer": "Progress", "index": 1, "from": 1, "to": 10}
+    bar = _shape_group(1, "Bar")
+    rect = bar + ".property('ADBE Vectors Group').property(1)"
+    assert ae.inspect(f"[{rect}.property(1).value, {rect}.property(2).value, {rect}.property(3).value]") == [
+        [1880, 10], [940, 0], 5]
+    assert ae.inspect(bar + ".property('ADBE Vector Transform Group').property('ADBE Vector Position').value") == [
+        20, 1080 - 20 - 5]
+    assert _kv(ae, bar + ".property('ADBE Vector Transform Group').property('ADBE Vector Scale')") == [
+        [1, [0, 100]], [10, [100, 100]]]
+    assert ae.inspect(_shape_group(1, "Track") + ".property('ADBE Vectors Group').property(2).property(2).value") == 25
+    # the bar draws over its track: it comes first in the contents
+    assert ae.inspect(_layer(1) + ".property('ADBE Root Vectors Group').children.map(g => g.name)") == ["Bar", "Track"]
+    d.progress_bar(position="top", duration=3, track_opacity=0, rounded=False, name="Top")
+    assert ae.inspect(_layer(1) + ".property('ADBE Root Vectors Group').children.map(g => g.name)") == ["Bar"]
+    assert ae.inspect(_shape_group(1, "Bar") + ".property('ADBE Vector Transform Group')"
+                      ".property('ADBE Vector Position').value") == [0, 4]
+    with pytest.raises(ToolError, match="start is at or past"):
+        d.progress_bar(start=10)
+    with pytest.raises(ToolError, match="bottom or top"):
+        d.progress_bar(position="left")
+
+
+def test_gradient_background(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("text", text="Title")
+    out = d.gradient_background(["#000000", [1, 1, 1]], angle=0)
+    assert out == {"layer": "Background", "index": 2, "kind": "linear", "start": [0, 540], "end": [1920, 540]}
+    p = dict(_params(ae, 2, 1))
+    assert (p["Start Color"], p["End Color"], p["Ramp Shape"]) == ([0, 0, 0, 1], [1, 1, 1, 1], 1)
+    out = d.gradient_background(angle=90, cycle=8, name="Spin")
+    assert (out["start"], out["end"]) == ([960, 0], [960, 1080])
+    expr = ae.inspect(_fx(3, 1) + ".property('Start of Ramp').expression")
+    assert "a = (90 + time * 360 / 8) * Math.PI / 180" in expr
+    # the expression reproduces the static ends at time 0 and turns a quarter in 2 s
+    js = expr.replace("time", "T")
+    assert ae.inspect(f"(function () {{ var T = 0; return eval({json.dumps(js)}); }})()") == pytest.approx([960, 0])
+    assert ae.inspect(f"(function () {{ var T = 2; return eval({json.dumps(js)}); }})()") == pytest.approx([1920, 540])
+    out = d.gradient_background(["#FF0000", "#0000FF"], kind="radial", name="Glow")
+    assert (out["start"], out["end"]) == ([960, 540], [960 + 1152, 540])
+    assert dict(_params(ae, 4, 1))["Ramp Shape"] == 2
+    for kwargs, msg in [({"colors": ["#000000"]}, "two colors"), ({"kind": "conic"}, "linear or radial"),
+                        ({"kind": "radial", "cycle": 2}, "only turns a linear")]:
+        with pytest.raises(ToolError, match=msg):
+            d.gradient_background(**kwargs)
+
+
+def test_reframe(ae):
+    d.create_comp("Wide", duration=6)  # 1920 x 1080
+    out = d.reframe("Wide")
+    assert out == {"comp": "Wide 9x16", "id": 2, "width": 1080, "height": 1920, "mode": "fill", "scale": 177.78}
+    assert ae.inspect("[ae.app.project.item(2).duration, ae.app.project.item(2).layer(1).source.name]") == [6, "Wide"]
+    assert _tr(ae, 1, "ADBE Position", comp=2)[:2] == [540, 960]
+    # a focus on the right third slides the picture left, but never past its edge
+    d.reframe("Wide", focus=[0.75, 0.5], name="Right")
+    assert _tr(ae, 1, "ADBE Position", comp=3)[0] == pytest.approx(540 - 0.25 * 3413.33, abs=0.1)
+    d.reframe("Wide", focus=[1, 0.5], name="Edge")
+    assert _tr(ae, 1, "ADBE Position", comp=4)[0] == pytest.approx(540 - (3413.33 - 1080) / 2, abs=0.1)
+    d.create_comp("Tall", 1080, 1920, duration=6)
+    out = d.reframe("Tall", "16:9", focus=[0.5, 0.2])
+    # a portrait into landscape: the focus picks the height, 30 % of the scaled height above the middle
+    assert _tr(ae, 1, "ADBE Position", comp=out["id"])[1] == pytest.approx(540 + 0.3 * 1920 * 1920 / 1080, abs=0.1)
+    out = d.reframe("Wide", "1:1", "fit")
+    assert (out["width"], out["height"], out["scale"]) == (1080, 1080, 56.25)
+    out = d.reframe("Wide", "4:5", "blur_fill", blur=80)
+    c = out["id"]
+    assert ae.inspect(f"ae.app.project.item({c})._layers.map(l => l.name)") == ["Wide", "Wide blurred"]
+    assert _tr(ae, 2, "ADBE Scale", comp=c)[0] == pytest.approx(1350 / 1080 * 100 * 1.1)
+    assert dict(_params(ae, 2, 1, comp=c))["Blurriness"] == 80
+    for kwargs, msg in [({"aspect": "21:9"}, "aspect must be"), ({"mode": "crop"}, "mode must be"),
+                        ({"focus": [2, 0]}, "focus"), ({"blur": 0}, "blur")]:
+        with pytest.raises(ToolError, match=msg):
+            d.reframe("Wide", **kwargs)
+
+
+def test_corner_pin(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Screen")  # 1920 x 1080, anchor at its center, at the comp's center
+    d.set_property("Screen", "scale", [50, 50])
+    out = d.corner_pin("Screen", corners=[[700, 300], [1300, 320], [1280, 700], [720, 680]])
+    # comp points become layer pixels: (comp - position) / 50 % + anchor
+    assert out == {"layer": "Screen", "effect": "Corner Pin", "keys": 0, "upperLeft": [440, 60]}
+    p = dict(_params(ae, 1, 1))
+    assert (p["Upper Right"], p["Lower Right"], p["Lower Left"]) == ([1640, 100], [1600, 860], [480, 820])
+    d.add_layer("solid", name="Phone")
+    out = d.corner_pin("Phone", keys=[{"time": 0, "corners": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+                                      {"time": 1, "corners": [[5, 5], [15, 5], [15, 15], [5, 15]]}])
+    assert out["keys"] == 2
+    assert _kv(ae, _fx(1, 1) + ".property('Upper Left')") == [[0, [0, 0]], [1, [5, 5]]]
+    for kwargs, msg in [({}, "corners or keys"), ({"corners": [[0, 0]] * 3}, "four"),
+                        ({"keys": [{"time": 0}]}, "time and corners")]:
+        with pytest.raises(ToolError, match=msg):
+            d.corner_pin("Phone", **kwargs)
+    d.set_property("Phone", "rotation", 10)
+    with pytest.raises(ToolError, match="Phone is rotated"):
+        d.corner_pin("Phone", corners=[[0, 0]] * 4)
+
+
+def test_neon(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("text", text="OPEN")
+    out = d.neon("OPEN", "#00FFFF", intensity=2, flicker=0.1)
+    assert out == {"layer": "OPEN", "effects": ["Fill", "Glow", "Glow 2"], "flicker": 0.1}
+    assert dict(_params(ae, 1, 1))["Color"] == [0.6, 1, 1, 1]  # the core, most of the way to white
+    tight, wide = dict(_params(ae, 1, 2)), dict(_params(ae, 1, 3))
+    assert (tight["Glow Radius"], tight["Glow Intensity"], wide["Glow Radius"], wide["Glow Intensity"]) == (12, 3, 60, 2)
+    assert (tight["Glow Colors"], tight["Color A"], wide["Color B"]) == (2, [0, 1, 1, 1], [0, 1, 1, 1])
+    assert ae.inspect(_layer(1) + ".property('ADBE Transform Group').property('ADBE Opacity').expression") == \
+        "seedRandom(Math.floor(time * 12), true);\nrandom() < 0.1 ? random(20, 60) : value;"
+    d.add_layer("text", text="Calm")
+    assert d.neon("Calm")["flicker"] == 0
+    assert ae.inspect(_layer(1) + ".property('ADBE Transform Group').property('ADBE Opacity').expression") == ""
+    for kwargs, msg in [({"intensity": 9}, "intensity"), ({"flicker": 2}, "flicker"), ({"color": "neon"}, "hex")]:
+        with pytest.raises(ToolError, match=msg):
+            d.neon("Calm", **kwargs)

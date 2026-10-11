@@ -39,6 +39,14 @@ A key is half the job; the subject has to sit in the plate:
 - **Shadows:** a black solid with a soft elliptical mask under the subject, blending
   `multiply`, opacity 30-60 %.
 
+## Screen replacement
+
+To put a video or graphic onto a phone, monitor, billboard or page in the shot:
+`corner_pin(layer, corners=[top_left, top_right, bottom_right, bottom_left])` in comp pixels.
+For a moving shot, track the four corners (`track_point` on each) and pass
+`keys=[{"time": t, "corners": [...]}, ...]`. Then grade the inserted layer down to the screen's
+brightness, and add a little blur so it is no sharper than the plate.
+
 ## Blending
 
 `set_switches(layer, blending="screen")` drops black (flares, fire, smoke over black);
