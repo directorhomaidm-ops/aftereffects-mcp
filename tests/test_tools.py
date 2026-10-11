@@ -36,6 +36,8 @@ def test_all_tools_registered():
         "audio_visualizer", "text_box",
         "animate_layer", "lower_third", "ken_burns", "slideshow", "progress_bar", "gradient_background", "reframe",
         "corner_pin", "neon",
+        "cut_silences", "duck_audio", "bar_chart", "donut_chart", "line_chart", "film_look", "bounce_drop",
+        "draw_path", "orbit",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -3046,3 +3048,275 @@ def test_neon(ae):
     for kwargs, msg in [({"intensity": 9}, "intensity"), ({"flicker": 2}, "flicker"), ({"color": "neon"}, "hex")]:
         with pytest.raises(ToolError, match=msg):
             d.neon("Calm", **kwargs)
+
+
+# --- talking heads, sound, charts, film, physics, paths ---
+
+
+def _speech_wav(path, loud, seconds, rate=8000):
+    """A 300 Hz tone (-6 dBFS) during the `loud` [start, end] spans, near silence (-70 dBFS) elsewhere."""
+    import wave as _wave
+    frames = bytearray()
+    for i in range(int(seconds * rate)):
+        t = i / rate
+        amp = 0.5 if any(a <= t < b for a, b in loud) else 0.0003
+        frames += int(amp * 32767 * math.sin(2 * math.pi * 300 * t)).to_bytes(2, "little", signed=True)
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def test_cut_silences(ae, tmp_path):
+    wav = tmp_path / "talk.wav"
+    _speech_wav(wav, [(0.5, 2.0), (3.0, 4.0), (4.2, 5.0)], 6)
+    d.import_file(str(wav))
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item="talk.wav")
+    d.set_layer("talk.wav", start_time=1, in_point=1, out_point=7)  # the whole file, from 1 s
+    out = d.cut_silences("talk.wav", min_silence=0.5, padding=0.1)
+    # the opening pause goes up to 0.1 s before the words; the 1 s pause keeps 0.1 s each side; the 0.2 s pause
+    # stays; the ending pause keeps 0.1 s after the last word
+    assert [p["source"] for p in out["parts"]] == [[0.4, 2.1], [2.9, 5.1]]
+    assert [(p["from"], p["to"]) for p in out["parts"]] == [(1, 2.7), (2.7, 4.9)]
+    assert (out["removed"], out["pauses"], out["end"]) == (2.1, 3, 4.9)  # 6 s down to 3.9
+    assert ae.inspect("ae.app.project.item(2)._layers.map(l => [l.name, l.enabled, l.audioEnabled])") == [
+        ["talk.wav 1", True, True], ["talk.wav 2", True, True], ["talk.wav", False, False]]
+    assert ae.inspect("ae.app.project.item(2).layer(2).startTime") == pytest.approx(2.7 - 2.9)
+    assert d.cut_silences("talk.wav 1", threshold_db=-90)["parts"] == []  # nothing below -90 dB
+    # a layer running past the end of its sound stops being cut where the sound ends
+    d.add_layer("item", item="talk.wav")
+    d.set_layer(1, out_point=10)
+    assert d.cut_silences(1, padding=0.1)["parts"][-1]["source"] == [2.9, 5.1]
+    for kwargs, msg in [({"threshold_db": 5}, "threshold_db"), ({"min_silence": 0.2, "padding": 0.1}, "half"),
+                        ({"min_silence": 0}, "min_silence")]:
+        with pytest.raises(ToolError, match=msg):
+            d.cut_silences("talk.wav", **kwargs)
+
+
+def test_cut_silences_needs_wav_or_ffmpeg(ae, tmp_path, monkeypatch):
+    (tmp_path / "clip.mov").write_bytes(b"not audio")
+    d.import_file(str(tmp_path / "clip.mov"))
+    d.create_comp("Main", duration=5)
+    d.add_layer("item", item="clip.mov")
+    monkeypatch.setattr(d.shutil, "which", lambda name: None)
+    with pytest.raises(ToolError, match="clip.mov is not a PCM WAV; install ffmpeg"):
+        d.cut_silences("clip.mov")
+    # with ffmpeg, the sound is decoded to a temporary WAV first, then deleted
+    made = []
+
+    def fake_ffmpeg(cmd, capture_output, text):
+        assert cmd[:2] == ["/usr/bin/ffmpeg", "-v"] and cmd[cmd.index("-i") + 1] == str(tmp_path / "clip.mov")
+        _speech_wav(cmd[-1], [(0, 1), (2, 5)], 5)
+        made.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(d.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(d.subprocess, "run", fake_ffmpeg)
+    out = d.cut_silences("clip.mov", padding=0.1)
+    assert [p["source"] for p in out["parts"]] == [[0, 1.1], [1.9, 5]]
+    assert made and not os.path.exists(made[0])  # the temporary WAV is gone
+
+
+def test_duck_audio(ae, tmp_path):
+    voice, music = tmp_path / "voice.wav", tmp_path / "music.wav"
+    _speech_wav(voice, [(1, 2), (2.3, 3), (5, 6)], 7)
+    _speech_wav(music, [(0, 10)], 10)
+    d.import_file(str(voice))
+    d.import_file(str(music))
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item="music.wav")
+    d.add_layer("item", item="voice.wav")
+    d.audio_fade("music.wav", fade_in=0.5, fade_out=0, level_db=-3)
+    out = d.duck_audio("music.wav", "voice.wav", amount_db=-10, attack=0.2, release=0.5, hold=0.5)
+    # the 0.3 s pause is held; the two phrases make two dips
+    assert out["ducks"] == [[1, 3], [5, 6]]
+    levels = ae.inspect("ae.app.project.item(3).layer(2).property('ADBE Audio Group').property('ADBE Audio Levels')"
+                        ".keys.map(k => [Math.round(k.time * 1000) / 1000, k.value[0]])")
+    # relative to what was there: the fade's -3 dB
+    assert levels == [[0, -48], [0.5, -3], [0.8, -3], [1, -13], [3, -13], [3.5, -3], [4.8, -3], [5, -13], [6, -13],
+                      [6.5, -3]]
+    assert out["keys"] == 10
+    # with no hold, the ramps alone still join phrases whose dips would overlap
+    assert d.duck_audio("music.wav", "voice.wav", attack=0.5, release=0.5, hold=0)["ducks"] == [[1, 3], [5, 6]]
+    # speech from the very start: the ramp down starts at 0, not before
+    early = tmp_path / "early.wav"
+    _speech_wav(early, [(0.1, 0.6)], 2)
+    d.import_file(str(early))
+    d.add_layer("item", item="early.wav")
+    d.add_layer("item", item="music.wav")
+    d.duck_audio(1, "early.wav", attack=0.3)
+    assert ae.inspect("ae.app.project.item(3).layer(1).property('ADBE Audio Group').property('ADBE Audio Levels')"
+                      ".keys[0].time") == 0
+    with pytest.raises(ToolError, match="no speech"):
+        d.duck_audio("music.wav", "voice.wav", threshold_db=0)
+    for kwargs, msg in [({"amount_db": 3}, "amount_db"), ({"attack": 0}, "attack"), ({"threshold_db": -100},
+                                                                                    "threshold_db")]:
+        with pytest.raises(ToolError, match=msg):
+            d.duck_audio("music.wav", "voice.wav", **kwargs)
+    d.add_layer("solid", name="Mute")
+    with pytest.raises(ToolError, match="Mute has no audio"):
+        d.duck_audio("Mute", "voice.wav")
+
+
+def test_bar_chart(ae):
+    d.create_comp("Main", duration=6)
+    out = d.bar_chart([50, 100, 25], labels=["A", "B", "C"], origin=[100, 900], height=400, bar_width=60, gap=20,
+                      prefix="$", suffix="k", start=1, duration=0.5, stagger=0.2, colors=["#FF0000"])
+    assert out == {"layer": "Bar chart", "bars": 3, "end": 1.9, "texts": [
+        "Bar chart label 1", "Bar chart value 1", "Bar chart label 2", "Bar chart value 2", "Bar chart label 3",
+        "Bar chart value 3"]}
+    chart = "ae.app.project.item(1)._layers.find(l => l.name === 'Bar chart')"
+    bar2 = chart + ".property('ADBE Root Vectors Group').property('Bar 2')"
+    rect = bar2 + ".property('ADBE Vectors Group').property(1)"
+    assert ae.inspect(f"[{rect}.property(1).value, {rect}.property(2).value]") == [[60, 400], [0, -200]]
+    assert ae.inspect(bar2 + ".property('ADBE Vector Transform Group').property('ADBE Vector Position').value") == [
+        210, 900]
+    assert _kv(ae, bar2 + ".property('ADBE Vector Transform Group').property('ADBE Vector Scale')") == [
+        [1.2, [100, 0]], [1.7, [100, 100]]]
+    assert ae.inspect(bar2 + ".property('ADBE Vectors Group').property(2).property(1).value") == [1, 0, 0, 1]
+    value = _layer("Bar chart value 3")
+    assert ae.inspect(value + ".property('ADBE Text Properties').property('ADBE Text Document').value.text") == "$25k"
+    assert _tr(ae, "Bar chart value 3", "ADBE Position")[:2] == [290, 900 - 100 - 16]
+    assert _key_values(ae, "Bar chart value 3", "ADBE Opacity") == [[1.8, 0], [2.1, 100]]
+    assert _tr(ae, "Bar chart label 1", "ADBE Position")[:2] == [130, 900 + 32 * 1.4]
+    out = d.bar_chart([1.5, 2], show_values=False, value_format="{:.1f}", name="Plain")
+    assert out["texts"] == []
+    for kwargs, msg in [({"values": []}, "values"), ({"values": [-1]}, "values"), ({"labels": ["a"]}, "one label"),
+                        ({"max_value": 1}, "at least the largest"), ({"value_format": "{:q}"}, "value_format")]:
+        with pytest.raises(ToolError, match=msg):
+            d.bar_chart(**{"values": [1, 2], **kwargs})
+
+
+def test_donut_chart(ae):
+    d.create_comp("Main", duration=6)
+    out = d.donut_chart([1, 3], labels=["Cats", "Dogs"], radius=200, thickness=60, start=1, duration=2)
+    assert out == {"layer": "Donut chart", "slices": [{"slice": "Slice 1", "percent": 25, "from": 1, "to": 1.5},
+                                                      {"slice": "Slice 2", "percent": 75, "from": 1.5, "to": 3}]}
+    s2 = _shape_group("Donut chart", "Slice 2") + ".property('ADBE Vectors Group')"
+    assert ae.inspect(s2 + ".property(1).property('ADBE Vector Ellipse Size').value") == [340, 340]
+    assert ae.inspect(s2 + ".property(2).property('ADBE Vector Trim Start').value") == 25
+    assert _kv(ae, s2 + ".property(2).property('ADBE Vector Trim End')") == [[1.5, 25], [3, 100]]
+    assert ae.inspect(s2 + ".property(3).property('ADBE Vector Stroke Width').value") == 60
+    assert ae.inspect(_layer("Donut chart label 2") + ".property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.text") == "Dogs 75%"
+    # the label sits outside the middle of its slice: 62.5 % of the way round from the top, clockwise
+    x, y = _tr(ae, "Donut chart label 2", "ADBE Position")[:2]
+    a = math.radians(0.625 * 360 - 90)
+    assert (x, y) == pytest.approx((960 + 245 * math.cos(a), 540 + 245 * math.sin(a) + 30 * 0.35), abs=0.01)
+    out = d.donut_chart([2, 2], show_percent=False, name="Pie", radius=100, thickness=100)
+    assert ae.inspect("ae.app.project.item(1)._layers.filter(l => l.name.startsWith('Pie label')).length") == 0
+    for kwargs, msg in [({"values": [0, 0]}, "not all 0"), ({"thickness": 300}, "thickness"),
+                        ({"labels": ["a", "b", "c"]}, "one label")]:
+        with pytest.raises(ToolError, match=msg):
+            d.donut_chart(**{"values": [1, 2], **kwargs})
+
+
+def test_line_chart(ae):
+    d.create_comp("Main", duration=6)
+    out = d.line_chart([0, 10, 5], box=[100, 100, 400, 200], smooth=False, start=1, duration=2, color=[0, 1, 0])
+    assert out == {"layer": "Line chart", "points": 3, "from": 1, "to": 3}
+    line = _shape_group("Line chart", "Line") + ".property('ADBE Vectors Group')"
+    path = ae.inspect(line + ".property(1).property('ADBE Vector Shape').value")
+    assert path["vertices"] == [[100, 300], [300, 100], [500, 200]] and path["closed"] is False
+    assert _kv(ae, line + ".property(3).property('ADBE Vector Trim End')") == [[1, 0], [3, 100]]
+    # each dot appears when the line has drawn up to it, by length
+    seg1, seg2 = math.hypot(200, 200), math.hypot(200, 100)
+    op = ".property('ADBE Vector Transform Group').property('ADBE Vector Group Opacity')"
+    assert _kv(ae, _shape_group("Line chart", "Dot 1") + op) == [[1, 100]]
+    t2 = _kv(ae, _shape_group("Line chart", "Dot 2") + op)
+    assert t2[0] == [1, 0] and t2[1][0] == pytest.approx(1 + 2 * seg1 / (seg1 + seg2), abs=1e-5)
+    d.line_chart([1, 2, 3, 2], dots=False, name="Smooth")
+    path = ae.inspect(_shape_group("Smooth", "Line") + ".property('ADBE Vectors Group').property(1)"
+                      ".property('ADBE Vector Shape').value")
+    assert path["outTangents"][1] != [0, 0] and path["inTangents"][0] == [0, 0]
+    assert ae.inspect(_layer("Smooth") + ".property('ADBE Root Vectors Group').numProperties") == 1
+    for kwargs, msg in [({"values": [1]}, "2-200"), ({"min_value": 5}, "include every value"),
+                        ({"box": [0, 0, 0, 1]}, "positive width")]:
+        with pytest.raises(ToolError, match=msg):
+            d.line_chart(**{"values": [1, 2], **kwargs})
+
+
+def test_film_look(ae):
+    d.create_comp("Main", duration=5)
+    out = d.film_look(grain=6, weave=2, flicker=0.05, halation=0.5)
+    assert out == {"layer": "Film", "index": 1, "effects": ["Grain", "Gate Weave", "Flicker", "Halation"]}
+    assert dict(_params(ae, 1, 1))["Amount of Noise"] == 6
+    assert ae.inspect(_fx(1, 2) + ".property('Position').expression") == "wiggle(8, 2);"
+    assert dict(_params(ae, 1, 2))["Scale"] == pytest.approx(100 * (1 + 4 / 1080) + 0.1, abs=0.01)
+    assert ae.inspect(_fx(1, 3) + ".property('Exposure').expression") == "wiggle(12, 0.05);"
+    halo = dict(_params(ae, 1, 4))
+    assert (halo["Glow Intensity"], halo["Glow Colors"], halo["Color A"]) == (0.5, 2, [1, 0.35, 0.1, 1])
+    d.add_layer("solid", name="Plate")
+    out = d.film_look(grain=0, weave=1, flicker=0, halation=0, layer="Plate")
+    assert out["effects"] == ["Gate Weave"] and dict(_params(ae, 1, 1))["Scale"] == 100  # a layer keeps its size
+    assert d.film_look(grain=3, weave=0, flicker=0, halation=0, name="Grain only")["effects"] == ["Grain"]
+    with pytest.raises(ToolError, match="nothing to add"):
+        d.film_look(0, 0, 0, 0)
+    with pytest.raises(ToolError, match="grain 0-30"):
+        d.film_look(grain=50)
+
+
+def test_bounce_drop(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Ball")
+    out = d.bounce_drop("Ball", height=400, bounces=2, elasticity=0.25, fall=0.5, start=1)
+    # falls 0.5 s; bounces to 100 px (0.25 s up, 0.25 s down), then to 25 px (0.125 s each way)
+    assert out == {"layer": "Ball", "keys": 6, "end": 2.25}
+    assert _key_values(ae, "Ball", "ADBE Position") == [
+        [1, [960, 140, 0]], [1.5, [960, 540, 0]], [1.75, [960, 440, 0]], [2, [960, 540, 0]], [2.125, [960, 515, 0]],
+        [2.25, [960, 540, 0]]]
+    kinds = ae.inspect(_layer("Ball") + ".property('ADBE Transform Group').property('ADBE Position')"
+                       ".keys.map(k => k.inType)")
+    assert kinds == [6613, 6612, 6613, 6612, 6613, 6612]  # apexes ease, impacts are sharp
+    with pytest.raises(ToolError, match="Position is animated"):
+        d.bounce_drop("Ball")
+    with pytest.raises(ToolError, match="elasticity"):
+        d.bounce_drop("Ball", elasticity=1)
+
+
+def test_draw_path(ae):
+    d.create_comp("Main", duration=5)
+    out = d.draw_path([[100, 100], [300, 100], [200, 300]], closed=True, fill=[0, 0, 1], stroke=None)
+    assert out == {"layer": "Path", "index": 1, "points": 3, "closed": True, "smooth": False}
+    c = _shape_group(1, "Path") + ".property('ADBE Vectors Group')"
+    assert ae.inspect(c + ".property(1).property(1).value.vertices") == [[100, 100], [300, 100], [200, 300]]
+    assert ae.inspect(c + ".children.map(p => p.matchName)") == ["ADBE Vector Shape - Group",
+                                                                  "ADBE Vector Graphic - Fill"]
+    d.draw_path([[0, 0], [100, 50], [200, 0]], smooth=True, duration=1, start=0.5, name="Wave")
+    c = _shape_group(1, "Path") + ".property('ADBE Vectors Group')"
+    shape = ae.inspect(c + ".property(1).property(1).value")
+    assert shape["outTangents"][1] == pytest.approx([200 / 6, 0]) and shape["inTangents"][0] == [0, 0]
+    assert ae.inspect(c + ".children.map(p => p.matchName)") == ["ADBE Vector Shape - Group",
+                                                                  "ADBE Vector Filter - Trim",
+                                                                  "ADBE Vector Graphic - Stroke"]
+    assert _kv(ae, c + ".property(2).property('ADBE Vector Trim End')") == [[0.5, 0], [1.5, 100]]
+    d.draw_path([[0, 0], [50, 50], [100, 0]], name="Open")
+    assert ae.inspect(_shape_group(1, "Path") + ".property('ADBE Vectors Group').property(1).property(1).value.closed") \
+        is False
+    for kwargs, msg in [({"points": [[0, 0]]}, "at least 2"), ({"closed": True}, "3 when closed"),
+                        ({"stroke": None}, "stroke or a fill")]:
+        with pytest.raises(ToolError, match=msg):
+            d.draw_path(**{"points": [[0, 0], [1, 1]], **kwargs})
+
+
+def test_orbit(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Moon")
+    out = d.orbit("Moon", center=[960, 540], radius=200, period=4, ratio=0.5)
+    expr = out["expression"]
+    assert expr.startswith("var a = (-90 + time * 90) * Math.PI / 180;")
+    js = expr.replace("time", "T").replace("value", "V")
+    run = lambda t: ae.inspect(f"(function () {{ var T = {t}, V = [0, 0, 0]; return eval({json.dumps(js)}); }})()")
+    assert run(0) == pytest.approx([960, 440, 0])  # the top (ratio 0.5: 100 px above)
+    assert run(1) == pytest.approx([1160, 540, 0])  # a quarter turn clockwise: the right
+    d.add_layer("solid", name="Back")
+    js = d.orbit("Back", clockwise=False, start_angle=0)["expression"].replace("time", "T").replace("value", "V")
+    assert ae.inspect(f"(function () {{ var T = 1, V = [0, 0]; return eval({json.dumps(js)}); }})()") == \
+        pytest.approx([960, 240])  # counter-clockwise from the right: the top
+    d.add_layer("solid", name="Fixed")
+    d.set_keyframes("Fixed", "position", [{"time": 0, "value": [0, 0]}, {"time": 1, "value": [5, 5]}])
+    with pytest.raises(ToolError, match="Position is animated"):
+        d.orbit("Fixed")
+    with pytest.raises(ToolError, match="above 0"):
+        d.orbit("Moon", period=0)

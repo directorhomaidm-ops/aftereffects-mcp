@@ -24,6 +24,8 @@ Tools: `camera_shake`, `glitch`, `weather`, `letterbox`, `color_grade`, `add_eff
   of a scene.
 - **Film look:** `color_grade("vintage")` plus an adjustment layer with `add_effect`
   "Noise" (3-6 %) and a light `vignette`.
+- **Shot on film:** `film_look()` adds grain, gate weave, exposure flicker and halation on an
+  adjustment layer; pair it with `color_grade("vintage")`.
 - **Glow and light:** `add_effect(layer, "Glow")` on bright elements; blending `add` or
   `screen` for light elements over footage.
 - **Motion:** `set_motion_blur` on anything that moves fast, so it reads as filmed rather

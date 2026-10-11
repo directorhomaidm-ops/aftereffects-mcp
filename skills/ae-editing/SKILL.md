@@ -47,6 +47,17 @@ Most cuts should stay hard cuts; transitions are punctuation.
   (`set_layer` out_point) or lower the speeds.
 - Hit-and-slow: a ramp down to 20-30 % on the impact, then back to 100-200 %.
 
+## Talking heads and voice-overs
+
+- Jump cuts: `cut_silences(layer)` removes the pauses (quieter than -40 dB for 0.5 s) and closes
+  the gaps. Too choppy: raise `min_silence` to 0.8 or `padding` to 0.2; breaths survive: raise
+  `threshold_db` toward -35.
+- Music under speech: `duck_audio("music", "voice", amount_db=-12)` dips the music while the
+  voice talks; -8 for a light touch, -18 to make room for a quiet voice.
+- Run `cut_silences` on the voice before `duck_audio` if both are needed: ducking follows the
+  voice layer it is given.
+- Video files need `ffmpeg` on the Mac for the sound analysis; WAV files do not.
+
 ## Photos and formats
 
 - A photo montage: `slideshow(["a.jpg", "b.jpg", ...], duration=3, overlap=0.5)` imports the

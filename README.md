@@ -151,6 +151,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `reframe` | `comp`, `aspect` (9:16, 1:1, 4:5, 16:9, 4:3), `mode` (fill, fit, blur_fill), `focus`, `blur`, `name` | `{comp, id, width, height, mode, scale}` |
 | `corner_pin` | `layer`, `corners` (clockwise from top left, comp pixels) or `keys` [{time, corners}], `comp` | `{layer, effect, keys, upperLeft}` |
 | `neon` | `layer`, `color`, `intensity`, `flicker`, `comp` | `{layer, effects, flicker}` |
+| `cut_silences` | `layer`, `threshold_db = -40`, `min_silence = 0.5`, `padding = 0.12`, `comp` | `{layer, parts: [{layer, from, to, source}], end, removed, pauses}` |
+| `duck_audio` | `music`, `voice`, `amount_db = -12`, `threshold_db = -35`, `attack`, `release`, `hold`, `comp` | `{layer, keys, ducks}` |
+| `bar_chart` | `values`, `labels`, `origin`, `height`, `bar_width`, `gap`, `max_value`, `colors`, `radius`, `show_values`, `value_format`, `prefix`, `suffix`, `font_size`, `text_color`, `start`, `duration`, `stagger`, `name`, `comp` | `{layer, bars, texts, end}` |
+| `donut_chart` | `values`, `labels`, `center`, `radius`, `thickness`, `colors`, `show_percent`, `font_size`, `text_color`, `start`, `duration`, `name`, `comp` | `{layer, slices}` |
+| `line_chart` | `values`, `box`, `min_value`, `max_value`, `color`, `width`, `smooth`, `dots`, `start`, `duration`, `name`, `comp` | `{layer, points, from, to}` |
+| `film_look` | `grain`, `weave`, `flicker`, `halation`, `layer`, `name`, `comp` | `{layer, index, effects}` |
+| `bounce_drop` | `layer`, `height`, `bounces`, `elasticity`, `fall`, `start`, `comp` | `{layer, keys, end}` |
+| `draw_path` | `points`, `closed`, `smooth`, `stroke`, `width`, `fill`, `duration`, `start`, `name`, `comp` | `{layer, index, points, closed, smooth}` |
+| `orbit` | `layer`, `center`, `radius`, `period`, `start_angle`, `clockwise`, `ratio`, `comp` | `{layer, period, radius, expression}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -203,6 +212,7 @@ Notes:
 - `split_text` places each part by measuring the layer's own text (`sourceRectAtTime` of the text up to that part), so kerning between parts is the only drift. `text_box` follows its text through expressions; renaming the text layer updates them.
 - `picture_in_picture` and `split_screen` set static transforms: they refuse parented or rotated layers and animated anchor, position or scale.
 - `animate_layer` reads the resting value from the layer, so an in and an out on the same layer chain; it refuses keyframes already inside its own span. `ken_burns` and `slideshow` never pan far enough to show a picture's edge (`ken_burns` fails and reports the room there is).
+- `cut_silences`, `duck_audio` and `markers_from_audio` analyse the sound here, not in After Effects: PCM WAV files directly, anything else (a video's sound) through `ffmpeg` when it is installed (`brew install ffmpeg`). Layers that copies replace (`cut_silences`, `beat_cut`, `split_text`) have their video and audio switches turned off.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Skills

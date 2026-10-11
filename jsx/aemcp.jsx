@@ -872,6 +872,52 @@ var aemcp = (function () {
             room: [round(2 * ox, 1), round(2 * oy, 1)]};
     }
 
+    function retire(l) {
+        // turn off a layer that copies replace: its picture and, when it has one, its sound
+        l.enabled = false;
+        if (l.hasAudio) {
+            l.audioEnabled = false;
+        }
+    }
+
+    function smoothShape(points, closed) {
+        // a curve through the points: Catmull-Rom tangents (a sixth of the neighbours' span)
+        var s = new Shape(), n = points.length, i, prev, next, tx, ty;
+        s.vertices = points;
+        s.inTangents = [];
+        s.outTangents = [];
+        for (i = 0; i < n; i++) {
+            prev = points[i > 0 ? i - 1 : (closed ? n - 1 : i)];
+            next = points[i < n - 1 ? i + 1 : (closed ? 0 : i)];
+            tx = (next[0] - prev[0]) / 6;
+            ty = (next[1] - prev[1]) / 6;
+            // an open path's ends have nothing beyond them: no handle there
+            s.inTangents.push(!closed && i === 0 ? [0, 0] : [-tx, -ty]);
+            s.outTangents.push(!closed && i === n - 1 ? [0, 0] : [tx, ty]);
+        }
+        s.closed = closed;
+        return s;
+    }
+
+    function openPath(points) {
+        var s = new Shape();
+        s.vertices = points;
+        s.closed = false;
+        return s;
+    }
+
+    function addLabel(c, str, size, color, pos, just) {
+        var l = c.layers.addText(str), p = l.property("ADBE Text Properties").property("ADBE Text Document"),
+            doc = p.value;
+        doc.fontSize = size;
+        doc.applyFill = true;
+        doc.fillColor = color;
+        doc.justification = just;
+        p.setValue(doc);
+        transform(l, "ADBE Position").setValue(pos);
+        return l;
+    }
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -3096,7 +3142,7 @@ var aemcp = (function () {
                 out.push({layer: d.name, from: round(cuts[k]), to: round(cuts[k + 1]), source: round(s)});
             }
             for (i = 0; i < srcs.length; i++) {
-                srcs[i].layer.enabled = false;
+                retire(srcs[i].layer);
                 hidden.push(srcs[i].layer.name);
             }
             return {cuts: out, hidden: hidden};
@@ -3752,7 +3798,7 @@ var aemcp = (function () {
                 pos.setValue(v);
                 made.push({layer: d.name, text: parts[k].text});
             }
-            l.enabled = false;
+            retire(l);
             return {layer: l.name, by: a.by, layers: made};
         },
 
@@ -4071,6 +4117,270 @@ var aemcp = (function () {
                     a.flicker + " ? random(20, 60) : value;";
             }
             return {layer: l.name, effects: effects, flicker: a.flicker || 0};
+        },
+
+        cut_segments: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), t = l.inPoint, out = [], i, d, s, len;
+            if (l.stretch !== 100 || l.timeRemapEnabled) {
+                fail(l.name + " is time-stretched or remapped: cut it at normal speed");
+            }
+            for (i = 0; i < a.segments.length; i++) {
+                s = a.segments[i];
+                len = s[1] - s[0];
+                d = l.duplicate();  // right above the original: the parts end up in order, top down
+                d.name = l.name + " " + (i + 1);
+                d.enabled = true;
+                d.startTime = t - s[0];
+                span(d, t, t + len);
+                out.push({layer: d.name, from: round(t), to: round(t + len), source: [round(s[0]), round(s[1])]});
+                t += len;
+            }
+            retire(l);
+            return {layer: l.name, parts: out, end: round(t)};
+        },
+
+        duck_audio: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p, base = [], i, k, v;
+            if (!l.hasAudio) {
+                fail(l.name + " has no audio");
+            }
+            p = l.property("ADBE Audio Group").property("ADBE Audio Levels");
+            // relative to the level already there (fades included): read every base before adding a key
+            for (i = 0; i < a.keys.length; i++) {
+                base.push(p.numKeys ? p.valueAtTime(a.keys[i].time, true) : p.value);
+            }
+            for (i = 0; i < a.keys.length; i++) {
+                k = a.keys[i];
+                v = base[i];
+                keyAt(p, k.time, [v[0] + k.db, v[1] + k.db], "linear");
+            }
+            return {layer: l.name, keys: p.numKeys};
+        },
+
+        bar_chart: function (a) {
+            var c = findComp(a.comp), l = c.layers.addShape(), root, n = a.values.length, i, h, cx, g, sc, t, labels = [],
+                x0 = a.origin[0], y = a.origin[1], col, lb;
+            l.name = a.name;
+            transform(l, "ADBE Position").setValue([0, 0]);  // layer pixels = comp pixels
+            root = l.property("ADBE Root Vectors Group");
+            for (i = 0; i < n; i++) {
+                // each bar stands on its group's origin at the baseline, so scaling the group grows it upward
+                h = a.values[i] / a.max * a.height;
+                col = a.colors[i % a.colors.length];
+                g = rectGroup(root, "Bar " + (i + 1), [a.barWidth, Math.max(h, 0.01)], [0, -h / 2], col, 100, a.radius);
+                g.property("ADBE Vector Transform Group").property("ADBE Vector Position").setValue(
+                    [x0 + i * (a.barWidth + a.gap) + a.barWidth / 2, y]);
+            }
+            for (i = 0; i < n; i++) {
+                t = a.start + i * a.stagger;
+                sc = root.property("Bar " + (i + 1)).property("ADBE Vector Transform Group").property("ADBE Vector Scale");
+                keyAt(sc, t, [100, 0], "ease");
+                keyAt(sc, t + a.duration, [100, 100], "ease");
+                cx = x0 + i * (a.barWidth + a.gap) + a.barWidth / 2;
+                h = a.values[i] / a.max * a.height;
+                if (a.labels) {
+                    lb = addLabel(c, a.labels[i], a.fontSize, a.textColor, [cx, y + a.fontSize * 1.4],
+                        ParagraphJustification.CENTER_JUSTIFY);
+                    lb.name = a.name + " label " + (i + 1);
+                    animateLayer(lb, {style: "fade", direction: "in", start: t, duration: 0.3, ease: true});
+                    labels.push(lb.name);
+                }
+                if (a.valueTexts) {
+                    lb = addLabel(c, a.valueTexts[i], a.fontSize, a.textColor, [cx, y - h - a.fontSize * 0.5],
+                        ParagraphJustification.CENTER_JUSTIFY);
+                    lb.name = a.name + " value " + (i + 1);
+                    animateLayer(lb, {style: "fade", direction: "in", start: t + a.duration * 0.8, duration: 0.3,
+                        ease: true});
+                    labels.push(lb.name);
+                }
+            }
+            return {layer: l.name, bars: n, texts: labels, end: round(a.start + (n - 1) * a.stagger + a.duration)};
+        },
+
+        donut_chart: function (a) {
+            var c = findComp(a.comp), l = c.layers.addShape(), root, i, g, contents, el, trim, st, acc = 0, total = 0,
+                p0, p1, t0, t1, r = a.radius - a.thickness / 2, ang, lb, out = [], cx = a.center[0], cy = a.center[1];
+            for (i = 0; i < a.values.length; i++) {
+                total += a.values[i];
+            }
+            l.name = a.name;
+            transform(l, "ADBE Position").setValue([0, 0]);
+            root = l.property("ADBE Root Vectors Group");
+            for (i = 0; i < a.values.length; i++) {
+                // a slice is a stroked circle trimmed to its share; the whole ring sweeps on clockwise from the top
+                p0 = acc / total * 100;
+                p1 = (acc + a.values[i]) / total * 100;
+                t0 = a.start + a.duration * acc / total;
+                t1 = a.start + a.duration * (acc + a.values[i]) / total;
+                g = root.addProperty("ADBE Vector Group");
+                g.name = "Slice " + (i + 1);
+                contents = g.property("ADBE Vectors Group");
+                el = contents.addProperty("ADBE Vector Shape - Ellipse");
+                el.property("ADBE Vector Ellipse Size").setValue([2 * r, 2 * r]);
+                el.property("ADBE Vector Ellipse Position").setValue([cx, cy]);
+                trim = contents.addProperty("ADBE Vector Filter - Trim");
+                trim.property("ADBE Vector Trim Start").setValue(p0);
+                keyAt(trim.property("ADBE Vector Trim End"), t0, p0, "linear");
+                keyAt(trim.property("ADBE Vector Trim End"), t1, p1, "linear");
+                st = contents.addProperty("ADBE Vector Graphic - Stroke");
+                st.property("ADBE Vector Stroke Color").setValue(a.colors[i % a.colors.length].concat([1]));
+                st.property("ADBE Vector Stroke Width").setValue(a.thickness);
+                if (a.labels) {
+                    ang = ((acc + a.values[i] / 2) / total * 360 - 90) * Math.PI / 180;
+                    lb = addLabel(c, a.labels[i], a.fontSize, a.textColor, [cx + (a.radius + a.fontSize * 1.5) *
+                        Math.cos(ang), cy + (a.radius + a.fontSize * 1.5) * Math.sin(ang) + a.fontSize * 0.35],
+                        ParagraphJustification.CENTER_JUSTIFY);
+                    lb.name = a.name + " label " + (i + 1);
+                    animateLayer(lb, {style: "fade", direction: "in", start: t1 - 0.1, duration: 0.3, ease: true});
+                }
+                out.push({slice: g.name, percent: round(p1 - p0, 1), from: round(t0), to: round(t1)});
+                acc += a.values[i];
+            }
+            return {layer: l.name, slices: out};
+        },
+
+        line_chart: function (a) {
+            var c = findComp(a.comp), l = c.layers.addShape(), root, n = a.values.length, pts = [], i, b = a.box,
+                len = [0], total, trim, t, dot, op, color = a.color.concat([1]), g, contents;
+            for (i = 0; i < n; i++) {
+                pts.push([b[0] + b[2] * i / (n - 1), b[1] + b[3] - (a.values[i] - a.lo) / (a.hi - a.lo) * b[3]]);
+                if (i > 0) {
+                    len.push(len[i - 1] + Math.sqrt(Math.pow(pts[i][0] - pts[i - 1][0], 2) +
+                        Math.pow(pts[i][1] - pts[i - 1][1], 2)));
+                }
+            }
+            total = len[n - 1] || 1;
+            l.name = a.name;
+            transform(l, "ADBE Position").setValue([0, 0]);
+            root = l.property("ADBE Root Vectors Group");
+            strokeGroup(root, "Line", a.smooth ? smoothShape(pts, false) : openPath(pts), color, a.width);
+            trim = root.property("Line").property("ADBE Vectors Group").addProperty("ADBE Vector Filter - Trim");
+            keyAt(trim.property("ADBE Vector Trim End"), a.start, 0, "linear");
+            keyAt(trim.property("ADBE Vector Trim End"), a.start + a.duration, 100, "linear");
+            if (a.dots) {
+                // each dot pops on when the line reaches it (by length along the line)
+                for (i = 0; i < n; i++) {
+                    g = root.addProperty("ADBE Vector Group");
+                    g.name = "Dot " + (i + 1);
+                    contents = g.property("ADBE Vectors Group");
+                    dot = contents.addProperty("ADBE Vector Shape - Ellipse");
+                    dot.property("ADBE Vector Ellipse Size").setValue([a.width * 2.5, a.width * 2.5]);
+                    dot.property("ADBE Vector Ellipse Position").setValue(pts[i]);
+                    contents.addProperty("ADBE Vector Graphic - Fill").property("ADBE Vector Fill Color").setValue(color);
+                    t = a.start + a.duration * len[i] / total;
+                    op = root.property("Dot " + (i + 1)).property("ADBE Vector Transform Group")
+                        .property("ADBE Vector Group Opacity");
+                    if (t > a.start + 1e-6) {
+                        keyAt(op, a.start, 0, "hold");
+                    }
+                    keyAt(op, t, 100, "hold");
+                }
+            }
+            return {layer: l.name, points: n, from: round(a.start), to: round(a.start + a.duration)};
+        },
+
+        film_look: function (a) {
+            var c = findComp(a.comp), adj = a.layer === undefined, l = adj ? adjustmentLayer(c, a.name) :
+                findLayer(c, a.layer), fx, effects = [];
+            if (a.grain > 0) {
+                fx = addFx(l, "ADBE Noise", "Noise");
+                fx.name = "Grain";
+                setParam(fx, "Amount of Noise", a.grain);
+                effects.push(fx.name);
+            }
+            if (a.weave > 0) {
+                // gate weave: the frame drifts a pixel or two, as film does in the gate
+                fx = addFx(l, "ADBE Geometry2", "Transform");
+                fx.name = "Gate Weave";
+                findParam(fx, "Position").expression = "wiggle(8, " + a.weave + ");";
+                if (adj) {
+                    setParam(fx, "Scale", round(100 * (1 + 2 * a.weave / Math.min(c.width, c.height)) + 0.1, 2));
+                }
+                effects.push(fx.name);
+            }
+            if (a.flicker > 0) {
+                fx = addFx(l, "ADBE Exposure2", "Exposure");
+                fx.name = "Flicker";
+                findParam(fx, "Exposure").expression = "wiggle(12, " + a.flicker + ");";
+                effects.push(fx.name);
+            }
+            if (a.halation > 0) {
+                // red-orange bloom around highlights, as light scatters in film's base
+                fx = addFx(l, "ADBE Glo2", "Glow");
+                fx.name = "Halation";
+                setParam(fx, "Glow Threshold", 75);
+                setParam(fx, "Glow Radius", 25);
+                setParam(fx, "Glow Intensity", a.halation);
+                setParam(fx, "Glow Colors", 2);
+                setParam(fx, "Color A", [1, 0.35, 0.1, 1]);
+                setParam(fx, "Color B", [1, 0.2, 0.05, 1]);
+                effects.push(fx.name);
+            }
+            return {layer: l.name, index: l.index, effects: effects};
+        },
+
+        bounce_drop: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p = transform(l, "ADBE Position"), rest, t, h = a.height, tf,
+                i;
+            if (p.numKeys) {
+                fail(l.name + "'s Position is animated: bounce_drop sets it");
+            }
+            rest = p.value;
+            t = a.start !== undefined ? a.start : l.inPoint;
+            // apexes ease (no speed at the top), impacts are sharp; each bounce rises `elasticity` as high, and
+            // falls in time with the square root of its height
+            keyAt(p, t, offset2(rest, 0, -h), "ease");
+            t += a.fall;
+            keyAt(p, t, rest, "linear");
+            for (i = 0; i < a.bounces; i++) {
+                h *= a.elasticity;
+                tf = a.fall * Math.sqrt(h / a.height);
+                keyAt(p, t + tf, offset2(rest, 0, -h), "ease");
+                t += 2 * tf;
+                keyAt(p, t, rest, "linear");
+            }
+            return {layer: l.name, keys: p.numKeys, end: round(t)};
+        },
+
+        draw_path: function (a) {
+            var c = findComp(a.comp), l = c.layers.addShape(), root, g, contents, trim, st, fill;
+            l.name = a.name;
+            transform(l, "ADBE Position").setValue([0, 0]);
+            root = l.property("ADBE Root Vectors Group");
+            g = root.addProperty("ADBE Vector Group");
+            g.name = "Path";
+            contents = g.property("ADBE Vectors Group");
+            contents.addProperty("ADBE Vector Shape - Group").property("ADBE Vector Shape").setValue(
+                a.smooth ? smoothShape(a.points, a.closed) : (a.closed ? polygon(a.points) : openPath(a.points)));
+            if (a.duration > 0) {
+                trim = contents.addProperty("ADBE Vector Filter - Trim");
+                keyAt(trim.property("ADBE Vector Trim End"), a.start, 0, "ease");
+                keyAt(trim.property("ADBE Vector Trim End"), a.start + a.duration, 100, "ease");
+            }
+            if (a.stroke) {
+                st = contents.addProperty("ADBE Vector Graphic - Stroke");
+                st.property("ADBE Vector Stroke Color").setValue(a.stroke.concat([1]));
+                st.property("ADBE Vector Stroke Width").setValue(a.width);
+                st.property("ADBE Vector Stroke Line Cap").setValue(2);
+                st.property("ADBE Vector Stroke Line Join").setValue(2);
+            }
+            if (a.fill) {
+                fill = contents.addProperty("ADBE Vector Graphic - Fill");
+                fill.property("ADBE Vector Fill Color").setValue(a.fill.concat([1]));
+            }
+            return {layer: l.name, index: l.index, points: a.points.length, closed: a.closed, smooth: a.smooth};
+        },
+
+        orbit: function (a) {
+            var l = findLayer(findComp(a.comp), a.layer), p = transform(l, "ADBE Position"), deg = 360 / a.period * a.dir;
+            if (p.numKeys) {
+                fail(l.name + "'s Position is animated: orbit drives it with an expression");
+            }
+            p.expression = "var a = (" + a.startAngle + " + time * " + round(deg, 6) + ") * Math.PI / 180;\n" +
+                "var x = " + a.center[0] + " + " + a.radius + " * Math.cos(a), y = " + a.center[1] + " + " +
+                round(a.radius * a.ratio, 4) + " * Math.sin(a);\nvalue.length > 2 ? [x, y, value[2]] : [x, y];";
+            p.expressionEnabled = true;
+            return {layer: l.name, period: a.period, radius: a.radius, expression: p.expression};
         },
 
         run_jsx: function (a) {
