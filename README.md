@@ -121,6 +121,18 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `replace_text` | `find`, `replace`, `regex`, `ignore_case`, `comp`, `all_comps` | `{changed: [{comp, layer, changed, text}], skipped}` |
 | `list_fonts` | | `[{font, layers, installed}]` |
 | `replace_font` | `find`, `replace` (PostScript names), `comp`, `all_comps = True` | `{font, layers: [{comp, layer, changed}]}` |
+| `color_grade` | `look` (teal_orange, bleach_bypass, noir, warm, cool, vintage, cyberpunk, matrix, golden_hour, day_for_night), `layer`, `exposure`, `contrast`, `highlights`, `shadows`, `whites`, `blacks`, `temperature`, `tint`, `saturation`, `vibrance`, `faded_film`, `sharpen`, `vignette`, `shadow_balance` / `midtone_balance` / `highlight_balance`, `name = "Grade"`, `comp` | `{layer, index, effects, set}` |
+| `beat_cut` | `layers`, `beats` or `bpm` (else the comp's markers), `every = 1`, `start`, `end`, `skip`, `comp` | `{cuts: [{layer, from, to, source}], hidden}` |
+| `transition` | `from_layer`, `to_layer`, `kind` (crossfade, dip_to_black, dip_to_white, push_<dir>, whip_<dir>, zoom, spin), `duration = 0.5`, `comp` | `{kind, from, to, start, end}` |
+| `speed_ramp` | `layer`, `points` [{time, speed}], `ramp = 0.3`, `comp` | `{layer, keys: [[time, source]], ramp}` |
+| `reveal_mask` | `layer`, `style` (wipe_right, wipe_left, wipe_down, wipe_up, split_vertical, split_horizontal, box, iris), `duration`, `start`, `feather`, `reverse`, `ease`, `comp` | `{layer, mask, style, from, to, mode}` |
+| `set_mask` | `layer`, `mask`, `mode`, `feather`, `expansion`, `opacity`, `inverted`, `name`, `comp` | `{mask, inverted, feather, expansion, opacity}` |
+| `animate_mask` | `layer`, `mask`, `keys` [{time, rect / ellipse / points, feather, expansion, opacity}], `ease`, `comp` | `{mask, keys}` |
+| `key_out` | `layer`, `screen` (green, blue, hex or [r, g, b]), `screen_gain`, `clip_black`, `clip_white`, `shrink`, `softness`, `clean`, `edge_radius`, `despill`, `choke`, `comp` | `{layer, effects, set}` |
+| `camera_shake` | `style` (handheld, impact), `amount`, `frequency`, `rotation`, `at`, `decay`, `motion_blur`, `layer`, `name`, `comp` | `{layer, index, effect, style, set}` |
+| `glitch` | `start`, `duration`, `intensity`, `frequency`, `density`, `layer`, `name`, `comp` | `{layer, index, from, to}` |
+| `weather` | `kind` (snow, rain), `amount`, `size`, `speed`, `wind`, `opacity`, `name`, `comp` | `{layer, index, effect, set}` |
+| `letterbox` | `aspect = 2.39`, `color`, `animate`, `start`, `name`, `comp` | `{layer, index, aspect, bar}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -168,7 +180,19 @@ Notes:
 - `replace_color` changes every color property (shape fills and strokes, effects, keyframes), text fill and stroke, and solid colors. A solid's color is shared by every layer using that solid.
 - `collect_files` relinks the open project to the copies and saves it in the folder, so the open project becomes the collected one; the original files and project are left as they were.
 - `list_fonts` reports whether a font is installed through `app.fonts` (After Effects 24 and later); `replace_font` refuses a font that is not installed.
+- `color_grade`, `key_out`, `camera_shake`, `glitch` and `weather` set effect parameters by their English display names (Lumetri Color, Color Balance, Keylight, Key Cleaner, Advanced Spill Suppressor, Simple Choker, Transform, Turbulent Displace, CC Snowfall, CC Rainfall). When a name differs in your After Effects, the error lists the names the effect has.
+- `beat_cut` and `speed_ramp` refuse time-stretched layers; `speed_ramp` replaces the layer's time remapping and fails, naming the time, when the footage would run out.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
+
+## Skills
+
+`skills/` holds Claude skills that teach the workflows behind the tools: `ae-color-grading`, `ae-editing`
+(cutting to music, transitions, speed), `ae-masks`, `ae-compositing` (keying and integration) and `ae-vfx`.
+Install them for Claude Code by copying them into your skills folder:
+
+```bash
+cp -R skills/* ~/.claude/skills/
+```
 
 ## Configuration
 
