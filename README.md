@@ -160,6 +160,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `bounce_drop` | `layer`, `height`, `bounces`, `elasticity`, `fall`, `start`, `comp` | `{layer, keys, end}` |
 | `draw_path` | `points`, `closed`, `smooth`, `stroke`, `width`, `fill`, `duration`, `start`, `name`, `comp` | `{layer, index, points, closed, smooth}` |
 | `orbit` | `layer`, `center`, `radius`, `period`, `start_angle`, `clockwise`, `ratio`, `comp` | `{layer, period, radius, expression}` |
+| `freeze_frame` | `layer`, `at`, `duration`, `zoom`, `comp` | `{layers, frame, from, to, end}` |
+| `time_stretch` | `layer`, `duration` or `percent`, or `reverse`, `comp` | `{layer, stretch, from, to, duration}` or `{layer, reversed, from, to}` |
+| `punch_zoom` | `times` (else the comp's markers from `start`), `amount`, `duration`, `motion_blur`, `layer`, `name`, `comp` | `{layer, index, punches}` |
+| `flash_frames` | `times` (else markers from `start`), `color`, `duration`, `opacity`, `name`, `comp` | `{layer, index, flashes}` |
+| `word_sequence` | `text`, `per_word`, `on_markers`, `start`, `style` (pop, fade, slide_up, scale, cut), `size`, `color`, `font`, `hold`, `name`, `comp` | `{words: [{layer, word, from, to}]}` |
+| `rack_focus` | `camera`, `from_layer`, `to_layer`, `at`, `duration`, `comp` | `{camera, from, to, start, end}` |
+| `light_sweep` | `layer`, `start`, `duration`, `angle`, `width`, `intensity`, `color`, `comp` | `{layer, effect, from, to}` |
+| `kaleidoscope` | `size`, `spin`, `layer`, `name`, `comp` | `{layer, index, effect, spin}` |
+| `organize_project` | `include_folders`, `comps`, `footage`, `images`, `audio`, `solids` (folder names) | `{moved: {folder: count}}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:

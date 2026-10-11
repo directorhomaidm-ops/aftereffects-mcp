@@ -47,6 +47,20 @@ Most cuts should stay hard cuts; transitions are punctuation.
   (`set_layer` out_point) or lower the speeds.
 - Hit-and-slow: a ramp down to 20-30 % on the impact, then back to 100-200 %.
 
+## On the beat
+
+After `markers_from_audio`, the comp's markers drive several tools at once:
+`punch_zoom()` (a 10-15 % zoom hit per beat), `flash_frames()` (white flashes; `opacity` 40-60
+for subtle), `word_sequence(text, on_markers=True)` (a word per beat). Use them on the drop or
+the chorus only (`times=[...]`, or `start` past the intro), not for the whole song.
+
+## Time tricks
+
+- `freeze_frame(layer, at, duration=1, zoom=115)` for the freeze-and-introduce moment; put a
+  `lower_third` over the held frame.
+- `time_stretch(layer, duration=...)` to fit a shot to a gap exactly; `percent=200` is half
+  speed; `reverse=True` plays it backwards.
+
 ## Talking heads and voice-overs
 
 - Jump cuts: `cut_silences(layer)` removes the pauses (quieter than -40 dB for 0.5 s) and closes

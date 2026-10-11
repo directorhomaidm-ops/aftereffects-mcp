@@ -26,6 +26,11 @@ Tools: `camera_shake`, `glitch`, `weather`, `letterbox`, `color_grade`, `add_eff
   "Noise" (3-6 %) and a light `vignette`.
 - **Shot on film:** `film_look()` adds grain, gate weave, exposure flicker and halation on an
   adjustment layer; pair it with `color_grade("vintage")`.
+- **Rack focus:** `rack_focus(camera, "Near", "Far", at, duration=1.5)` on 3D layers; a low
+  `f_stop` (`set_camera`) makes the shift visible.
+- **Shine:** `light_sweep(logo)` passes a glint across a logo or title once; time it to the moment
+  the logo settles.
+- **Abstract:** `kaleidoscope(size=30, spin=15)` turns any footage into a mirrored pattern.
 - **Glow and light:** `add_effect(layer, "Glow")` on bright elements; blending `add` or
   `screen` for light elements over footage.
 - **Motion:** `set_motion_blur` on anything that moves fast, so it reads as filmed rather
