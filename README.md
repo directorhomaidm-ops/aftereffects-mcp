@@ -133,6 +133,15 @@ Comps are addressed by name or id (default: the active comp), layers by 1-based 
 | `glitch` | `start`, `duration`, `intensity`, `frequency`, `density`, `layer`, `name`, `comp` | `{layer, index, from, to}` |
 | `weather` | `kind` (snow, rain), `amount`, `size`, `speed`, `wind`, `opacity`, `name`, `comp` | `{layer, index, effect, set}` |
 | `letterbox` | `aspect = 2.39`, `color`, `animate`, `start`, `name`, `comp` | `{layer, index, aspect, bar}` |
+| `draw_arrow` | `from_point`, `to_point`, `color`, `width`, `head`, `curve`, `duration`, `start`, `name`, `comp` | `{layer, index, length, drawn}` |
+| `spotlight` | `rect`, `shape` (ellipse, rect), `darkness`, `feather`, `radius`, `fade`, `start`, `name`, `comp` | `{layer, index, mask}` |
+| `blur_region` | `rect`, `kind` (blur, mosaic), `amount`, `shape`, `feather`, `start`, `end`, `name`, `comp` | `{layer, index, effect, set, from, to}` |
+| `picture_in_picture` | `layer`, `corner`, `size = 0.3`, `margin`, `radius`, `border`, `border_color`, `comp` | `{layer, scale, position, size, border}` |
+| `split_screen` | `layers`, `layout` (columns, rows, grid), `gap`, `comp` | `{layout, columns, rows, pane, layers}` |
+| `split_text` | `layer`, `by` (words, characters, lines), `comp` | `{layer, by, layers: [{layer, text}]}` |
+| `timer` | `from_seconds`, `to_seconds`, `duration`, `start`, `format` (mm:ss, m:ss, hh:mm:ss, ss.cs, mm:ss.cs), `layer`, `name`, `comp` | `{layer, index, from, to, format, error}` |
+| `audio_visualizer` | `audio`, `kind` (spectrum, waveform), `from_point`, `to_point`, `color`, `height`, `detail`, `thickness`, `name`, `comp` | `{layer, index, effect, audio}` |
+| `text_box` | `layer`, `padding = [30, 16]`, `color`, `opacity`, `radius`, `name`, `comp` | `{layer, index, text}` |
 | `run_jsx` | `code` | the script's value |
 
 Notes:
@@ -182,12 +191,15 @@ Notes:
 - `list_fonts` reports whether a font is installed through `app.fonts` (After Effects 24 and later); `replace_font` refuses a font that is not installed.
 - `color_grade`, `key_out`, `camera_shake`, `glitch` and `weather` set effect parameters by their English display names (Lumetri Color, Color Balance, Keylight, Key Cleaner, Advanced Spill Suppressor, Simple Choker, Transform, Turbulent Displace, CC Snowfall, CC Rainfall). When a name differs in your After Effects, the error lists the names the effect has.
 - `beat_cut` and `speed_ramp` refuse time-stretched layers; `speed_ramp` replaces the layer's time remapping and fails, naming the time, when the footage would run out.
+- `split_text` places each part by measuring the layer's own text (`sourceRectAtTime` of the text up to that part), so kerning between parts is the only drift. `text_box` follows its text through expressions; renaming the text layer updates them.
+- `picture_in_picture` and `split_screen` set static transforms: they refuse parented or rotated layers and animated anchor, position or scale.
 - `run_jsx` runs any ExtendScript inside one undo group; use it for what the other tools do not cover.
 
 ## Skills
 
 `skills/` holds Claude skills that teach the workflows behind the tools: `ae-color-grading`, `ae-editing`
-(cutting to music, transitions, speed), `ae-masks`, `ae-compositing` (keying and integration) and `ae-vfx`.
+(cutting to music, transitions, speed), `ae-masks`, `ae-compositing` (keying and integration), `ae-vfx` and
+`ae-explainers` (arrows, spotlights, labels, timers, layouts, hiding faces and plates).
 Install them for Claude Code by copying them into your skills folder:
 
 ```bash

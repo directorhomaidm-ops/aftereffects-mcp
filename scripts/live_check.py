@@ -374,6 +374,14 @@ def main():
     step("export the effects frame", lambda: d.export_frame(str(work / "frame_fx.png"), time=2.2,
                                                            comp="edit check"), needs=True if edit else "no cuts",
          note="check frame_fx.png: bars, snow, a glitch hit, the shake")
+    print("\nExplainers, privacy, layouts, text, audio")
+    step("explainer frame: arrow, spotlight, text box, timer, blur", lambda: _explain(work), needs=have,
+         note="check frame_explain.png: the box hugs the text, the timer reads 00:07, the arrow points at the light")
+    step("split_text a headline into words", lambda: _split(), needs=have,
+         note="the words must sit exactly where the headline was: compare the two frames in split_*.png")
+    step("picture_in_picture + split_screen", lambda: _layouts(work), needs=have, note="check frame_layout.png")
+    step("audio_visualizer on the beat WAV", lambda: _visualize(work), needs=have,
+         note="Audio Spectrum names (Audio Layer, Frequency bands...); frame_audio.png shows bars")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
@@ -612,6 +620,48 @@ def _key(work):
     d.add_layer("solid", name="Screen", color=[0.2, 0.75, 0.3], comp="key check")
     out = d.key_out("Screen", choke=1, comp="key check")
     d.export_frame(str(work / "frame_key.png"), time=0, comp="key check")
+    return out
+
+
+def _explain(work):
+    d.create_comp("explain check", 1920, 1080, 10, 30)
+    d.add_layer("solid", name="BG", color=[0.25, 0.3, 0.35], comp="explain check")
+    d.add_layer("text", text="Look here", name="Label", comp="explain check")
+    d.set_property("Label", "position", [300, 200], comp="explain check")
+    d.text_box("Label", comp="explain check")
+    d.spotlight([1100, 500, 400, 300], fade=0, comp="explain check")
+    d.draw_arrow([500, 260], [1080, 600], curve=120, duration=1, comp="explain check")
+    out = d.timer(10, 0, start=2, comp="explain check")
+    expect(out["error"] is None, f"timer expression error: {out['error']}")
+    d.blur_region([1500, 50, 300, 200], kind="mosaic", comp="explain check")
+    d.export_frame(str(work / "frame_explain.png"), time=5, comp="explain check")
+    return out
+
+
+def _split():
+    d.create_comp("split check", 1920, 1080, 2, 30)
+    d.add_layer("text", text="Every word on its own", name="Headline", comp="split check")
+    d.set_property("Headline", "position", [400, 540], comp="split check")
+    d.export_frame(str(WORK[0] / "split_before.png"), time=0, comp="split check")
+    out = d.split_text("Headline", comp="split check")
+    d.export_frame(str(WORK[0] / "split_after.png"), time=0, comp="split check")
+    return out
+
+
+def _layouts(work):
+    d.create_comp("layout check", 1920, 1080, 3, 30)
+    for name, color in (("Left", [0.8, 0.3, 0.2]), ("Right", [0.2, 0.5, 0.8]), ("Guest", [0.9, 0.8, 0.2])):
+        d.add_layer("solid", name=name, color=color, comp="layout check")
+    out = d.split_screen(["Left", "Right"], gap=20, comp="layout check")
+    d.picture_in_picture("Guest", "bottom_right", border=6, comp="layout check")
+    d.export_frame(str(work / "frame_layout.png"), time=0, comp="layout check")
+    return out
+
+
+def _visualize(work):
+    d.add_layer("item", item="beat.wav", comp="layout check")
+    out = d.audio_visualizer("beat.wav", height=250, comp="layout check")
+    d.export_frame(str(work / "frame_audio.png"), time=1, comp="layout check")
     return out
 
 

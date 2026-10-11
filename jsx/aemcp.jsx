@@ -687,6 +687,60 @@ var aemcp = (function () {
         return p;
     }
 
+    function roundedRect(x, y, w, h, r) {
+        // a rectangle with quarter-arc corners of radius r (8 Bezier points, clockwise from the top left)
+        var s, k;
+        r = Math.min(r, w / 2, h / 2);
+        if (r <= 0) {
+            return box(x, y, x + w, y + h);
+        }
+        s = new Shape();
+        k = 0.5523 * r;
+        s.vertices = [[x + r, y], [x + w - r, y], [x + w, y + r], [x + w, y + h - r], [x + w - r, y + h], [x + r, y + h],
+            [x, y + h - r], [x, y + r]];
+        s.inTangents = [[-k, 0], [0, 0], [0, -k], [0, 0], [k, 0], [0, 0], [0, k], [0, 0]];
+        s.outTangents = [[0, 0], [k, 0], [0, 0], [0, k], [0, 0], [-k, 0], [0, 0], [0, -k]];
+        s.closed = true;
+        return s;
+    }
+
+    function still(l, what) {
+        // layout tools set static transforms: refuse what they would break
+        var i, names = ["ADBE Anchor Point", "ADBE Position", "ADBE Scale"];
+        if (l.parent) {
+            fail(l.name + " is parented: unparent it first");
+        }
+        if (transform(l, "ADBE Rotate Z").value !== 0) {
+            fail(l.name + " is rotated: " + what + " works on unrotated layers");
+        }
+        for (i = 0; i < names.length; i++) {
+            if (transform(l, names[i]).numKeys) {
+                fail(l.name + "'s " + transform(l, names[i]).name + " is animated: " + what + " sets it");
+            }
+        }
+    }
+
+    function strokeGroup(root, name, shape, color, width) {
+        var g = root.addProperty("ADBE Vector Group"), contents, st;
+        g.name = name;
+        contents = g.property("ADBE Vectors Group");
+        contents.addProperty("ADBE Vector Shape - Group").property("ADBE Vector Shape").setValue(shape);
+        st = contents.addProperty("ADBE Vector Graphic - Stroke");
+        st.property("ADBE Vector Stroke Color").setValue(color);
+        st.property("ADBE Vector Stroke Width").setValue(width);
+        st.property("ADBE Vector Stroke Line Cap").setValue(2);  // round
+        st.property("ADBE Vector Stroke Line Join").setValue(2);
+        return g;
+    }
+
+    var TIMER_FORMATS = {
+        "mm:ss": 'p(Math.floor(t / 60)) + ":" + p(s)',
+        "m:ss": 'Math.floor(t / 60) + ":" + p(s)',
+        "hh:mm:ss": 'p(h) + ":" + p(m) + ":" + p(s)',
+        "ss.cs": 'p(Math.floor(t)) + "." + p(cs)',
+        "mm:ss.cs": 'p(Math.floor(t / 60)) + ":" + p(s) + "." + p(cs)'
+    };
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -3326,6 +3380,324 @@ var aemcp = (function () {
                 p.setValue(inner);
             }
             return {layer: l.name, index: l.index, aspect: a.aspect, bar: round(bar, 2)};
+        },
+
+        draw_arrow: function (a) {
+            var c = findComp(a.comp), l, root, pos, p0, p1, dx, dy, len, q, s, ang, w1, w2, trim, op, t0 = a.start,
+                color = [a.color[0], a.color[1], a.color[2], 1];
+            dx = a.to[0] - a.from[0];
+            dy = a.to[1] - a.from[1];
+            len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 1) {
+                fail("the arrow needs two different points");
+            }
+            l = c.layers.addShape();
+            l.name = a.name;
+            root = l.property("ADBE Root Vectors Group");
+            // the shape layer sits at the comp's center with its anchor at 0, 0: layer pixels = comp pixels - that
+            pos = transform(l, "ADBE Position").value;
+            p0 = [a.from[0] - pos[0], a.from[1] - pos[1]];
+            p1 = [a.to[0] - pos[0], a.to[1] - pos[1]];
+            // the bend: a control point off the middle, at right angles to the line (a quadratic as a cubic)
+            q = [(p0[0] + p1[0]) / 2 - dy / len * a.curve, (p0[1] + p1[1]) / 2 + dx / len * a.curve];
+            s = new Shape();
+            s.vertices = [p0, p1];
+            s.outTangents = [[(q[0] - p0[0]) * 2 / 3, (q[1] - p0[1]) * 2 / 3], [0, 0]];
+            s.inTangents = [[0, 0], [(q[0] - p1[0]) * 2 / 3, (q[1] - p1[1]) * 2 / 3]];
+            s.closed = false;
+            strokeGroup(root, "Line", s, color, a.width);
+            // the head's wings open back from the tip, along the direction the line arrives in
+            ang = Math.atan2(p1[1] - q[1], p1[0] - q[0]);
+            w1 = [p1[0] - a.head * Math.cos(ang - 0.5), p1[1] - a.head * Math.sin(ang - 0.5)];
+            w2 = [p1[0] - a.head * Math.cos(ang + 0.5), p1[1] - a.head * Math.sin(ang + 0.5)];
+            s = new Shape();
+            s.vertices = [w1, p1, w2];
+            s.closed = false;
+            strokeGroup(root, "Head", s, color, a.width);
+            if (a.duration > 0) {
+                // adding groups can invalidate older references: look them up again
+                trim = root.property("Line").property("ADBE Vectors Group").addProperty("ADBE Vector Filter - Trim");
+                keyAt(trim.property("ADBE Vector Trim End"), t0, 0, "ease");
+                keyAt(trim.property("ADBE Vector Trim End"), t0 + a.duration, 100, "ease");
+                op = root.property("Head").property("ADBE Vector Transform Group").property("ADBE Vector Group Opacity");
+                keyAt(op, t0, 0, "hold");
+                keyAt(op, t0 + a.duration, 100, "hold");
+            }
+            return {layer: l.name, index: l.index, length: round(len, 1),
+                drawn: a.duration > 0 ? [round(t0), round(t0 + a.duration)] : null};
+        },
+
+        spotlight: function (a) {
+            var c = findComp(a.comp), r = a.rect, l, m, op;
+            l = c.layers.addSolid([0, 0, 0], a.name, c.width, c.height, c.pixelAspect, c.duration);
+            m = l.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+            m.name = "Light";
+            m.inverted = true;  // the dark solid everywhere but the lit area
+            m.property("ADBE Mask Shape").setValue(a.shape === "ellipse" ? ellipse(r[0], r[1], r[2], r[3]) :
+                roundedRect(r[0], r[1], r[2], r[3], a.radius));
+            if (a.feather) {
+                m.property("ADBE Mask Feather").setValue([a.feather, a.feather]);
+            }
+            op = transform(l, "ADBE Opacity");
+            if (a.fade > 0) {
+                keyAt(op, a.start, 0, "ease");
+                keyAt(op, a.start + a.fade, a.darkness, "ease");
+            } else {
+                op.setValue(a.darkness);
+            }
+            if (a.start > 0) {
+                l.inPoint = a.start;
+            }
+            return {layer: l.name, index: l.index, mask: m.name};
+        },
+
+        blur_region: function (a) {
+            var c = findComp(a.comp), r = a.rect, l = adjustmentLayer(c, a.name), m, fx, set = {};
+            // an adjustment layer's mask limits its effects to the masked area
+            m = l.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+            m.name = "Region";
+            m.property("ADBE Mask Shape").setValue(a.shape === "ellipse" ? ellipse(r[0], r[1], r[2], r[3]) :
+                box(r[0], r[1], r[0] + r[2], r[1] + r[3]));
+            if (a.feather) {
+                m.property("ADBE Mask Feather").setValue([a.feather, a.feather]);
+            }
+            if (a.kind === "mosaic") {
+                fx = addFx(l, "ADBE Mosaic", "Mosaic");
+                set["Horizontal Blocks"] = setParam(fx, "Horizontal Blocks", Math.max(1, Math.round(c.width / a.amount)));
+                set["Vertical Blocks"] = setParam(fx, "Vertical Blocks", Math.max(1, Math.round(c.height / a.amount)));
+            } else {
+                fx = addFx(l, "ADBE Gaussian Blur 2", "Gaussian Blur");
+                set.Blurriness = setParam(fx, "Blurriness", a.amount);
+                setParam(fx, "Repeat Edge Pixels", 1);
+            }
+            span(l, a.start, a.end !== undefined ? a.end : c.duration);
+            return {layer: l.name, index: l.index, effect: fx.name, set: set, from: round(l.inPoint),
+                to: round(l.outPoint)};
+        },
+
+        picture_in_picture: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), r, s, w, h, cx, cy, m, b, g, contents, rect, fill, group;
+            still(l, "picture_in_picture");
+            r = contentRect(l);
+            s = c.width * a.size / r.width * 100;
+            w = r.width * s / 100;
+            h = r.height * s / 100;
+            cx = a.corner.indexOf("left") >= 0 ? a.margin + w / 2 : c.width - a.margin - w / 2;
+            cy = a.corner.indexOf("top") >= 0 ? a.margin + h / 2 : c.height - a.margin - h / 2;
+            transform(l, "ADBE Anchor Point").setValue([r.left + r.width / 2, r.top + r.height / 2]);
+            transform(l, "ADBE Scale").setValue([s, s]);
+            transform(l, "ADBE Position").setValue([cx, cy]);
+            if (a.radius > 0) {
+                group = l.property("ADBE Mask Parade");
+                m = group.addProperty("ADBE Mask Atom");
+                m.name = "Rounded";
+                m.maskMode = group.numProperties > 1 ? MaskMode.INTERSECT : MaskMode.ADD;
+                // the radius is in comp pixels: in layer pixels it is larger by the scale
+                m.property("ADBE Mask Shape").setValue(roundedRect(r.left, r.top, r.width, r.height, a.radius * 100 / s));
+            }
+            if (a.border > 0) {
+                b = c.layers.addShape();
+                b.name = l.name + " border";
+                g = b.property("ADBE Root Vectors Group").addProperty("ADBE Vector Group");
+                contents = g.property("ADBE Vectors Group");
+                rect = contents.addProperty("ADBE Vector Shape - Rect");
+                rect.property("ADBE Vector Rect Size").setValue([w + 2 * a.border, h + 2 * a.border]);
+                rect.property("ADBE Vector Rect Roundness").setValue(a.radius > 0 ? a.radius + a.border : 0);
+                fill = contents.addProperty("ADBE Vector Graphic - Fill");
+                fill.property("ADBE Vector Fill Color").setValue([a.borderColor[0], a.borderColor[1], a.borderColor[2], 1]);
+                transform(b, "ADBE Position").setValue([cx, cy]);
+                span(b, l.inPoint, l.outPoint);
+                b.moveAfter(l);
+            }
+            return {layer: l.name, scale: round(s, 2), position: [round(cx, 2), round(cy, 2)],
+                size: [round(w, 2), round(h, 2)], border: b ? b.name : null};
+        },
+
+        split_screen: function (a) {
+            var c = findComp(a.comp), n = a.layers.length, cols, rows, pw, ph, i, l, r, s, cx, cy, ax, ay, hw, hh, m,
+                group, out = [];
+            cols = a.layout === "columns" ? n : (a.layout === "rows" ? 1 : Math.ceil(Math.sqrt(n)));
+            rows = Math.ceil(n / cols);
+            pw = (c.width - (cols - 1) * a.gap) / cols;
+            ph = (c.height - (rows - 1) * a.gap) / rows;
+            if (pw <= 0 || ph <= 0) {
+                fail("the gaps leave no room for " + rows + " x " + cols + " panes");
+            }
+            for (i = 0; i < n; i++) {
+                l = findLayer(c, a.layers[i]);
+                still(l, "split_screen");
+                r = contentRect(l);
+                s = Math.max(pw / r.width, ph / r.height) * 100;  // fill the pane, cropping the rest
+                cx = (i % cols) * (pw + a.gap) + pw / 2;
+                cy = Math.floor(i / cols) * (ph + a.gap) + ph / 2;
+                ax = r.left + r.width / 2;
+                ay = r.top + r.height / 2;
+                transform(l, "ADBE Anchor Point").setValue([ax, ay]);
+                transform(l, "ADBE Scale").setValue([s, s]);
+                transform(l, "ADBE Position").setValue([cx, cy]);
+                // crop to the pane: its size in layer pixels around the anchor
+                hw = pw / 2 * 100 / s;
+                hh = ph / 2 * 100 / s;
+                group = l.property("ADBE Mask Parade");
+                m = group.addProperty("ADBE Mask Atom");
+                m.name = "Pane";
+                m.maskMode = group.numProperties > 1 ? MaskMode.INTERSECT : MaskMode.ADD;
+                m.property("ADBE Mask Shape").setValue(box(ax - hw, ay - hh, ax + hw, ay + hh));
+                out.push({layer: l.name, pane: [Math.floor(i / cols) + 1, i % cols + 1], scale: round(s, 2),
+                    center: [round(cx, 2), round(cy, 2)]});
+            }
+            return {layout: a.layout, columns: cols, rows: rows, pane: [round(pw, 2), round(ph, 2)], layers: out};
+        },
+
+        split_text: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), p, text, parts = [], i, k, re, mt, full, rp, one, sc,
+                d, dp, pos, v, t, made = [], lines;
+            if (!(l instanceof TextLayer)) {
+                fail(l.name + " is not a text layer");
+            }
+            p = l.property("ADBE Text Properties").property("ADBE Text Document");
+            if (p.numKeys || (p.expressionEnabled && p.expression)) {
+                fail(l.name + "'s text is keyframed or driven by an expression");
+            }
+            if (l.parent || transform(l, "ADBE Rotate Z").value !== 0 || transform(l, "ADBE Position").numKeys) {
+                fail(l.name + " is parented, rotated or moving: split it where it stands still");
+            }
+            t = l.inPoint;
+            text = p.value.text;
+            function measure(str) {
+                var dd = p.value;
+                dd.text = str;
+                p.setValue(dd);
+                return l.sourceRectAtTime(t, false);
+            }
+            lines = text.split(/\r\n|\r|\n/);
+            if (a.by === "lines") {
+                for (i = 0; i < lines.length; i++) {
+                    if (lines[i].replace(/\s+/g, "")) {
+                        parts.push({text: lines[i], line: i});
+                    }
+                }
+            } else {
+                if (lines.length > 1) {
+                    fail(l.name + " has several lines: split it by lines first");
+                }
+                re = a.by === "words" ? /\S+/g : /\S/g;
+                while ((mt = re.exec(text)) !== null) {
+                    parts.push({text: mt[0], end: mt.index + mt[0].length});
+                }
+            }
+            if (parts.length < 2) {
+                fail(l.name + " has fewer than two " + a.by + " to split");
+            }
+            full = measure(text);
+            // where each part sits in the whole text, measured with the layer's own font: lay the text out up to
+            // the part and compare with the part alone
+            for (k = 0; k < parts.length; k++) {
+                one = measure(parts[k].text);
+                if (a.by === "lines") {
+                    rp = measure(lines.slice(0, parts[k].line + 1).join("\r"));
+                    parts[k].dx = 0;
+                    parts[k].dy = (rp.top + rp.height) - (one.top + one.height);
+                } else {
+                    rp = measure(text.substring(0, parts[k].end));
+                    parts[k].dx = full.left + rp.width - one.width - one.left;
+                    parts[k].dy = 0;
+                }
+            }
+            measure(text);
+            sc = transform(l, "ADBE Scale").value;
+            for (k = 0; k < parts.length; k++) {
+                d = l.duplicate();  // right above the original: the first part ends on top
+                d.name = l.name + " " + (k + 1);
+                d.enabled = true;
+                dp = d.property("ADBE Text Properties").property("ADBE Text Document");
+                v = dp.value;
+                v.text = parts[k].text;
+                dp.setValue(v);
+                pos = transform(d, "ADBE Position");
+                v = pos.value;
+                v[0] += parts[k].dx * sc[0] / 100;
+                v[1] += parts[k].dy * sc[1] / 100;
+                pos.setValue(v);
+                made.push({layer: d.name, text: parts[k].text});
+            }
+            l.enabled = false;
+            return {layer: l.name, by: a.by, layers: made};
+        },
+
+        timer: function (a) {
+            var c = findComp(a.comp), l, fx, slider, expr, text, down = a.to < a.from;
+            l = a.layer !== undefined ? findLayer(c, a.layer) : c.layers.addText("00:00");
+            text = l.property("ADBE Text Properties");
+            if (!text) {
+                fail(l.name + " is not a text layer");
+            }
+            if (a.layer === undefined && a.name) {
+                l.name = a.name;
+            }
+            fx = addFx(l, "ADBE Slider Control", "Slider Control");
+            fx.name = "Timer";
+            slider = fx.property(1);
+            keyAt(slider, a.start, a.from, "linear");
+            keyAt(slider, a.start + a.duration, a.to, "linear");
+            // counting down shows 10 until it reaches 9: whole seconds round up
+            expr = 'function p(n) { return (n < 10 ? "0" : "") + n; }\n' +
+                'var v = Math.max(0, effect("' + fx.name + '")("Slider").value);\n' +
+                "var t = " + (down && a.format.indexOf("cs") < 0 ? "Math.ceil(v - 0.0001)" : "v") + ";\n" +
+                "var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), s = Math.floor(t % 60), " +
+                "cs = Math.floor(t * 100 % 100);\n" + TIMER_FORMATS[a.format] + ";";
+            text = text.property("ADBE Text Document");
+            text.expression = expr;
+            text.expressionEnabled = true;
+            return {layer: l.name, index: l.index, from: a.from, to: a.to, format: a.format,
+                error: text.expressionError || null};
+        },
+
+        audio_visualizer: function (a) {
+            var c = findComp(a.comp), au = findLayer(c, a.audio), spec = a.kind === "spectrum", l, fx, color;
+            if (!au.hasAudio) {
+                fail(au.name + " has no audio");
+            }
+            l = c.layers.addSolid([0, 0, 0], a.name, c.width, c.height, c.pixelAspect, c.duration);
+            fx = addFx(l, spec ? "ADBE AudSpect" : "ADBE AudWave", spec ? "Audio Spectrum" : "Audio Waveform");
+            color = [a.color[0], a.color[1], a.color[2], 1];
+            setParam(fx, "Audio Layer", au.index);  // after the solid went on top: the audio's index now
+            setParam(fx, "Start Point", a.from || [c.width * 0.1, c.height / 2]);
+            setParam(fx, "End Point", a.to || [c.width * 0.9, c.height / 2]);
+            setParam(fx, spec ? "Frequency bands" : "Displayed Samples", a.detail);
+            setParam(fx, "Maximum Height", a.height);
+            setParam(fx, "Thickness", a.thickness);
+            setParam(fx, "Inside Color", color);
+            setParam(fx, "Outside Color", color);
+            setParam(fx, "Composite On Original", 0);  // only the bars or the wave, not the black solid
+            return {layer: l.name, index: l.index, effect: fx.name, audio: au.name};
+        },
+
+        text_box: function (a) {
+            var c = findComp(a.comp), t = findLayer(c, a.layer), b, g, contents, rect, fill, ref;
+            if (!(t instanceof TextLayer)) {
+                fail(t.name + " is not a text layer");
+            }
+            b = c.layers.addShape();
+            b.name = a.name || t.name + " box";
+            // the box layer at 0, 0: its pixels are comp pixels, so it can follow the text wherever it goes
+            transform(b, "ADBE Position").setValue([0, 0]);
+            g = b.property("ADBE Root Vectors Group").addProperty("ADBE Vector Group");
+            g.name = "Box";
+            contents = g.property("ADBE Vectors Group");
+            rect = contents.addProperty("ADBE Vector Shape - Rect");
+            ref = "var l = thisComp.layer(" + quote(t.name) + "), r = l.sourceRectAtTime(time, false);\n";
+            rect.property("ADBE Vector Rect Size").expression = ref + "var s = l.transform.scale;\n[r.width * s[0] / 100 + " +
+                2 * a.padding[0] + ", r.height * s[1] / 100 + " + 2 * a.padding[1] + "];";
+            rect.property("ADBE Vector Rect Position").expression = ref +
+                "var p = l.toComp([r.left + r.width / 2, r.top + r.height / 2]);\n[p[0], p[1]];";
+            rect.property("ADBE Vector Rect Roundness").setValue(a.radius);
+            fill = contents.addProperty("ADBE Vector Graphic - Fill");
+            fill.property("ADBE Vector Fill Color").setValue([a.color[0], a.color[1], a.color[2], 1]);
+            fill.property("ADBE Vector Fill Opacity").setValue(a.opacity);
+            span(b, t.inPoint, t.outPoint);
+            b.moveAfter(t);
+            return {layer: b.name, index: b.index, text: t.name};
         },
 
         run_jsx: function (a) {

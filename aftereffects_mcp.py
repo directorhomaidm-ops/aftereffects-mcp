@@ -51,7 +51,8 @@ mcp = MCPServer(
     "vector shapes, text animation presets, precomposing, layer order and switches, track mattes, markers, motion "
     "paths and easing curves, point tracking, cameras, extruded 3D and parallax, color grading looks, cutting to the "
     "beat, transitions, speed ramps, animated mask reveals, green screen keying, camera shake, glitches, weather, "
-    "letterbox, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "letterbox, arrows, spotlights, text boxes, timers, split screens, picture-in-picture, region blur, audio "
+    "visualizers, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -2106,6 +2107,157 @@ def letterbox(aspect: float = 2.39, color: list[float] = [0, 0, 0], animate: flo
         raise ToolError("animate and start must be 0 or more")
     return _call("letterbox", comp=comp, aspect=aspect, color=_color("color", color), animate=animate, start=start,
                  name=name)
+
+
+# --- explainers, privacy, layouts, text, audio ---
+
+
+def _point(name, v):
+    if v is None:
+        return None
+    if len(v) != 2:
+        raise ToolError(f"{name} needs [x, y]")
+    return [float(v[0]), float(v[1])]
+
+
+@_tool
+def draw_arrow(from_point: list[float], to_point: list[float], color: list[float] = [1, 1, 1], width: float = 8,
+               head: float = 30, curve: float = 0.0, duration: float = 0.8, start: float = 0.0, name: str = "Arrow",
+               comp: int | str | None = None) -> dict:
+    """An arrow from from_point to to_point (comp pixels) on a new shape layer: a stroke `width` px wide with round
+    ends, a head of `head` px, bent sideways by `curve` px (negative bends the other way). It draws itself on over
+    `duration` seconds from `start` (0: shown at once), the head appearing when the line arrives."""
+    if width <= 0 or head < 0 or duration < 0 or start < 0:
+        raise ToolError("width must be above 0; head, duration and start 0 or more")
+    return _call("draw_arrow", comp=comp, name=name, **{"from": _point("from_point", from_point),
+                                                       "to": _point("to_point", to_point)},
+                 color=_color("color", color), width=width, head=head, curve=curve, duration=duration, start=start)
+
+
+@_tool
+def spotlight(rect: list[float], shape: str = "ellipse", darkness: float = 70, feather: float = 40, radius: float = 0,
+              fade: float = 0.5, start: float = 0.0, name: str = "Spotlight", comp: int | str | None = None) -> dict:
+    """Darken everything but one area to point at it: a black solid at `darkness` % opacity with a hole (ellipse,
+    or rect with corner `radius`) at rect [x, y, width, height] in comp pixels, feathered. It fades in over `fade`
+    seconds from `start`. Move the hole later with animate_mask on the "Light" mask."""
+    _rect("rect", rect)
+    if shape not in ("ellipse", "rect"):
+        raise ToolError("shape must be ellipse or rect")
+    if not 0 < darkness <= 100 or feather < 0 or radius < 0 or fade < 0 or start < 0:
+        raise ToolError("darkness must be 1-100; feather, radius, fade and start 0 or more")
+    return _call("spotlight", comp=comp, name=name, rect=[float(v) for v in rect], shape=shape, darkness=darkness,
+                 feather=feather, radius=radius, fade=fade, start=start)
+
+
+@_tool
+def blur_region(rect: list[float], kind: str = "blur", amount: float = 30, shape: str = "rect", feather: float = 10,
+                start: float = 0.0, end: float | None = None, name: str = "Blur", comp: int | str | None = None) -> dict:
+    """Hide part of the picture (faces, plates, screens): an adjustment layer masked to rect [x, y, width, height]
+    in comp pixels (or an ellipse in it) with Gaussian Blur (amount = blurriness) or Mosaic (amount = block size in
+    px), from `start` to `end` seconds. To follow a moving subject, animate its "Region" mask with animate_mask or
+    parent it to a tracked null."""
+    _rect("rect", rect)
+    if kind not in ("blur", "mosaic"):
+        raise ToolError("kind must be blur or mosaic")
+    if shape not in ("rect", "ellipse"):
+        raise ToolError("shape must be rect or ellipse")
+    if amount <= 0 or feather < 0 or start < 0 or (end is not None and end <= start):
+        raise ToolError("amount must be above 0, feather and start 0 or more, end after start")
+    return _call("blur_region", comp=comp, name=name, rect=[float(v) for v in rect], kind=kind, amount=amount,
+                 shape=shape, feather=feather, start=start, end=end)
+
+
+CORNERS = ("top_left", "top_right", "bottom_left", "bottom_right")
+
+
+@_tool
+def picture_in_picture(layer: int | str, corner: str = "top_right", size: float = 0.3, margin: float = 40,
+                       radius: float = 16, border: float = 0, border_color: list[float] = [1, 1, 1],
+                       comp: int | str | None = None) -> dict:
+    """Make a layer a picture-in-picture: scaled to `size` of the comp's width, placed in a corner with `margin`
+    px, corners rounded by `radius` px (a mask), and an optional `border` px frame in border_color behind it."""
+    if corner not in CORNERS:
+        raise ToolError(f"corner must be one of: {', '.join(CORNERS)}")
+    if not 0.05 <= size <= 1 or margin < 0 or radius < 0 or border < 0:
+        raise ToolError("size must be 0.05-1; margin, radius and border 0 or more")
+    return _call("picture_in_picture", comp=comp, layer=layer, corner=corner, size=size, margin=margin, radius=radius,
+                 border=border, borderColor=_color("border_color", border_color))
+
+
+@_tool
+def split_screen(layers: list[int | str], layout: str = "columns", gap: float = 0,
+                 comp: int | str | None = None) -> dict:
+    """Split the frame between layers: columns (side by side), rows (stacked) or grid. Each layer is scaled to fill
+    its pane, centered, and cropped to it with a mask; `gap` px between panes shows what is below."""
+    if layout not in ("columns", "rows", "grid"):
+        raise ToolError("layout must be columns, rows or grid")
+    if not 2 <= len(layers) <= 16:
+        raise ToolError("split_screen takes 2-16 layers")
+    if gap < 0:
+        raise ToolError("gap must be 0 or more")
+    return _call("split_screen", comp=comp, layers=layers, layout=layout, gap=gap)
+
+
+@_tool
+def split_text(layer: int | str, by: str = "words", comp: int | str | None = None) -> dict:
+    """Split a text layer into one layer per word, character or line, each placed where it sat in the original
+    (measured with its own font), so they can be animated one by one (stagger_layers, animate_text). The original
+    is turned off. Words and characters need one line of text."""
+    if by not in ("words", "characters", "lines"):
+        raise ToolError("by must be words, characters or lines")
+    return _call("split_text", comp=comp, layer=layer, by=by)
+
+
+TIMER_FORMATS = ("mm:ss", "m:ss", "hh:mm:ss", "ss.cs", "mm:ss.cs")
+
+
+@_tool
+def timer(from_seconds: float = 0, to_seconds: float = 60, duration: float | None = None, start: float = 0.0,
+          format: str = "mm:ss", layer: int | str | None = None, name: str | None = None,
+          comp: int | str | None = None) -> dict:
+    """A clock: counts from from_seconds to to_seconds (down when to is lower) over `duration` seconds (default
+    real time) from `start`, shown as mm:ss, m:ss, hh:mm:ss, ss.cs or mm:ss.cs (cs: hundredths) on a new text layer
+    or `layer`. Driven by a Slider Control named Timer; style it with set_text."""
+    if format not in TIMER_FORMATS:
+        raise ToolError(f"format must be one of: {', '.join(TIMER_FORMATS)}")
+    if from_seconds < 0 or to_seconds < 0 or from_seconds == to_seconds:
+        raise ToolError("from_seconds and to_seconds must differ and be 0 or more")
+    duration = abs(to_seconds - from_seconds) if duration is None else duration
+    if duration <= 0 or start < 0:
+        raise ToolError("duration must be above 0 and start 0 or more")
+    return _call("timer", comp=comp, layer=layer, name=name, **{"from": from_seconds, "to": to_seconds},
+                 duration=duration, start=start, format=format)
+
+
+@_tool
+def audio_visualizer(audio: int | str, kind: str = "spectrum", from_point: list[float] | None = None,
+                     to_point: list[float] | None = None, color: list[float] = [1, 1, 1], height: float = 300,
+                     detail: int = 64, thickness: float = 6, name: str | None = None,
+                     comp: int | str | None = None) -> dict:
+    """Bars or a wave that move with a layer's audio: kind spectrum (Audio Spectrum: `detail` frequency bands) or
+    waveform (Audio Waveform: `detail` samples), drawn from from_point to to_point (comp pixels, default across the
+    middle), up to `height` px, `thickness` px, in `color`, on a new layer above the audio."""
+    if kind not in ("spectrum", "waveform"):
+        raise ToolError("kind must be spectrum or waveform")
+    if height <= 0 or thickness <= 0 or not 1 <= detail <= 4096:
+        raise ToolError("height and thickness must be above 0, detail 1-4096")
+    return _call("audio_visualizer", comp=comp, audio=audio, kind=kind, name=name or kind.capitalize(),
+                 **{"from": _point("from_point", from_point), "to": _point("to_point", to_point)},
+                 color=_color("color", color), height=height, detail=detail, thickness=thickness)
+
+
+@_tool
+def text_box(layer: int | str, padding: list[float] = [30, 16], color: list[float] = [0, 0, 0], opacity: float = 80,
+             radius: float = 8, name: str | None = None, comp: int | str | None = None) -> dict:
+    """A background box behind a text layer that follows it: sized and placed by expressions from the text's
+    sourceRectAtTime, so it fits when the text, its size or its position changes. padding [x, y] px, corner
+    radius px, color and opacity. For captions, lower thirds and labels."""
+    if len(padding) != 2 or min(padding) < 0:
+        raise ToolError("padding needs [x, y], 0 or more")
+    if not 0 <= opacity <= 100 or radius < 0:
+        raise ToolError("opacity must be 0-100 and radius 0 or more")
+    return _call("text_box", comp=comp, layer=layer, name=name, padding=[float(v) for v in padding],
+                 color=_color("color", color), opacity=opacity, radius=radius)
 
 
 @_tool
