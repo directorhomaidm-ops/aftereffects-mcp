@@ -397,7 +397,16 @@ def main():
     step("bar, donut and line charts", lambda: _charts(work), needs=have, note="check frame_charts.png at 3 s")
     step("film_look, bounce_drop, draw_path, orbit", lambda: _film(work), needs=have,
          note="Noise (Amount of Noise), Exposure and Glow names; check frame_film.png")
+    print("\nTiming tricks, beats, words, focus, shine, project")
+    step("freeze_frame + time_stretch on a precomp", lambda: _timing(), needs=have,
+         note="a single HOLD time remap key holds the frame; Layer.stretch keeps the in point")
+    step("punch_zoom + flash_frames + word_sequence on beats", lambda: _beats(work), needs=have,
+         note="check frame_beats.png: a word, mid-punch, under a fading flash")
+    step("rack_focus between two 3D layers", lambda: _focus(), needs=have)
+    step("light_sweep + kaleidoscope", lambda: _shine(work), needs=have,
+         note="CC Light Sweep and CC Kaleida names; check frame_shine.png")
     step("save_project", lambda: d.save_project(str(work / "aemcp_check.aep")), needs=have)
+    step("organize_project (last: it moves items into folders)", lambda: d.organize_project(), needs=have)
     step("render_background through aerender", lambda: _background(work), needs=have,
          note="set AE_RENDER if aerender is not next to the application")
     step("reduce_project to the check comp (last: it deletes items)", lambda: d.reduce_project(["aemcp check"]),
@@ -759,6 +768,46 @@ def _film(work):
     d.orbit("Moon", radius=250, period=3, comp="film check")
     out = d.film_look(comp="film check")
     d.export_frame(str(work / "frame_film.png"), time=1.2, comp="film check")
+    return out
+
+
+def _timing():
+    d.create_comp("timing check", 1920, 1080, 10, 30)
+    d.add_layer("item", item="retime check", comp="timing check")
+    frozen = d.freeze_frame("retime check", at=1, duration=1, zoom=110, comp="timing check")
+    stretched = d.time_stretch("retime check after", percent=150, comp="timing check")
+    return {"freeze": frozen["layers"], "stretch": stretched["stretch"]}
+
+
+def _beats(work):
+    d.create_comp("beats check", 1920, 1080, 4, 30)
+    d.gradient_background(["#1A1A2E", "#E94560"], comp="beats check")
+    for t in (0.5, 1.0, 1.5, 2.0, 2.5):
+        d.add_marker(t, comp="beats check")
+    d.word_sequence("feel the beat drop now", on_markers=True, comp="beats check")
+    d.punch_zoom(comp="beats check")
+    out = d.flash_frames(opacity=60, comp="beats check")
+    d.export_frame(str(work / "frame_beats.png"), time=1.55, comp="beats check")
+    return out
+
+
+def _focus():
+    d.create_comp("focus check", 1920, 1080, 3, 30)
+    d.add_layer("solid", name="Near", color=[0.9, 0.4, 0.2], comp="focus check")
+    d.add_layer("solid", name="Far", color=[0.2, 0.5, 0.9], comp="focus check")
+    d.depth_stack(["Near", "Far"], spacing=800, comp="focus check")
+    d.add_layer("camera", name="Cam", comp="focus check")
+    return d.rack_focus("Cam", "Near", "Far", at=0.5, duration=1.5, comp="focus check")
+
+
+def _shine(work):
+    d.create_comp("shine check", 1920, 1080, 3, 30)
+    d.add_layer("text", text="SHINE", name="Logo", comp="shine check")
+    d.set_text("Logo", size=220, comp="shine check")
+    d.center_anchor("Logo", comp="shine check")
+    out = d.light_sweep("Logo", start=0.5, duration=1.5, comp="shine check")
+    d.kaleidoscope(size=25, spin=15, comp="shine check")
+    d.export_frame(str(work / "frame_shine.png"), time=1.2, comp="shine check")
     return out
 
 

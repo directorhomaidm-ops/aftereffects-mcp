@@ -38,6 +38,8 @@ def test_all_tools_registered():
         "corner_pin", "neon",
         "cut_silences", "duck_audio", "bar_chart", "donut_chart", "line_chart", "film_look", "bounce_drop",
         "draw_path", "orbit",
+        "freeze_frame", "time_stretch", "punch_zoom", "flash_frames", "word_sequence", "rack_focus", "light_sweep",
+        "kaleidoscope", "organize_project",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -3320,3 +3322,188 @@ def test_orbit(ae):
         d.orbit("Fixed")
     with pytest.raises(ToolError, match="above 0"):
         d.orbit("Moon", period=0)
+
+
+# --- timing tricks, beats, words, focus, shine, project ---
+
+
+def _span(ae, layer, comp=1):
+    return ae.inspect(f"(function () {{ const l = {_layer(layer, comp)}; return [l.name, Math.round(l.inPoint * 1e4) / 1e4,"
+                      f" Math.round(l.outPoint * 1e4) / 1e4, Math.round(l.startTime * 1e4) / 1e4]; }})()")
+
+
+def test_freeze_frame(ae, tmp_path):
+    (tmp_path / "run.mov").write_bytes(b"x")
+    d.import_file(str(tmp_path / "run.mov"))  # 5 s
+    d.create_comp("Main", duration=10)
+    d.add_layer("item", item="run.mov", comp="Main")
+    d.set_layer("run.mov", start_time=1, out_point=6, comp="Main")  # plays 0-5 s of the file at 1-6 s
+    out = d.freeze_frame("run.mov", at=3, duration=2, zoom=120, comp="Main")
+    assert out == {"layers": ["run.mov", "run.mov freeze", "run.mov after"], "frame": 2, "from": 3, "to": 5, "end": 8}
+    assert _span(ae, "run.mov", comp=2) == ["run.mov", 1, 3, 1]
+    assert _span(ae, "run.mov freeze", comp=2) == ["run.mov freeze", 3, 5, 1]
+    assert _span(ae, "run.mov after", comp=2) == ["run.mov after", 5, 8, 3]  # carries on from 2 s, 2 s later
+    remap = ae.inspect(_layer("run.mov freeze", 2) + ".property('ADBE Time Remapping').keys"
+                       ".map(k => [k.time, k.value, k.outType])")
+    assert remap == [[3, 2, 6614]]  # one held frame
+    assert _key_values(ae, "run.mov freeze", "ADBE Scale", comp=2)[-1] == [5, [120, 120, 100]]
+    with pytest.raises(ToolError, match="inside run.mov"):
+        d.freeze_frame("run.mov", at=0.5, comp="Main")
+    with pytest.raises(ToolError, match="without time remapping"):
+        d.freeze_frame("run.mov freeze", at=4, comp="Main")
+    d.add_layer("solid", name="Plate", comp="Main")
+    with pytest.raises(ToolError, match="Plate needs to be footage"):
+        d.freeze_frame("Plate", at=1, comp="Main")
+    with pytest.raises(ToolError, match="zoom"):
+        d.freeze_frame("run.mov", at=2, zoom=50, comp="Main")
+
+
+def test_time_stretch(ae, tmp_path):
+    (tmp_path / "run.mov").write_bytes(b"x")
+    d.import_file(str(tmp_path / "run.mov"))
+    d.create_comp("Main", duration=20)
+    d.add_layer("item", item="run.mov", comp="Main")
+    d.set_layer("run.mov", start_time=2, out_point=6, comp="Main")  # 4 s long, from 2 s
+    out = d.time_stretch("run.mov", duration=8, comp="Main")
+    assert out == {"layer": "run.mov", "stretch": 200, "from": 2, "to": 10, "duration": 8}
+    out = d.time_stretch("run.mov", percent=50, comp="Main")
+    assert (out["from"], out["to"], out["duration"]) == (2, 4, 2)
+    # a duration is reached from the current stretch: 2 s at 50 % to 3 s is 75 %
+    assert d.time_stretch("run.mov", duration=3, comp="Main")["stretch"] == 75
+    d.time_stretch("run.mov", percent=100, comp="Main")
+    # trimmed past its start: the in point stays where it was
+    d.add_layer("item", item="run.mov", comp="Main")
+    d.set_layer(1, start_time=2, in_point=3, out_point=6, comp="Main")
+    assert d.time_stretch(1, percent=200, comp="Main")["from"] == 3
+    out = d.time_stretch("run.mov", reverse=True, comp="Main")
+    assert out == {"layer": "run.mov", "reversed": True, "from": 2, "to": 6}
+    assert ae.inspect(_layer("run.mov", 2) + ".property('ADBE Time Remapping').keys.map(k => [k.time, k.value])") == [
+        [2, 4], [6, 0]]
+    with pytest.raises(ToolError, match="time remapped"):
+        d.time_stretch("run.mov", percent=80, comp="Main")
+    for kwargs, msg in [({}, "duration or percent"), ({"duration": 1, "percent": 50}, "duration or percent"),
+                        ({"percent": 0}, "percent"), ({"reverse": True, "percent": 50}, "reverse keeps")]:
+        with pytest.raises(ToolError, match=msg):
+            d.time_stretch("run.mov", comp="Main", **kwargs)
+
+
+def test_punch_zoom_and_flash(ae):
+    d.create_comp("Main", duration=10)
+    for t in (1, 1.1, 2, 3):
+        d.add_marker(t)
+    out = d.punch_zoom(amount=115, duration=0.4)
+    assert out == {"layer": "Punch", "index": 1, "punches": [1, 2, 3]}  # 1.1 s comes before the first settles
+    scale = _fx(1, 1) + ".property('Scale')"
+    assert _kv(ae, scale)[:3] == [[1, 100], [1.1, 115], [1.4, 100]]
+    assert ae.inspect(_fx(1, 1) + ".name") == "Punch" and dict(_params(ae, 1, 1))["Shutter Angle"] == 180
+    out = d.punch_zoom(times=[5], start=0, motion_blur=False, name="One")
+    assert out["punches"] == [5] and dict(_params(ae, 1, 1))["Shutter Angle"] == 0
+    out = d.flash_frames(duration=0.2, opacity=80, start=1.5)
+    assert out == {"layer": "Flash", "index": 1, "flashes": [2, 3]}
+    keys = ae.inspect(_layer(1) + ".property('ADBE Transform Group').property('ADBE Opacity').keys"
+                      ".map(k => [Math.round(k.time * 1e4) / 1e4, k.value, k.inType, k.outType])")
+    # held at 0 until each hit, full at the hit, fading to 0 over 0.2 s, then held again
+    assert keys == [[0, 0, 6614, 6614], [2, 80, 6614, 6612], [2.2, 0, 6612, 6614], [3, 80, 6614, 6612],
+                    [3.2, 0, 6612, 6614]]
+    d.create_comp("Bare", duration=5)
+    with pytest.raises(ToolError, match="no times"):
+        d.flash_frames(comp="Bare")
+    for kwargs, msg in [({"amount": 100}, "amount"), ({"times": [2, 1]}, "ascending")]:
+        with pytest.raises(ToolError, match=msg):
+            d.punch_zoom(comp="Bare", **kwargs)
+
+
+def test_word_sequence(ae):
+    d.create_comp("Main", duration=10)
+    out = d.word_sequence("Make it  move", per_word=0.5, start=1, hold=2, style="pop", size=100)
+    assert [(w["layer"], w["word"], w["from"], w["to"]) for w in out["words"]] == [
+        ("Word 1", "Make", 1, 1.5), ("Word 2", "it", 1.5, 2), ("Word 3", "move", 2, 4)]
+    assert _span(ae, "Word 2")[1:3] == [1.5, 2]
+    doc = ae.inspect(_layer("Word 3") + ".property('ADBE Text Properties').property('ADBE Text Document').value")
+    assert (doc["text"], doc["fontSize"], doc["justification"]) == ("move", 100, 7415)
+    assert _tr(ae, "Word 3", "ADBE Position")[:2] == [960, 575]
+    assert _key_values(ae, "Word 1", "ADBE Scale")[0] == [1, [0, 0, 100]]  # pop
+    for t in (0.5, 1.0, 2.0, 3.5):
+        d.add_marker(t, comp="Main")
+    out = d.word_sequence("on the beat", on_markers=True, start=0.8, style="cut", name="Beat", font="Helvetica")
+    assert [(w["from"], w["to"]) for w in out["words"]] == [(1, 2), (2, 3.5), (3.5, 4.5)]
+    assert _key_values(ae, "Beat 1", "ADBE Opacity") == []
+    assert ae.inspect(_layer("Beat 1") + ".property('ADBE Text Properties').property('ADBE Text Document')"
+                      ".value.font") == "Helvetica"
+    with pytest.raises(ToolError, match="4 words but only 3 markers"):
+        d.word_sequence("one two three four", on_markers=True, start=0.8)
+    for kwargs, msg in [({"text": "  "}, "1-300 words"), ({"style": "spin"}, "style must be"),
+                        ({"per_word": 0}, "per_word")]:
+        with pytest.raises(ToolError, match=msg):
+            d.word_sequence(**{"text": "a b", **kwargs})
+
+
+def test_rack_focus(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("solid", name="Near")
+    d.add_layer("solid", name="Far")
+    for name, z in (("Near", 200), ("Far", 1500)):
+        d.set_3d_layer(name)
+        d.set_property(name, "position", [960, 540, z])
+    d.add_layer("camera", name="Cam")
+    d.set_property("Cam", "position", [960, 540, -1000])
+    out = d.rack_focus("Cam", "Near", "Far", at=1, duration=2)
+    assert out == {"camera": "Cam", "from": ["Near", 1200], "to": ["Far", 2500], "start": 1, "end": 3}
+    opts = _layer("Cam") + ".property('ADBE Camera Options Group')"
+    assert ae.inspect(opts + ".property('ADBE Camera Depth of Field').value") == 1
+    assert _kv(ae, opts + ".property('ADBE Camera Focus Distance')") == [[1, 1200], [3, 2500]]
+    d.add_layer("solid", name="Flat")
+    with pytest.raises(ToolError, match="both layers must be 3D"):
+        d.rack_focus("Cam", "Near", "Flat")
+    with pytest.raises(ToolError, match="Flat is not a camera"):
+        d.rack_focus("Flat", "Near", "Far")
+    d.set_camera("Cam", focus_on="Near")
+    with pytest.raises(ToolError, match="has autofocus"):
+        d.rack_focus("Cam", "Near", "Far", at=4)
+
+
+def test_light_sweep_and_kaleidoscope(ae):
+    d.create_comp("Main", duration=5)
+    d.add_layer("text", text="LOGO")
+    out = d.light_sweep("LOGO", start=1, duration=1.5, angle=-20, width=40, intensity=70, color=[1, 0.9, 0.6])
+    assert out == {"layer": "LOGO", "effect": "CC Light Sweep", "from": 1, "to": 2.5}
+    p = dict(_params(ae, 1, 1))
+    assert (p["Direction"], p["Width"], p["Sweep Intensity"], p["Light Color"]) == (-20, 40, 70, [1, 0.9, 0.6, 1])
+    # the fake's text box: -150..150 by -60..20
+    assert _kv(ae, _fx(1, 1) + ".property('Center')") == [[1, [-230, -20]], [2.5, [230, -20]]]
+    out = d.kaleidoscope(size=45, spin=20)
+    assert out == {"layer": "Kaleidoscope", "index": 1, "effect": "CC Kaleida", "spin": 20}
+    assert dict(_params(ae, 1, 1))["Size"] == 45
+    assert ae.inspect(_fx(1, 1) + ".property('Rotation').expression") == "value + time * 20;"
+    assert d.kaleidoscope(layer="LOGO")["spin"] is None
+    assert ae.inspect(_fx(2, 2) + ".property('Rotation').expression") == ""  # no spin, no expression
+    for call, msg in [(lambda: d.light_sweep("LOGO", intensity=0), "intensity"),
+                      (lambda: d.kaleidoscope(size=0), "size")]:
+        with pytest.raises(ToolError, match=msg):
+            call()
+
+
+def test_organize_project(ae, tmp_path):
+    for n in ("clip.mov", "photo.png", "song.wav"):
+        (tmp_path / n).write_bytes(b"x")
+        d.import_file(str(tmp_path / n))
+    d.create_comp("Main")
+    d.create_folder("Keep")
+    d.create_comp("Inside")
+    d.move_items(["Inside"], "Keep")
+    out = d.organize_project()
+    assert out == {"moved": {"Footage": 1, "Images": 1, "Audio": 1, "Comps": 1}}
+    placed = ae.inspect("Object.fromEntries(ae.app.project._items.map(i => [i.name, i.parentFolder ? "
+                        "i.parentFolder.name : null]))")
+    assert (placed["clip.mov"], placed["photo.png"], placed["song.wav"], placed["Main"]) == (
+        "Footage", "Images", "Audio", "Comps")
+    assert placed["Inside"] == "Keep"  # already filed: left alone
+    assert d.organize_project() == {"moved": {}}  # the folders are reused, nothing moves twice
+    # a solid's item at the top level (After Effects files new solids in its own Solids folder)
+    d.add_layer("solid", name="BG", comp="Main")
+    ae.inspect("(function () { const s = ae.app.project._items.find(i => i.name === 'Main')._layers[0].source;"
+               " s.parentFolder = ae.app.project.rootFolder; ae.app.project._items.push(s); return 1; })()")
+    assert d.organize_project() == {"moved": {"Solids": 1}}
+    assert d.organize_project(include_folders=True) == {"moved": {"Comps": 1}}
+    with pytest.raises(ToolError, match="different"):
+        d.organize_project(images="Footage")

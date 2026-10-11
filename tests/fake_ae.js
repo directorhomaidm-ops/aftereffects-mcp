@@ -116,6 +116,11 @@ const EFFECTS = [
     {displayName: "Exposure", matchName: "ADBE Exposure2", category: "Color Correction", params: [
         ["Channels", 1], ["Master", null], ["Exposure", 0], ["Offset", 0], ["Gamma Correction", 1],
         ["Red", null], ["Red Exposure", 0]]},
+    {displayName: "CC Light Sweep", matchName: "CC Light Sweep", category: "Generate", params: [
+        ["Center", [960, 540]], ["Direction", -30], ["Shape", 2], ["Width", 50], ["Sweep Intensity", 50],
+        ["Edge Intensity", 100], ["Edge Thickness", 1], ["Light Color", [1, 1, 1, 1]], ["Light Reception", 1]]},
+    {displayName: "CC Kaleida", matchName: "CC Kaleida", category: "Stylize", params: [
+        ["Center", [960, 540]], ["Size", 30], ["Mirroring", 1], ["Rotation", 0], ["Floating Center", 0]]},
     {displayName: "Mosaic", matchName: "ADBE Mosaic", category: "Stylize", params: [
         ["Horizontal Blocks", 10], ["Vertical Blocks", 10], ["Sharp Colors", 0]]},
     {displayName: "Audio Spectrum", matchName: "ADBE AudSpect", category: "Generate", params: [
@@ -631,6 +636,7 @@ function makeAE(CtxArray) {
             this._frameRate = opts.frameRate || 0;
             this.pixelAspect = 1;
             this.hasAudio = !!file && /\.(wav|mp3|aif|aiff|m4a|mov|mp4)$/i.test(file.fsName);
+            this.hasVideo = !(file && /\.(wav|mp3|aif|aiff|m4a)$/i.test(file.fsName));
         }
         // conforming the frame rate stretches the duration, as in After Effects
         get frameRate() {
@@ -694,7 +700,7 @@ function makeAE(CtxArray) {
             }
             this.selected = false;
             this.autoOrient = AutoOrientType.NO_AUTO_ORIENT;
-            this.stretch = 100;
+            this._stretch = 100;
             this.label = 0;
             Object.assign(this, {blendingMode: BlendingMode.NORMAL, threeDLayer: false, motionBlur: false, shy: false,
                 solo: false, locked: false, trackMatteLayer: null, trackMatteType: TrackMatteType.NO_TRACK_MATTE});
@@ -785,6 +791,16 @@ function makeAE(CtxArray) {
         }
         get startTime() {
             return this._start;
+        }
+        get stretch() {
+            return this._stretch;
+        }
+        set stretch(v) {
+            // After Effects scales the in and out points around the start time
+            const k = v / this._stretch;
+            this.inPoint = this._start + (this.inPoint - this._start) * k;
+            this.outPoint = this._start + (this.outPoint - this._start) * k;
+            this._stretch = v;
         }
         set startTime(t) {
             // moving a layer in time moves its in and out points with it

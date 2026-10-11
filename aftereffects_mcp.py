@@ -54,7 +54,8 @@ mcp = MCPServer(
     "letterbox, arrows, spotlights, text boxes, timers, split screens, picture-in-picture, region blur, audio "
     "visualizers, entrances and exits, lower thirds, Ken Burns slideshows, progress bars, gradients, social "
     "reframing, corner pin, neon, silence cutting, music ducking, charts, film looks, bounces, paths, orbits, "
-    "import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
+    "freeze frames, time stretch, beat punches and flashes, word sequences, rack focus, light sweeps, "
+    "kaleidoscopes, project folders, import, the render queue and frame export. Start with status and list_items, then comp_info to see a comp's layers. "
     "Times are in seconds. Layers are addressed by 1-based index or name, comps by name or id; with no comp the "
     "active comp is used.",
 )
@@ -2710,6 +2711,134 @@ def orbit(layer: int | str, center: list[float] = [960, 540], radius: float = 30
         raise ToolError("radius, period and ratio must be above 0")
     return _call("orbit", comp=comp, layer=layer, center=_point("center", center), radius=radius, period=period,
                  startAngle=start_angle, dir=1 if clockwise else -1, ratio=ratio)
+
+
+# --- timing tricks, beats, words, focus, shine, project ---
+
+
+def _times(times):
+    if times is None:
+        return None
+    if not times or any(t < 0 for t in times) or times != sorted(times):
+        raise ToolError("times must be ascending seconds, 0 or more")
+    return [float(t) for t in times]
+
+
+@_tool
+def freeze_frame(layer: int | str, at: float, duration: float = 1.0, zoom: float = 100,
+                 comp: int | str | None = None) -> dict:
+    """Freeze a shot on the frame at `at` seconds for `duration` seconds, then carry on: the layer is cut there, a
+    held frame fills the pause, and the rest of the shot moves later by `duration`. zoom > 100 pushes in on the
+    held frame (the classic freeze-and-zoom on a character)."""
+    if duration <= 0 or not 100 <= zoom <= 300:
+        raise ToolError("duration must be above 0 and zoom 100-300")
+    return _call("freeze_frame", comp=comp, layer=layer, at=at, duration=duration, zoom=zoom)
+
+
+@_tool
+def time_stretch(layer: int | str, duration: float | None = None, percent: float | None = None,
+                 reverse: bool = False, comp: int | str | None = None) -> dict:
+    """Change a layer's speed by time stretch, keeping its in point: to last `duration` seconds, or to `percent`
+    (200 = half speed, 50 = double speed). reverse=True plays it backwards instead (time remapping), keeping its
+    span."""
+    if reverse:
+        if duration is not None or percent is not None:
+            raise ToolError("reverse keeps the layer's span: leave out duration and percent")
+        return _call("time_stretch", comp=comp, layer=layer, reverse=True)
+    if (duration is None) == (percent is None):
+        raise ToolError("pass duration or percent")
+    if (duration is not None and duration <= 0) or (percent is not None and not 1 <= percent <= 10000):
+        raise ToolError("duration must be above 0, percent 1-10000")
+    return _call("time_stretch", comp=comp, layer=layer, duration=duration, percent=percent)
+
+
+@_tool
+def punch_zoom(times: list[float] | None = None, amount: float = 112, duration: float = 0.3, start: float = 0.0,
+               motion_blur: bool = True, layer: int | str | None = None, name: str = "Punch",
+               comp: int | str | None = None) -> dict:
+    """A quick zoom punch on each beat: the picture jumps to `amount` % and settles back over `duration` seconds,
+    at `times` or else on the comp's markers from `start` (see markers_from_audio). On a new adjustment layer over
+    the whole comp, or on `layer`. Beats closer than `duration` are skipped."""
+    if not 100 < amount <= 200 or duration <= 0:
+        raise ToolError("amount must be above 100 up to 200, duration above 0")
+    return _call("punch_zoom", comp=comp, layer=layer, name=name, times=_times(times), start=start, amount=amount,
+                 duration=duration, motionBlur=motion_blur or None)
+
+
+@_tool
+def flash_frames(times: list[float] | None = None, color: list[float] = [1, 1, 1], duration: float = 0.15,
+                 opacity: float = 100, start: float = 0.0, name: str = "Flash", comp: int | str | None = None) -> dict:
+    """Flashes on the beats: a solid on top that hits `opacity` at each of `times` (or the comp's markers from
+    `start`) and fades out over `duration` seconds."""
+    if duration <= 0 or not 0 < opacity <= 100:
+        raise ToolError("duration must be above 0 and opacity 1-100")
+    return _call("flash_frames", comp=comp, times=_times(times), start=start, color=_color("color", color),
+                 duration=duration, opacity=opacity, name=name)
+
+
+WORD_STYLES = ("pop", "fade", "slide_up", "scale", "cut")
+
+
+@_tool
+def word_sequence(text: str, per_word: float = 0.4, on_markers: bool = False, start: float = 0.0,
+                  style: str = "pop", size: float = 140, color: list[float] = [1, 1, 1], font: str | None = None,
+                  hold: float = 1.0, name: str = "Word", comp: int | str | None = None) -> dict:
+    """Kinetic typography: the words of `text` one at a time, big in the middle of the frame, each for `per_word`
+    seconds from `start`, or on the comp's markers (on_markers, e.g. beats from markers_from_audio). Each word
+    enters with `style` (pop, fade, slide_up, scale, or cut for none); the last one stays `hold` seconds."""
+    words = text.split()
+    if not words or len(words) > 300:
+        raise ToolError("text needs 1-300 words")
+    if style not in WORD_STYLES:
+        raise ToolError(f"style must be one of: {', '.join(WORD_STYLES)}")
+    if per_word <= 0 or hold <= 0 or size <= 0 or start < 0:
+        raise ToolError("per_word, hold and size must be above 0, start 0 or more")
+    return _call("word_sequence", comp=comp, words=words, perWord=per_word, useMarkers=on_markers or None,
+                 start=start, style=style, size=size, color=_color("color", color), font=font, hold=hold, name=name)
+
+
+@_tool
+def rack_focus(camera: int | str, from_layer: int | str, to_layer: int | str, at: float = 0.0,
+               duration: float = 1.0, comp: int | str | None = None) -> dict:
+    """Pull focus from one 3D layer to another: the camera's depth of field goes on and its focus distance eases
+    from from_layer's distance to to_layer's over `duration` seconds at `at`. Use set_camera f_stop for how
+    shallow the focus is."""
+    if duration <= 0 or at < 0:
+        raise ToolError("duration must be above 0 and at 0 or more")
+    return _call("rack_focus", comp=comp, camera=camera, at=at, duration=duration,
+                 **{"from": from_layer, "to": to_layer})
+
+
+@_tool
+def light_sweep(layer: int | str, start: float = 0.0, duration: float = 1.0, angle: float = -30, width: float = 60,
+                intensity: float = 80, color: list[float] = [1, 1, 1], comp: int | str | None = None) -> dict:
+    """A shine that crosses a logo or a title once (CC Light Sweep): from past its left edge to past its right edge
+    over `duration` seconds from `start`, at `angle` degrees, `width` px wide, `intensity` 0-100."""
+    if duration <= 0 or start < 0 or width <= 0 or not 0 < intensity <= 100:
+        raise ToolError("duration and width must be above 0, start 0 or more, intensity 1-100")
+    return _call("light_sweep", comp=comp, layer=layer, start=start, duration=duration, angle=angle, width=width,
+                 intensity=intensity, color=_color("color", color))
+
+
+@_tool
+def kaleidoscope(size: float = 30, spin: float = 0, layer: int | str | None = None, name: str = "Kaleidoscope",
+                 comp: int | str | None = None) -> dict:
+    """A kaleidoscope (CC Kaleida) over the whole comp on a new adjustment layer, or on `layer`: size of the mirrored
+    wedges (1-100), spin in degrees per second (0: still). For music videos and abstract backgrounds."""
+    if not 1 <= size <= 100:
+        raise ToolError("size must be 1-100")
+    return _call("kaleidoscope", comp=comp, layer=layer, name=name, size=size, spin=spin or None)
+
+
+@_tool
+def organize_project(include_folders: bool = False, comps: str = "Comps", footage: str = "Footage",
+                     images: str = "Images", audio: str = "Audio", solids: str = "Solids") -> dict:
+    """Sort the project panel: items at the top level go into folders by kind (comps, footage, images, audio,
+    solids), made when missing. include_folders=True also moves items already inside other folders."""
+    names = {"comps": comps, "footage": footage, "images": images, "audio": audio, "solids": solids}
+    if any(not v.strip() for v in names.values()) or len(set(names.values())) < len(names):
+        raise ToolError("folder names must be different and not empty")
+    return _call("organize_project", all=include_folders or None, names=names)
 
 
 @_tool

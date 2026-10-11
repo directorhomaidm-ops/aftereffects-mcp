@@ -918,6 +918,28 @@ var aemcp = (function () {
         return l;
     }
 
+    function beatTimes(c, a) {
+        // the times given, or the comp's markers from `start` (inclusive) on
+        var out = [], i, mk = c.markerProperty;
+        if (a.times) {
+            return a.times;
+        }
+        for (i = 1; i <= mk.numKeys; i++) {
+            if (mk.keyTime(i) >= (a.start || 0) - 1e-6) {
+                out.push(mk.keyTime(i));
+            }
+        }
+        if (!out.length) {
+            fail("no times: pass times, or put markers on the comp (markers_from_audio)");
+        }
+        return out;
+    }
+
+    function sourceTime(l, t) {
+        // what the layer shows at comp time t (normal speed, no remapping)
+        return t - l.startTime;
+    }
+
     var LABELS = ["none", "red", "yellow", "aqua", "pink", "lavender", "peach", "sea_foam", "blue", "green", "purple",
         "orange", "brown", "fuchsia", "cyan", "sandstone", "dark_green"];
 
@@ -4381,6 +4403,254 @@ var aemcp = (function () {
                 round(a.radius * a.ratio, 4) + " * Math.sin(a);\nvalue.length > 2 ? [x, y, value[2]] : [x, y];";
             p.expressionEnabled = true;
             return {layer: l.name, period: a.period, radius: a.radius, expression: p.expression};
+        },
+
+        freeze_frame: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), end = l.outPoint, s, hold, rest, sc, v, made = [];
+            if (!l.canSetTimeRemapEnabled || l.timeRemapEnabled || l.stretch !== 100) {
+                fail(l.name + " needs to be footage or a precomp at normal speed, without time remapping");
+            }
+            if (a.at <= l.inPoint + 1e-6 || a.at >= end - 1e-6) {
+                fail("the freeze must be inside " + l.name + " (" + round(l.inPoint) + "-" + round(end) + " s)");
+            }
+            s = sourceTime(l, a.at);
+            // the rest of the shot first, pushed later by the freeze; then the held frame between the two parts
+            rest = l.duplicate();
+            rest.name = l.name + " after";
+            rest.startTime += a.duration;
+            span(rest, a.at + a.duration, end + a.duration);
+            hold = l.duplicate();
+            hold.name = l.name + " freeze";
+            setRemap(hold, [{time: a.at, source: s, kind: KeyframeInterpolationType.HOLD}]);
+            span(hold, a.at, a.at + a.duration);
+            l.outPoint = a.at;
+            if (a.zoom !== 100) {
+                sc = transform(hold, "ADBE Scale");
+                v = sc.value;
+                keyAt(sc, a.at, v, "ease");
+                keyAt(sc, a.at + a.duration, scale2(v, a.zoom / 100), "ease");
+            }
+            made = [l.name, hold.name, rest.name];
+            return {layers: made, frame: round(s, 3), from: round(a.at), to: round(a.at + a.duration),
+                end: round(end + a.duration)};
+        },
+
+        time_stretch: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), t0 = l.inPoint, len = l.outPoint - l.inPoint, s0, s1,
+                pct;
+            if (a.reverse) {
+                // backwards by time remapping: the in point shows the last frame, the out point the first
+                if (!l.canSetTimeRemapEnabled || l.timeRemapEnabled || l.stretch !== 100) {
+                    fail(l.name + " needs to be footage or a precomp at normal speed, without time remapping");
+                }
+                s0 = sourceTime(l, t0);
+                s1 = sourceTime(l, l.outPoint);
+                setRemap(l, [{time: t0, source: s1, kind: KeyframeInterpolationType.LINEAR},
+                    {time: l.outPoint, source: s0, kind: KeyframeInterpolationType.LINEAR}]);
+                return {layer: l.name, reversed: true, from: round(t0), to: round(l.outPoint)};
+            }
+            if (l.timeRemapEnabled) {
+                fail(l.name + " is time remapped: stretch works on the layer's own timing");
+            }
+            pct = a.percent !== undefined ? a.percent : l.stretch * a.duration / len;
+            l.stretch = pct;
+            l.startTime += t0 - l.inPoint;  // keep the in point where it was
+            return {layer: l.name, stretch: round(l.stretch, 3), from: round(l.inPoint), to: round(l.outPoint),
+                duration: round(l.outPoint - l.inPoint, 3)};
+        },
+
+        punch_zoom: function (a) {
+            var c = findComp(a.comp), times = beatTimes(c, a), adj = a.layer === undefined, l, fx, p, i, t, last = -1e9,
+                hits = [];
+            l = adj ? adjustmentLayer(c, a.name) : findLayer(c, a.layer);
+            fx = addFx(l, "ADBE Geometry2", "Transform");
+            fx.name = "Punch";
+            p = findParam(fx, "Scale");
+            for (i = 0; i < times.length; i++) {
+                t = times[i];
+                if (t < last - 1e-6) {
+                    continue;  // still settling from the last punch
+                }
+                keyAt(p, t, 100, "linear");
+                keyAt(p, t + a.duration * 0.25, a.amount, "ease_out");
+                keyAt(p, t + a.duration, 100, "ease");
+                last = t + a.duration;
+                hits.push(round(t, 3));
+            }
+            if (a.motionBlur) {
+                setParam(fx, "Use Composition*", 0);
+                setParam(fx, "Shutter Angle", 180);
+            }
+            return {layer: l.name, index: l.index, punches: hits};
+        },
+
+        flash_frames: function (a) {
+            var c = findComp(a.comp), times = beatTimes(c, a), l, p, i, t, idx, out = [],
+                HOLD = KeyframeInterpolationType.HOLD, LIN = KeyframeInterpolationType.LINEAR;
+            l = c.layers.addSolid(a.color, a.name, c.width, c.height, c.pixelAspect, c.duration);
+            p = transform(l, "ADBE Opacity");
+            if (times[0] > 0) {
+                p.setValueAtTime(0, 0);
+                p.setInterpolationTypeAtKey(p.nearestKeyIndex(0), HOLD, HOLD);
+            }
+            for (i = 0; i < times.length; i++) {
+                t = times[i];
+                if (out.length && t < out[out.length - 1] + a.duration - 1e-6) {
+                    continue;
+                }
+                // full at the hit, fading out; then held at 0 until the next hit
+                p.setValueAtTime(t, a.opacity);
+                p.setInterpolationTypeAtKey(p.nearestKeyIndex(t), HOLD, LIN);
+                p.setValueAtTime(t + a.duration, 0);
+                idx = p.nearestKeyIndex(t + a.duration);
+                p.setInterpolationTypeAtKey(idx, LIN, HOLD);
+                out.push(round(t, 3));
+            }
+            return {layer: l.name, index: l.index, flashes: out};
+        },
+
+        word_sequence: function (a) {
+            var c = findComp(a.comp), words = a.words, times = [], i, t, l, made = [], end, v, doc;
+            if (a.useMarkers) {
+                times = beatTimes(c, {start: a.start});
+            } else {
+                for (i = 0; i <= words.length; i++) {
+                    times.push(a.start + i * a.perWord);
+                }
+            }
+            if (times.length < words.length) {
+                fail(words.length + " words but only " + times.length + " markers from " + a.start + " s");
+            }
+            for (i = 0; i < words.length; i++) {
+                t = times[i];
+                end = i + 1 < times.length ? times[i + 1] : t + a.perWord;
+                if (i === words.length - 1) {
+                    end = Math.max(end, t + a.hold);  // the last word stays a little longer
+                }
+                l = addLabel(c, words[i], a.size, a.color, [c.width / 2, c.height / 2 + a.size * 0.35],
+                    ParagraphJustification.CENTER_JUSTIFY);
+                if (a.font) {
+                    v = l.property("ADBE Text Properties").property("ADBE Text Document");
+                    doc = v.value;
+                    doc.font = a.font;
+                    v.setValue(doc);
+                }
+                l.name = a.name + " " + (i + 1);
+                span(l, t, end);
+                if (a.style !== "cut") {
+                    animateLayer(l, {style: a.style, direction: "in", start: t, duration: Math.min(0.25, (end - t) / 2),
+                        distance: a.size * 0.6, ease: true});
+                }
+                made.push({layer: l.name, word: words[i], from: round(t, 3), to: round(end, 3)});
+            }
+            return {words: made};
+        },
+
+        rack_focus: function (a) {
+            var c = findComp(a.comp), cam = findLayer(c, a.camera), from = findLayer(c, a.from), to = findLayer(c, a.to),
+                opts = cam.property("ADBE Camera Options Group"), fd, cp, d0, d1;
+            if (!(cam instanceof CameraLayer)) {
+                fail(cam.name + " is not a camera");
+            }
+            fd = opts.property("ADBE Camera Focus Distance");
+            if (fd.expressionEnabled && fd.expression) {
+                fail(cam.name + " has autofocus (an expression on Focus Distance): set it off with set_camera first");
+            }
+            if (cam.parent || from.parent || to.parent) {
+                fail("rack_focus measures comp positions: unparent the camera and the two layers");
+            }
+            function dist(l) {
+                var p = transform(l, "ADBE Position").valueAtTime(a.at, true), q = transform(cam, "ADBE Position")
+                    .valueAtTime(a.at, true);
+                return Math.sqrt(Math.pow(p[0] - q[0], 2) + Math.pow(p[1] - q[1], 2) +
+                    Math.pow((p[2] || 0) - (q[2] || 0), 2));
+            }
+            if (!from.threeDLayer || !to.threeDLayer) {
+                fail("both layers must be 3D (set_3d_layer or depth_stack) for the camera to focus on them");
+            }
+            d0 = dist(from);
+            d1 = dist(to);
+            opts.property("ADBE Camera Depth of Field").setValue(1);
+            keyAt(fd, a.at, d0, "ease");
+            keyAt(fd, a.at + a.duration, d1, "ease");
+            return {camera: cam.name, from: [from.name, round(d0, 1)], to: [to.name, round(d1, 1)],
+                start: round(a.at), end: round(a.at + a.duration)};
+        },
+
+        light_sweep: function (a) {
+            var c = findComp(a.comp), l = findLayer(c, a.layer), r = contentRect(l), fx, p, y, x0, x1, t1;
+            fx = addFx(l, "CC Light Sweep", "CC Light Sweep");
+            setParam(fx, "Direction", a.angle);
+            setParam(fx, "Width", a.width);
+            setParam(fx, "Sweep Intensity", a.intensity);
+            setParam(fx, "Light Color", [a.color[0], a.color[1], a.color[2], 1]);
+            p = findParam(fx, "Center");
+            // from past the left edge to past the right edge, across the middle
+            y = r.top + r.height / 2;
+            x0 = r.left - a.width * 2;
+            x1 = r.left + r.width + a.width * 2;
+            t1 = a.start + a.duration;
+            keyAt(p, a.start, [x0, y], "ease");
+            keyAt(p, t1, [x1, y], "ease");
+            return {layer: l.name, effect: fx.name, from: round(a.start), to: round(t1)};
+        },
+
+        kaleidoscope: function (a) {
+            var c = findComp(a.comp), adj = a.layer === undefined, l = adj ? adjustmentLayer(c, a.name) :
+                findLayer(c, a.layer), fx, rot;
+            fx = addFx(l, "CC Kaleida", "CC Kaleida");
+            setParam(fx, "Size", a.size);
+            rot = findParam(fx, "Rotation");
+            if (a.spin) {
+                rot.expression = "value + time * " + a.spin + ";";
+            }
+            return {layer: l.name, index: l.index, effect: fx.name, spin: a.spin};
+        },
+
+        organize_project: function (a) {
+            var items = allItems(), root = app.project.rootFolder, folders = {}, moved = {}, i, it, kind, k, out = {};
+            function folder(name) {
+                var j;
+                if (!folders[name]) {
+                    for (j = 0; j < items.length; j++) {
+                        if (items[j] instanceof FolderItem && items[j].name === name && items[j].parentFolder === root) {
+                            folders[name] = items[j];
+                        }
+                    }
+                    if (!folders[name]) {
+                        folders[name] = app.project.items.addFolder(name);
+                    }
+                }
+                return folders[name];
+            }
+            for (i = 0; i < items.length; i++) {
+                it = items[i];
+                if (it instanceof FolderItem || (it.parentFolder !== root && !a.all)) {
+                    continue;
+                }
+                if (it instanceof CompItem) {
+                    kind = a.names.comps;
+                } else if (it.mainSource instanceof SolidSource) {
+                    kind = a.names.solids;
+                } else if (it.hasVideo === false) {
+                    kind = a.names.audio;
+                } else if (it.mainSource && it.mainSource.isStill) {
+                    kind = a.names.images;
+                } else {
+                    kind = a.names.footage;
+                }
+                if (it.parentFolder === folder(kind)) {
+                    continue;
+                }
+                it.parentFolder = folder(kind);
+                moved[kind] = (moved[kind] || 0) + 1;
+            }
+            for (k in moved) {
+                if (moved.hasOwnProperty(k)) {
+                    out[k] = moved[k];
+                }
+            }
+            return {moved: out};
         },
 
         run_jsx: function (a) {
