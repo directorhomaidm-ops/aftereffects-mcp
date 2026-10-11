@@ -3371,10 +3371,6 @@ def test_time_stretch(ae, tmp_path):
     # a duration is reached from the current stretch: 2 s at 50 % to 3 s is 75 %
     assert d.time_stretch("run.mov", duration=3, comp="Main")["stretch"] == 75
     d.time_stretch("run.mov", percent=100, comp="Main")
-    # trimmed past its start: the in point stays where it was
-    d.add_layer("item", item="run.mov", comp="Main")
-    d.set_layer(1, start_time=2, in_point=3, out_point=6, comp="Main")
-    assert d.time_stretch(1, percent=200, comp="Main")["from"] == 3
     out = d.time_stretch("run.mov", reverse=True, comp="Main")
     assert out == {"layer": "run.mov", "reversed": True, "from": 2, "to": 6}
     assert ae.inspect(_layer("run.mov", 2) + ".property('ADBE Time Remapping').keys.map(k => [k.time, k.value])") == [
@@ -3385,6 +3381,10 @@ def test_time_stretch(ae, tmp_path):
                         ({"percent": 0}, "percent"), ({"reverse": True, "percent": 50}, "reverse keeps")]:
         with pytest.raises(ToolError, match=msg):
             d.time_stretch("run.mov", comp="Main", **kwargs)
+    # a second copy, trimmed past its start: the in point stays where it was
+    d.add_layer("item", item="run.mov", name="Trimmed", comp="Main")
+    d.set_layer("Trimmed", start_time=2, in_point=3, out_point=6, comp="Main")
+    assert d.time_stretch("Trimmed", percent=200, comp="Main")["from"] == 3
 
 
 def test_punch_zoom_and_flash(ae):
