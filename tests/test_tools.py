@@ -32,6 +32,8 @@ def test_all_tools_registered():
         "replace_text", "list_fonts", "replace_font",
         "color_grade", "beat_cut", "transition", "speed_ramp", "reveal_mask", "set_mask", "animate_mask", "key_out",
         "camera_shake", "glitch", "weather", "letterbox",
+        "draw_arrow", "spotlight", "blur_region", "picture_in_picture", "split_screen", "split_text", "timer",
+        "audio_visualizer", "text_box",
         "make_variants", "import_layered", "find_missing_footage",
         "motion_path", "bezier_ease", "track_point", "attach_to_track", "set_camera", "set_3d_layer", "depth_stack",
     }
@@ -2503,3 +2505,288 @@ def test_weather_and_letterbox(ae):
         d.letterbox(1.5)
     with pytest.raises(ToolError, match="aspect must be"):
         d.letterbox(0.5)
+
+
+# --- explainers, privacy, layouts, text, audio ---
+
+
+def _shape_group(layer, name, comp=1):
+    return f"{_layer(layer, comp)}.property('ADBE Root Vectors Group').property({json.dumps(name)})"
+
+
+def test_draw_arrow(ae):
+    d.create_comp("Main")  # the shape layer sits at 960, 540
+    out = d.draw_arrow([160, 540], [960, 540], color=[1, 0.8, 0], width=10, head=40, start=1, duration=0.5)
+    assert out == {"layer": "Arrow", "index": 1, "length": 800, "drawn": [1, 1.5]}
+    line = _shape_group(1, "Line") + ".property('ADBE Vectors Group')"
+    path = ae.inspect(line + ".property(1).property('ADBE Vector Shape').value")
+    assert path["vertices"] == [[-800, 0], [0, 0]] and path["closed"] is False
+    assert path["outTangents"][0][1] == 0 and path["inTangents"][1][1] == 0  # handles along the line: straight
+    stroke = line + ".property(2)"
+    assert ae.inspect(f"[{stroke}.property(1).value, {stroke}.property(2).value, {stroke}.property(3).value]") == [
+        [1, 0.8, 0, 1], 10, 2]
+    assert ae.inspect(line + ".property(3).property('ADBE Vector Trim End').keys.map(k => [k.time, k.value])") == [
+        [1, 0], [1.5, 100]]
+    head = ae.inspect(_shape_group(1, "Head") + ".property('ADBE Vectors Group').property(1)"
+                      ".property('ADBE Vector Shape').value.vertices")
+    # wings 40 px back from the tip, 0.5 rad either side of the line
+    assert head[1] == [0, 0]
+    assert [round(v, 2) for v in head[0]] == [round(-40 * math.cos(-0.5), 2), round(-40 * math.sin(-0.5), 2)]
+    op = _shape_group(1, "Head") + ".property('ADBE Vector Transform Group').property('ADBE Vector Group Opacity')"
+    assert ae.inspect(op + ".keys.map(k => [k.time, k.value, k.inType])") == [[1, 0, 6614], [1.5, 100, 6614]]
+    # bent: the tangents pull toward a point 200 px off the middle, and the head follows the arriving direction
+    d.draw_arrow([160, 540], [960, 540], curve=200, duration=0, name="Bent")
+    path = ae.inspect(_shape_group(1, "Line") + ".property('ADBE Vectors Group').property(1)"
+                      ".property('ADBE Vector Shape').value")
+    q = [-400, 200]
+    assert path["outTangents"][0] == pytest.approx([(q[0] + 800) * 2 / 3, q[1] * 2 / 3])
+    assert path["inTangents"][1] == pytest.approx([q[0] * 2 / 3, q[1] * 2 / 3])
+    assert ae.inspect(_shape_group(1, "Line") + ".property('ADBE Vectors Group').numProperties") == 2  # no trim
+    head = ae.inspect(_shape_group(1, "Head") + ".property('ADBE Vectors Group').property(1)"
+                      ".property('ADBE Vector Shape').value.vertices")
+    ang = math.atan2(0 - q[1], 0 - q[0])  # arriving from the control point
+    assert head[0] == pytest.approx([-30 * math.cos(ang - 0.5), -30 * math.sin(ang - 0.5)])
+    # a vertical arrow bends to the side: the control point moves along x
+    d.draw_arrow([960, 140], [960, 940], curve=100, duration=0, name="Down")
+    path = ae.inspect(_shape_group(1, "Line") + ".property('ADBE Vectors Group').property(1)"
+                      ".property('ADBE Vector Shape').value")
+    assert path["outTangents"][0] == pytest.approx([-100 * 2 / 3, 400 * 2 / 3])
+    with pytest.raises(ToolError, match="two different points"):
+        d.draw_arrow([5, 5], [5.5, 5])
+    with pytest.raises(ToolError, match=r"needs \[x, y\]"):
+        d.draw_arrow([5], [5, 5])
+    with pytest.raises(ToolError, match="width must be above 0"):
+        d.draw_arrow([0, 0], [5, 5], width=0)
+
+
+def test_spotlight(ae):
+    d.create_comp("Main", duration=5)
+    out = d.spotlight([100, 200, 300, 150], darkness=60, feather=20, fade=1, start=0.5)
+    assert out == {"layer": "Spotlight", "index": 1, "mask": "Light"}
+    m = "ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(1)"
+    assert ae.inspect(m + ".inverted") is True
+    v = ae.inspect(m + ".property('ADBE Mask Shape').value.vertices")
+    assert (min(x for x, _ in v), max(x for x, _ in v), min(y for _, y in v), max(y for _, y in v)) == (100, 400, 200,
+                                                                                                       350)
+    assert ae.inspect(m + ".property('ADBE Mask Feather').value") == [20, 20]
+    assert _key_values(ae, 1, "ADBE Opacity") == [[0.5, 0], [1.5, 60]]
+    assert ae.inspect("ae.app.project.item(1).layer(1).inPoint") == 0.5
+    d.spotlight([0, 0, 200, 100], shape="rect", radius=20, fade=0, name="Box")
+    assert len(ae.inspect(m + ".property('ADBE Mask Shape').value.vertices")) == 8  # rounded corners
+    assert ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Transform Group').property('ADBE Opacity')"
+                      ".value") == 70
+    for kwargs, msg in [({"rect": [0, 0, 0, 5]}, "positive width"), ({"shape": "star"}, "ellipse or rect"),
+                        ({"darkness": 0}, "darkness")]:
+        with pytest.raises(ToolError, match=msg):
+            d.spotlight(**{"rect": [0, 0, 10, 10], **kwargs})
+
+
+def test_blur_region(ae):
+    d.create_comp("Main", duration=10)
+    out = d.blur_region([800, 100, 200, 240], amount=40, start=2, end=6)
+    assert out == {"layer": "Blur", "index": 1, "effect": "Gaussian Blur", "set": {"Blurriness": 40}, "from": 2,
+                   "to": 6}
+    assert ae.inspect("ae.app.project.item(1).layer(1).adjustmentLayer") is True
+    assert dict(_params(ae, 1, 1))["Repeat Edge Pixels"] == 1
+    v = ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Mask Parade').property(1)"
+                   ".property('ADBE Mask Shape').value.vertices")
+    assert v == [[800, 100], [1000, 100], [1000, 340], [800, 340]]
+    out = d.blur_region([0, 0, 100, 100], kind="mosaic", amount=24, shape="ellipse", name="Plate")
+    assert out["set"] == {"Horizontal Blocks": 80, "Vertical Blocks": 45} and (out["from"], out["to"]) == (0, 10)
+    for kwargs, msg in [({"kind": "pixel"}, "blur or mosaic"), ({"amount": 0}, "amount"), ({"start": 3, "end": 2},
+                                                                                          "end after start"),
+                        ({"shape": "star"}, "rect or ellipse")]:
+        with pytest.raises(ToolError, match=msg):
+            d.blur_region(**{"rect": [0, 0, 10, 10], **kwargs})
+
+
+def _tr(ae, layer, prop, comp=1):
+    return ae.inspect(_layer(layer, comp) + f".property('ADBE Transform Group').property('{prop}').value")
+
+
+def test_picture_in_picture(ae):
+    d.create_comp("Main", duration=5)  # 1920 x 1080
+    d.add_layer("solid", name="Cam")  # 1920 x 1080
+    out = d.picture_in_picture("Cam", "bottom_left", size=0.25, margin=30, radius=20, border=6,
+                               border_color=[1, 0, 0])
+    assert out == {"layer": "Cam", "scale": 25, "position": [270, 915], "size": [480, 270], "border": "Cam border"}
+    assert _tr(ae, "Cam", "ADBE Anchor Point")[:2] == [960, 540]
+    assert _tr(ae, "Cam", "ADBE Scale")[:2] == [25, 25]
+    assert _order(ae) == ["Cam", "Cam border"]  # the frame sits right under it
+    rect = _shape_group("Cam border", 1) + ".property('ADBE Vectors Group')"
+    assert ae.inspect(rect + ".property(1).property('ADBE Vector Rect Size').value") == [492, 282]
+    assert ae.inspect(rect + ".property(1).property('ADBE Vector Rect Roundness').value") == 26
+    assert ae.inspect(rect + ".property(2).property('ADBE Vector Fill Color').value") == [1, 0, 0, 1]
+    assert _tr(ae, "Cam border", "ADBE Position")[:2] == [270, 915]
+    # the corner radius is in comp pixels: 20 px at 25 % is 80 layer pixels
+    v = ae.inspect(_layer("Cam") + ".property('ADBE Mask Parade').property(1).property('ADBE Mask Shape').value"
+                   ".vertices")
+    assert v[0] == [80, 0] and len(v) == 8
+    d.add_layer("solid", name="Two")
+    assert d.picture_in_picture("Two", "top_right", radius=0)["position"] == [1920 - 40 - 288, 40 + 162]
+    assert ae.inspect(_layer("Two") + ".property('ADBE Mask Parade').numProperties") == 0
+    d.set_property("Two", "rotation", 5)
+    with pytest.raises(ToolError, match="Two is rotated"):
+        d.picture_in_picture("Two")
+    d.set_keyframes("Cam", "scale", [{"time": 0, "value": [10, 10]}, {"time": 1, "value": [20, 20]}])
+    with pytest.raises(ToolError, match="Cam's Scale is animated"):
+        d.picture_in_picture("Cam")
+    for kwargs, msg in [({"corner": "middle"}, "corner"), ({"size": 2}, "size")]:
+        with pytest.raises(ToolError, match=msg):
+            d.picture_in_picture("Cam", **kwargs)
+
+
+def test_split_screen(ae):
+    d.create_comp("Main", duration=5)  # 1920 x 1080
+    for n in ("C", "B", "A"):
+        d.add_layer("solid", name=n)
+    out = d.split_screen(["A", "B", "C"], "columns", gap=30)
+    # three 620 px panes: a 1920 x 1080 layer fills 620 x 1080 at 100 % (height bound), cropped sideways
+    assert (out["columns"], out["rows"], out["pane"]) == (3, 1, [620, 1080])
+    assert [(l["layer"], l["pane"], l["scale"], l["center"]) for l in out["layers"]] == [
+        ("A", [1, 1], 100, [310, 540]), ("B", [1, 2], 100, [960, 540]), ("C", [1, 3], 100, [1610, 540])]
+    v = ae.inspect(_layer("B") + ".property('ADBE Mask Parade').property(1).property('ADBE Mask Shape').value.vertices")
+    assert v == [[650, 0], [1270, 0], [1270, 1080], [650, 1080]]
+    out = d.split_screen(["A", "B", "C"], "grid")
+    assert (out["columns"], out["rows"], out["pane"]) == (2, 2, [960, 540])
+    assert out["layers"][2]["center"] == [480, 810] and out["layers"][0]["scale"] == 50
+    # again over the first masks: intersect
+    assert ae.inspect(_layer("A") + ".property('ADBE Mask Parade').property(2).maskMode") == 6815
+    out = d.split_screen(["A", "B"], "rows")
+    assert out["pane"] == [1920, 540] and out["layers"][1]["center"] == [960, 810]
+    for kwargs, msg in [({"layout": "diagonal"}, "layout"), ({"layers": ["A"]}, "2-16"), ({"gap": -1}, "gap"),
+                        ({"gap": 2000}, "no room")]:
+        with pytest.raises(ToolError, match=msg):
+            d.split_screen(**{"layers": ["A", "B"], **kwargs})
+
+
+def test_split_text_words(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="one two three")  # the fake measures 300 px for 13 characters at 72 px
+    d.set_property(1, "position", [500, 400])
+    out = d.split_text(1)
+    assert out == {"layer": "one two three", "by": "words", "layers": [
+        {"layer": "one two three 1", "text": "one"}, {"layer": "one two three 2", "text": "two"},
+        {"layer": "one two three 3", "text": "three"}]}
+    assert _order(ae) == ["one two three 1", "one two three 2", "one two three 3", "one two three"]
+    assert ae.inspect("ae.app.project.item(1).layer(4).enabled") is False
+    unit = 300 / 13  # one character in the fake
+    # each word's left edge lands where it was in the line (the fake's rects start at -150 per 300 px)
+    for i, (word, start) in enumerate((("one", 0), ("two", 4), ("three", 8))):
+        x = _tr(ae, i + 1, "ADBE Position")[0]
+        word_left = -150 * len(word) / 13
+        assert x + word_left == pytest.approx(500 - 150 + start * unit)
+        assert ae.inspect(f"ae.app.project.item(1).layer({i + 1}).property('ADBE Text Properties')"
+                          ".property('ADBE Text Document').value.text") == word
+    # the original keeps its text
+    assert ae.inspect("ae.app.project.item(1).layer(4).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.text") == "one two three"
+
+
+def test_split_text_lines_and_characters(ae):
+    d.create_comp("Main")
+    d.add_layer("text", text="ab\rcd\r\rlast")
+    d.set_property(1, "scale", [50, 50])
+    out = d.split_text(1, "lines")
+    assert [l["text"] for l in out["layers"]] == ["ab", "cd", "last"]  # the empty line is skipped
+    y0 = _tr(ae, 4, "ADBE Position")[1]
+    # the fake's 80 px box holds the 4 lines: 20 px a line, at 50 %: lines 2 and 4 sit 10 and 30 px lower
+    assert [_tr(ae, i, "ADBE Position")[1] - y0 for i in (1, 2, 3)] == pytest.approx([0, 10, 30])
+    d.add_layer("text", text="a b ")
+    assert [l["text"] for l in d.split_text(1, "characters")["layers"]] == ["a", "b"]
+    assert ae.inspect("ae.app.project.item(1).layer(3).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').value.text") == "a b "  # the original is left as it was
+    assert _order(ae)[6] == "ab\rcd\r\rlast"
+    with pytest.raises(ToolError, match="several lines"):
+        d.split_text(7, "words")
+    d.add_layer("text", text="solo")
+    with pytest.raises(ToolError, match="fewer than two words"):
+        d.split_text(1)
+    d.set_expression(1, "text", '"x y"')
+    with pytest.raises(ToolError, match="keyframed or driven by an expression"):
+        d.split_text(1)
+    d.add_layer("null", name="Rig")
+    with pytest.raises(ToolError, match="Rig is not a text layer"):
+        d.split_text("Rig")
+    with pytest.raises(ToolError, match="by must be"):
+        d.split_text(1, "sentences")
+
+
+def test_timer(ae):
+    d.create_comp("Main", duration=20)
+    out = d.timer(10, 0, start=2, format="mm:ss", name="Countdown")
+    assert {k: out[k] for k in ("layer", "from", "to", "format", "error")} == {
+        "layer": "Countdown", "from": 10, "to": 0, "format": "mm:ss", "error": None}
+    slider = _fx(1, 1) + ".property(1)"
+    assert ae.inspect(slider + ".keys.map(k => [k.time, k.value])") == [[2, 10], [12, 0]]
+    assert ae.inspect(_fx(1, 1) + ".name") == "Timer"
+    expr = ae.inspect("ae.app.project.item(1).layer(1).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').expression")
+    assert "var t = Math.ceil(v - 0.0001);" in expr and expr.endswith('p(Math.floor(t / 60)) + ":" + p(s);')
+    expr = _timer_expr(ae, d.timer(0, 90.5, format="mm:ss.cs", duration=5))
+    assert "var t = v;" in expr and expr.endswith('p(Math.floor(t / 60)) + ":" + p(s) + "." + p(cs);')
+    # the expression, run: what it shows for a few slider values
+    js = expr.replace('effect("Timer")("Slider").value', "V")
+    for v, shown in ((0, "00:00.00"), (65.257, "01:05.25"), (90.5, "01:30.50")):
+        assert ae.inspect(f"(function () {{ var V = {v}; return eval({json.dumps(js)}); }})()") == shown
+    js = _timer_expr(ae, d.timer(3700, 0, format="hh:mm:ss")).replace('effect("Timer")("Slider").value', "V")
+    assert ae.inspect(f"(function () {{ var V = 3661.5; return eval({json.dumps(js)}); }})()") == "01:01:02"
+    for kwargs, msg in [({"format": "frames"}, "format"), ({"from_seconds": 5, "to_seconds": 5}, "differ"),
+                        ({"duration": 0}, "duration")]:
+        with pytest.raises(ToolError, match=msg):
+            d.timer(**kwargs)
+
+
+def _timer_expr(ae, out):
+    return ae.inspect(f"ae.app.project.item(1).layer({out['index']}).property('ADBE Text Properties')"
+                      ".property('ADBE Text Document').expression")
+
+
+def test_audio_visualizer(ae, tmp_path):
+    (tmp_path / "song.wav").write_bytes(b"x")
+    d.import_file(str(tmp_path / "song.wav"))
+    d.create_comp("Main", duration=5)
+    d.add_layer("item", item="song.wav")
+    out = d.audio_visualizer("song.wav", color=[0, 1, 0.5], height=200, detail=32, comp="Main")
+    assert out == {"layer": "Spectrum", "index": 1, "effect": "Audio Spectrum", "audio": "song.wav"}
+    p = dict(_params(ae, 1, 1, comp=2))
+    assert p["Audio Layer"] == 2  # the song, below the new layer
+    assert (p["Start Point"], p["End Point"]) == ([192, 540], [1728, 540])
+    assert (p["Frequency bands"], p["Maximum Height"], p["Thickness"], p["Inside Color"], p["Composite On Original"]) \
+        == (32, 200, 6, [0, 1, 0.5, 1], 0)
+    out = d.audio_visualizer("song.wav", "waveform", [0, 900], [1920, 900], detail=400, comp="Main")
+    p = dict(_params(ae, 1, 1, comp=2))
+    assert out["effect"] == "Audio Waveform" and p["Audio Layer"] == 3 and p["Displayed Samples"] == 400
+    assert p["Start Point"] == [0, 900]
+    d.add_layer("solid", name="Mute", comp="Main")
+    with pytest.raises(ToolError, match="Mute has no audio"):
+        d.audio_visualizer("Mute", comp="Main")
+    for kwargs, msg in [({"kind": "bars"}, "spectrum or waveform"), ({"detail": 0}, "detail")]:
+        with pytest.raises(ToolError, match=msg):
+            d.audio_visualizer("song.wav", comp="Main", **kwargs)
+
+
+def test_text_box(ae):
+    d.create_comp("Main", duration=8)
+    d.add_layer("text", text="Breaking news", name="Title")
+    d.set_layer("Title", in_point=1, out_point=6)
+    out = d.text_box("Title", padding=[20, 10], color=[0.1, 0.1, 0.1], opacity=90, radius=6)
+    assert out == {"layer": "Title box", "index": 2, "text": "Title"}
+    assert _order(ae) == ["Title", "Title box"]
+    box = _shape_group("Title box", "Box") + ".property('ADBE Vectors Group')"
+    size = ae.inspect(box + ".property(1).property('ADBE Vector Rect Size').expression")
+    assert size.startswith('var l = thisComp.layer("Title"), r = l.sourceRectAtTime(time, false);')
+    assert size.endswith("[r.width * s[0] / 100 + 40, r.height * s[1] / 100 + 20];")
+    assert ae.inspect(box + ".property(1).property('ADBE Vector Rect Position').expression").endswith(
+        "var p = l.toComp([r.left + r.width / 2, r.top + r.height / 2]);\n[p[0], p[1]];")
+    assert ae.inspect(box + ".property(1).property('ADBE Vector Rect Roundness').value") == 6
+    assert ae.inspect(f"[{box}.property(2).property(1).value, {box}.property(2).property(2).value]") == [
+        [0.1, 0.1, 0.1, 1], 90]
+    assert _tr(ae, "Title box", "ADBE Position")[:2] == [0, 0]
+    assert ae.inspect(f"[{_layer('Title box')}.inPoint, {_layer('Title box')}.outPoint]") == [1, 6]
+    d.add_layer("solid", name="Plate")
+    with pytest.raises(ToolError, match="Plate is not a text layer"):
+        d.text_box("Plate")
+    for kwargs, msg in [({"padding": [1]}, "padding"), ({"opacity": 120}, "opacity")]:
+        with pytest.raises(ToolError, match=msg):
+            d.text_box("Title", **kwargs)

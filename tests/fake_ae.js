@@ -105,6 +105,16 @@ const EFFECTS = [
         ["Rotation", 0], ["Opacity", 100], ["Use Composition\u2019s Shutter Angle", 1], ["Shutter Angle", 0]]},
     {displayName: "Turbulent Displace", matchName: "ADBE Turbulent Displace", category: "Distort", params: [
         ["Displacement", 1], ["Amount", 50], ["Size", 100], ["Complexity", 1], ["Evolution", 0]]},
+    {displayName: "Mosaic", matchName: "ADBE Mosaic", category: "Stylize", params: [
+        ["Horizontal Blocks", 10], ["Vertical Blocks", 10], ["Sharp Colors", 0]]},
+    {displayName: "Audio Spectrum", matchName: "ADBE AudSpect", category: "Generate", params: [
+        ["Audio Layer", {layer: 0}], ["Start Point", [480, 540]], ["End Point", [1440, 540]], ["Frequency bands", 64],
+        ["Maximum Height", 4500], ["Thickness", 3], ["Inside Color", [1, 1, 1, 1]], ["Outside Color", [0, 0, 1, 1]],
+        ["Composite On Original", 1]]},
+    {displayName: "Audio Waveform", matchName: "ADBE AudWave", category: "Generate", params: [
+        ["Audio Layer", {layer: 0}], ["Start Point", [480, 540]], ["End Point", [1440, 540]],
+        ["Displayed Samples", 200], ["Maximum Height", 300], ["Thickness", 2], ["Inside Color", [1, 1, 1, 1]],
+        ["Outside Color", [0, 0, 1, 1]], ["Composite On Original", 1]]},
     {displayName: "CC Snowfall", matchName: "CC Snowfall", category: "Simulation", params: [
         ["Flakes", 8000], ["Size", 3], ["Speed", 100], ["Wind", 0], ["Opacity", 100]]},
     {displayName: "CC Rainfall", matchName: "CC Rainfall", category: "Simulation", params: [
@@ -453,7 +463,15 @@ function makeAE(CtxArray) {
             new Property("Opacity", "ADBE Vector Fill Opacity", 100, PropertyValueType.OneD)]],
         "ADBE Vector Graphic - Stroke": ["Stroke", () => [
             new Property("Color", "ADBE Vector Stroke Color", [1, 1, 1, 1], PropertyValueType.COLOR),
-            new Property("Stroke Width", "ADBE Vector Stroke Width", 2, PropertyValueType.OneD)]],
+            new Property("Stroke Width", "ADBE Vector Stroke Width", 2, PropertyValueType.OneD),
+            new Property("Line Cap", "ADBE Vector Stroke Line Cap", 1, PropertyValueType.OneD),
+            new Property("Line Join", "ADBE Vector Stroke Line Join", 1, PropertyValueType.OneD)]],
+        "ADBE Vector Shape - Group": ["Path", () => [
+            new Property("Path", "ADBE Vector Shape", new Shape(), PropertyValueType.SHAPE)]],
+        "ADBE Vector Filter - Trim": ["Trim Paths", () => [
+            new Property("Start", "ADBE Vector Trim Start", 0, PropertyValueType.OneD),
+            new Property("End", "ADBE Vector Trim End", 100, PropertyValueType.OneD),
+            new Property("Offset", "ADBE Vector Trim Offset", 0, PropertyValueType.OneD)]],
     };
     const shapeRoot = () => new AddGroup("Contents", "ADBE Root Vectors Group", {
         "ADBE Vector Filter - Trim": ["Trim Paths", () => [
@@ -791,6 +809,7 @@ function makeAE(CtxArray) {
         constructor(comp, text) {
             super(comp, text);
             this.rect = {left: -150, top: -60, width: 300, height: 80};  // text grows up and right from its anchor
+            this._measure = text;  // the rect is the box of this text: other text scales it by length and lines
             this.groups[0].children[0]._value = [0, 0, 0];
             this.groups.unshift(new PropertyGroup("Text", "ADBE Text Properties", [
                 new Property("Source Text", "ADBE Text Document", new TextDocument(text), PropertyValueType.TEXT_DOCUMENT),
@@ -799,9 +818,16 @@ function makeAE(CtxArray) {
         }
     }
     TextLayer.prototype.sourceRectAtTime = function () {
-        // the box grows with the font size (the rect is the box at 72 px)
-        const k = this.property("ADBE Text Properties").property("ADBE Text Document").value.fontSize / 72;
-        return {left: this.rect.left * k, top: this.rect.top * k, width: this.rect.width * k, height: this.rect.height * k};
+        // the box grows with the font size (the rect is the box at 72 px), the longest line and the line count
+        const doc = this.property("ADBE Text Properties").property("ADBE Text Document").value, k = doc.fontSize / 72;
+        const shape = (t) => {
+            const lines = String(t).split(/\r\n|\r|\n/);
+            return [Math.max(...lines.map((x) => x.length)) || 1, lines.length];
+        };
+        const [w0, n0] = shape(this._measure), [w, n] = shape(doc.text);
+        const kw = k * w / w0, kh = k * n / n0;
+        return {left: this.rect.left * kw, top: this.rect.top * k, width: this.rect.width * kw,
+            height: this.rect.height * kh};
     };
     class ShapeLayer extends AVLayer {
         constructor(comp, name) {
